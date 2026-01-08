@@ -8,7 +8,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Lightweight client info stored in the manager
@@ -90,6 +90,8 @@ pub struct ClientManager {
     password: Option<Bytes>,
     /// Default password (for AUTH without username)
     default_password: Option<Bytes>,
+    /// Maximum number of clients (0 = unlimited)
+    maxclients: AtomicU32,
 }
 
 impl ClientManager {
@@ -104,6 +106,7 @@ impl ClientManager {
             start_time: Instant::now(),
             password: None,
             default_password: None,
+            maxclients: AtomicU32::new(0),
         }
     }
 
@@ -118,6 +121,7 @@ impl ClientManager {
             start_time: Instant::now(),
             password: Some(password.clone()),
             default_password: Some(password),
+            maxclients: AtomicU32::new(0),
         }
     }
 
@@ -180,6 +184,21 @@ impl ClientManager {
     #[inline]
     pub fn client_count(&self) -> usize {
         self.clients.len()
+    }
+
+    /// Set maximum clients limit
+    pub fn set_maxclients(&self, max: u32) {
+        self.maxclients.store(max, Ordering::Relaxed);
+    }
+
+    /// Check if a new connection can be accepted
+    #[inline]
+    pub fn can_accept(&self) -> bool {
+        let max = self.maxclients.load(Ordering::Relaxed);
+        if max == 0 {
+            return true; // No limit
+        }
+        self.clients.len() < max as usize
     }
 
     /// Get client by ID

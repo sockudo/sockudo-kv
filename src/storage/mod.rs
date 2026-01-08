@@ -10,6 +10,7 @@ mod types;
 mod value;
 
 // Import all operation modules - each adds methods to Store via impl blocks
+pub mod eviction;
 pub mod ops;
 
 // Re-export the main Store struct

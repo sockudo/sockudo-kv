@@ -176,7 +176,6 @@ impl Store {
 ## Module Organization Benefits
 
 ### ✅ Maintainability
-- Each file is <400 lines
 - Easy to find operations
 - Clear separation of concerns
 

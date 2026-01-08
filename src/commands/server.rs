@@ -26,6 +26,9 @@ pub fn execute(
         // COMMAND introspection
         b"COMMAND" => cmd_command(args),
 
+        // CONFIG command
+        b"CONFIG" => cmd_config(server, args),
+
         // Memory commands
         b"MEMORY" => cmd_memory(store, args),
 
@@ -476,59 +479,332 @@ fn cmd_command_info(args: &[Bytes]) -> Result<RespValue> {
 
 fn cmd_command_list(args: &[Bytes]) -> Result<RespValue> {
     let all_cmds = vec![
+        // String commands
         "GET",
         "SET",
-        "DEL",
+        "SETNX",
+        "SETEX",
+        "PSETEX",
         "MGET",
         "MSET",
+        "MSETNX",
         "INCR",
         "DECR",
+        "INCRBY",
+        "DECRBY",
+        "INCRBYFLOAT",
         "APPEND",
+        "STRLEN",
+        "GETRANGE",
+        "SETRANGE",
+        "GETSET",
+        "GETEX",
+        "GETDEL",
+        // List commands
         "LPUSH",
         "RPUSH",
+        "LPUSHX",
+        "RPUSHX",
         "LPOP",
         "RPOP",
         "LRANGE",
         "LLEN",
+        "LINDEX",
+        "LSET",
+        "LINSERT",
+        "LREM",
+        "LTRIM",
+        "LPOS",
+        "LMOVE",
+        "LMPOP",
+        "BLPOP",
+        "BRPOP",
+        "BLMOVE",
+        "BLMPOP",
+        "RPOPLPUSH",
+        "BRPOPLPUSH",
+        // Set commands
         "SADD",
         "SREM",
         "SMEMBERS",
         "SISMEMBER",
+        "SMISMEMBER",
         "SCARD",
+        "SPOP",
+        "SRANDMEMBER",
+        "SDIFF",
+        "SDIFFSTORE",
+        "SINTER",
+        "SINTERSTORE",
+        "SINTERCARD",
+        "SUNION",
+        "SUNIONSTORE",
+        "SMOVE",
+        "SSCAN",
+        // Hash commands
         "HSET",
         "HGET",
         "HDEL",
-        "HGETALL",
+        "HEXISTS",
+        "HLEN",
         "HKEYS",
         "HVALS",
+        "HGETALL",
+        "HINCRBY",
+        "HINCRBYFLOAT",
+        "HMSET",
+        "HMGET",
+        "HSETNX",
+        "HSTRLEN",
+        "HSCAN",
+        "HRANDFIELD",
+        // Sorted Set commands
         "ZADD",
         "ZREM",
-        "ZRANGE",
         "ZSCORE",
+        "ZRANK",
+        "ZREVRANK",
         "ZCARD",
-        "PING",
-        "ECHO",
-        "INFO",
-        "DBSIZE",
+        "ZCOUNT",
+        "ZLEXCOUNT",
+        "ZRANGE",
+        "ZRANGESTORE",
+        "ZRANGEBYLEX",
+        "ZRANGEBYSCORE",
+        "ZREVRANGE",
+        "ZREVRANGEBYLEX",
+        "ZREVRANGEBYSCORE",
+        "ZINCRBY",
+        "ZPOPMIN",
+        "ZPOPMAX",
+        "BZPOPMIN",
+        "BZPOPMAX",
+        "ZMPOP",
+        "BZMPOP",
+        "ZINTER",
+        "ZINTERSTORE",
+        "ZINTERCARD",
+        "ZUNION",
+        "ZUNIONSTORE",
+        "ZDIFF",
+        "ZDIFFSTORE",
+        "ZRANDMEMBER",
+        "ZMSCORE",
+        "ZSCAN",
+        // Generic commands
+        "DEL",
+        "EXISTS",
+        "EXPIRE",
+        "EXPIREAT",
+        "PEXPIRE",
+        "PEXPIREAT",
+        "EXPIRETIME",
+        "PEXPIRETIME",
+        "TTL",
+        "PTTL",
+        "PERSIST",
+        "TYPE",
         "KEYS",
         "SCAN",
-        "TYPE",
-        "TTL",
-        "EXPIRE",
+        "RENAME",
+        "RENAMENX",
+        "COPY",
+        "DUMP",
+        "RESTORE",
+        "SORT",
+        "SORT_RO",
+        "OBJECT",
+        "TOUCH",
+        "UNLINK",
+        "WAIT",
+        "WAITAOF",
+        "RANDOMKEY",
+        "DBSIZE",
+        "FLUSHDB",
+        "FLUSHALL",
+        "MOVE",
+        // Connection commands
+        "PING",
+        "ECHO",
+        "SELECT",
+        "QUIT",
+        "AUTH",
+        "CLIENT",
+        "HELLO",
+        "RESET",
+        // Server commands
+        "INFO",
+        "CONFIG",
+        "COMMAND",
+        "ACL",
+        "MEMORY",
+        "SLOWLOG",
+        "LATENCY",
+        "TIME",
+        "DBSIZE",
+        "BGSAVE",
+        "BGREWRITEAOF",
+        "LASTSAVE",
+        "SAVE",
+        "SHUTDOWN",
+        "DEBUG",
+        "LOLWUT",
+        "SWAPDB",
+        // Pub/Sub commands
         "PUBLISH",
         "SUBSCRIBE",
         "PSUBSCRIBE",
+        "UNSUBSCRIBE",
+        "PUNSUBSCRIBE",
+        "PUBSUB",
+        "SSUBSCRIBE",
+        "SUNSUBSCRIBE",
+        "SPUBLISH",
+        // Transaction commands
         "MULTI",
         "EXEC",
         "DISCARD",
         "WATCH",
-        "ACL",
-        "CONFIG",
-        "COMMAND",
-        "CLIENT",
-        "MEMORY",
-        "SLOWLOG",
-        "LATENCY",
+        "UNWATCH",
+        // Scripting commands
+        "EVAL",
+        "EVALSHA",
+        "EVAL_RO",
+        "EVALSHA_RO",
+        "SCRIPT",
+        "FUNCTION",
+        "FCALL",
+        "FCALL_RO",
+        // Cluster commands
+        "CLUSTER",
+        "READONLY",
+        "READWRITE",
+        "ASKING",
+        // Replication commands
+        "REPLICAOF",
+        "SLAVEOF",
+        "ROLE",
+        "PSYNC",
+        "REPLCONF",
+        "SYNC",
+        "FAILOVER",
+        // HyperLogLog commands
+        "PFADD",
+        "PFCOUNT",
+        "PFMERGE",
+        "PFDEBUG",
+        "PFSELFTEST",
+        // Bitmap commands
+        "SETBIT",
+        "GETBIT",
+        "BITCOUNT",
+        "BITPOS",
+        "BITOP",
+        "BITFIELD",
+        "BITFIELD_RO",
+        // Stream commands
+        "XADD",
+        "XREAD",
+        "XREADGROUP",
+        "XRANGE",
+        "XREVRANGE",
+        "XLEN",
+        "XINFO",
+        "XDEL",
+        "XTRIM",
+        "XGROUP",
+        "XACK",
+        "XCLAIM",
+        "XAUTOCLAIM",
+        "XPENDING",
+        "XSETID",
+        // Geo commands
+        "GEOADD",
+        "GEODIST",
+        "GEOHASH",
+        "GEOPOS",
+        "GEORADIUS",
+        "GEORADIUSBYMEMBER",
+        "GEOSEARCH",
+        "GEOSEARCHSTORE",
+        // JSON commands
+        "JSON.GET",
+        "JSON.SET",
+        "JSON.DEL",
+        "JSON.MGET",
+        "JSON.TYPE",
+        "JSON.NUMINCRBY",
+        "JSON.ARRAPPEND",
+        "JSON.ARRINDEX",
+        "JSON.ARRINSERT",
+        "JSON.ARRLEN",
+        "JSON.ARRPOP",
+        "JSON.ARRTRIM",
+        "JSON.OBJKEYS",
+        "JSON.OBJLEN",
+        "JSON.STRLEN",
+        "JSON.STRAPPEND",
+        "JSON.CLEAR",
+        "JSON.TOGGLE",
+        // TimeSeries commands
+        "TS.CREATE",
+        "TS.ADD",
+        "TS.MADD",
+        "TS.INCRBY",
+        "TS.DECRBY",
+        "TS.CREATERULE",
+        "TS.DELETERULE",
+        "TS.RANGE",
+        "TS.REVRANGE",
+        "TS.MRANGE",
+        "TS.MREVRANGE",
+        "TS.GET",
+        "TS.MGET",
+        "TS.INFO",
+        "TS.QUERYINDEX",
+        "TS.ALTER",
+        "TS.DEL",
+        // Search commands
+        "FT.CREATE",
+        "FT.SEARCH",
+        "FT.AGGREGATE",
+        "FT.INFO",
+        "FT.DROPINDEX",
+        "FT.ALIASADD",
+        "FT.ALIASUPDATE",
+        "FT.ALIASDEL",
+        "FT._LIST",
+        "FT.EXPLAIN",
+        "FT.EXPLAINCLI",
+        "FT.PROFILE",
+        "FT.TAGVALS",
+        "FT.SUGADD",
+        "FT.SUGGET",
+        "FT.SUGDEL",
+        "FT.SUGLEN",
+        "FT.SYNDUMP",
+        "FT.SYNUPDATE",
+        "FT.SPELLCHECK",
+        "FT.DICTADD",
+        "FT.DICTDEL",
+        "FT.DICTDUMP",
+        "FT.CONFIG",
+        // Vector commands
+        "VADD",
+        "VCARD",
+        "VDIM",
+        "VEMB",
+        "VGETATTR",
+        "VINFO",
+        "VISMEMBER",
+        "VLINKS",
+        "VRANDMEMBER",
+        "VRANGE",
+        "VREM",
+        "VSETATTR",
+        "VSIM",
+        // Module command
+        "MODULE",
     ];
 
     let mut result: Vec<&str> = all_cmds.clone();
@@ -552,6 +828,26 @@ fn cmd_command_list(args: &[Bytes]) -> Result<RespValue> {
 
 // === MEMORY Commands ===
 
+// FFI for mimalloc stats
+use std::ffi::{CStr, c_void};
+use std::os::raw::c_char;
+
+unsafe extern "C" {
+    fn mi_stats_print_out(out: extern "C" fn(*const c_char, *mut c_void), arg: *mut c_void);
+}
+
+extern "C" fn mi_stats_callback(msg: *const c_char, arg: *mut c_void) {
+    unsafe {
+        if !msg.is_null() {
+            let c_str = CStr::from_ptr(msg);
+            if let Ok(str_slice) = c_str.to_str() {
+                let buffer = &mut *(arg as *mut String);
+                buffer.push_str(str_slice);
+            }
+        }
+    }
+}
+
 fn cmd_memory(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::WrongArity("MEMORY"));
@@ -559,9 +855,16 @@ fn cmd_memory(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 
     match args[0].to_ascii_uppercase().as_slice() {
         b"DOCTOR" => Ok(RespValue::bulk_string("Sam, I have no memory problems")),
-        b"MALLOC-SIZE" | b"MALLOC-STATS" => Ok(RespValue::bulk_string(
+        b"MALLOC-SIZE" => Ok(RespValue::bulk_string(
             "Memory allocator stats not available",
         )),
+        b"MALLOC-STATS" => {
+            let mut buffer = String::new();
+            unsafe {
+                mi_stats_print_out(mi_stats_callback, &mut buffer as *mut _ as *mut c_void);
+            }
+            Ok(RespValue::bulk_string(&buffer))
+        }
         b"PURGE" => Ok(RespValue::ok()),
         b"STATS" => Ok(memory_stats(store)),
         b"USAGE" => {
@@ -634,21 +937,25 @@ fn memory_stats(store: &Store) -> RespValue {
         RespValue::bulk_string("allocator.resident"),
         RespValue::integer(0),
         RespValue::bulk_string("allocator-fragmentation.ratio"),
-        RespValue::bulk_string("1.0"),
+        RespValue::bulk_string("0.0"),
         RespValue::bulk_string("allocator-fragmentation.bytes"),
         RespValue::integer(0),
         RespValue::bulk_string("allocator-rss.ratio"),
-        RespValue::bulk_string("1.0"),
+        RespValue::bulk_string("0.0"),
         RespValue::bulk_string("allocator-rss.bytes"),
         RespValue::integer(0),
         RespValue::bulk_string("rss-overhead.ratio"),
-        RespValue::bulk_string("1.0"),
+        RespValue::bulk_string("0.0"),
         RespValue::bulk_string("rss-overhead.bytes"),
         RespValue::integer(0),
         RespValue::bulk_string("fragmentation"),
-        RespValue::bulk_string("1.0"),
+        RespValue::bulk_string("0.0"),
         RespValue::bulk_string("fragmentation.bytes"),
         RespValue::integer(0),
+        RespValue::bulk_string("allocator.name"),
+        RespValue::bulk_string("mimalloc"),
+        RespValue::bulk_string("allocator.note"),
+        RespValue::bulk_string("Use MEMORY MALLOC-STATS for detailed mimalloc stats"),
     ])
 }
 
@@ -803,4 +1110,255 @@ fn cmd_module(args: &[Bytes]) -> Result<RespValue> {
             String::from_utf8_lossy(&args[0])
         ))),
     }
+}
+
+// === CONFIG Command ===
+
+fn cmd_config(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
+    if args.is_empty() {
+        return Err(Error::Syntax);
+    }
+
+    match args[0].to_ascii_uppercase().as_slice() {
+        b"GET" => {
+            if args.len() < 2 {
+                return Err(Error::WrongArity("CONFIG GET"));
+            }
+            cmd_config_get(server, &args[1])
+        }
+        b"SET" => {
+            if args.len() < 3 {
+                return Err(Error::WrongArity("CONFIG SET"));
+            }
+            cmd_config_set(server, &args[1], &args[2])
+        }
+        b"RESETSTAT" => Ok(RespValue::ok()),
+        // ... regex continue from existing code
+        b"REWRITE" => Ok(RespValue::ok()),
+        _ => Err(Error::Custom(format!(
+            "ERR Unknown subcommand '{}'",
+            String::from_utf8_lossy(&args[0])
+        ))),
+    }
+}
+
+fn cmd_config_set(server: &Arc<ServerState>, parameter: &[u8], value: &[u8]) -> Result<RespValue> {
+    let param_str = String::from_utf8_lossy(parameter).to_lowercase();
+    let value_str = String::from_utf8_lossy(value);
+
+    match param_str.as_str() {
+        "slowlog-log-slower-than" => {
+            let val: u64 = value_str
+                .parse()
+                .map_err(|_| Error::Custom("Invalid argument".into()))?;
+            server
+                .slowlog_threshold_us
+                .store(val, std::sync::atomic::Ordering::Relaxed);
+        }
+        "slowlog-max-len" => {
+            let val: usize = value_str
+                .parse()
+                .map_err(|_| Error::Custom("Invalid argument".into()))?;
+            server
+                .slowlog_max_len
+                .store(val, std::sync::atomic::Ordering::Relaxed);
+        }
+        "latency-monitor-threshold" => {
+            let val: u64 = value_str
+                .parse()
+                .map_err(|_| Error::Custom("Invalid argument".into()))?;
+            server
+                .latency_threshold_ms
+                .store(val, std::sync::atomic::Ordering::Relaxed);
+        }
+        "acllog-max-len" => {
+            let val: usize = value_str
+                .parse()
+                .map_err(|_| Error::Custom("Invalid argument".into()))?;
+            server
+                .acl_log_max_len
+                .store(val, std::sync::atomic::Ordering::Relaxed);
+        }
+        "appendonly" => {
+            let val = match value_str.to_lowercase().as_str() {
+                "yes" => true,
+                "no" => false,
+                _ => return Err(Error::Custom("Invalid argument 'yes' or 'no'".into())),
+            };
+            server
+                .aof_enabled
+                .store(val, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Supported but read-only in this context or complex logical update needed
+        "databases" | "maxclients" | "port" | "bind" | "dir" | "dbfilename" | "appendfilename" => {
+            return Err(Error::Custom(format!(
+                "ERR Unsupported CONFIG parameter: {}",
+                param_str
+            )));
+        }
+        // Silent ignore for others to allow some compatibility
+        _ => {
+            // For strictness we could error, but for compatibility we might just return OK or error
+            // Redis returns error for unknown parameters
+            return Err(Error::Custom(format!(
+                "ERR Unsupported CONFIG parameter: {}",
+                param_str
+            )));
+        }
+    }
+
+    Ok(RespValue::ok())
+}
+
+fn cmd_config_get(server: &Arc<ServerState>, pattern: &[u8]) -> Result<RespValue> {
+    let pattern_str = std::str::from_utf8(pattern).unwrap_or("*");
+    let mut result = Vec::new();
+
+    // All config parameters with their values
+    let configs: Vec<(&str, String)> = vec![
+        (
+            "databases",
+            server
+                .databases
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        ("maxclients", "10000".to_string()),
+        ("timeout", "0".to_string()),
+        ("tcp-keepalive", "300".to_string()),
+        ("tcp-backlog", "511".to_string()),
+        ("port", "6379".to_string()),
+        ("bind", "127.0.0.1".to_string()),
+        (
+            "appendonly",
+            if server
+                .aof_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
+        ("appendfsync", "everysec".to_string()),
+        ("appendfilename", "appendonly.aof".to_string()),
+        ("dbfilename", "dump.rdb".to_string()),
+        ("dir", ".".to_string()),
+        ("maxmemory", "0".to_string()),
+        ("maxmemory-policy", "noeviction".to_string()),
+        ("maxmemory-samples", "5".to_string()),
+        ("lfu-decay-time", "1".to_string()),
+        ("lfu-log-factor", "10".to_string()),
+        (
+            "slowlog-log-slower-than",
+            server
+                .slowlog_threshold_us
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "slowlog-max-len",
+            server
+                .slowlog_max_len
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "latency-monitor-threshold",
+            server
+                .latency_threshold_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        ("notify-keyspace-events", "".to_string()),
+        ("hash-max-listpack-entries", "512".to_string()),
+        ("hash-max-listpack-value", "64".to_string()),
+        ("list-max-listpack-size", "-2".to_string()),
+        ("list-compress-depth", "0".to_string()),
+        ("set-max-intset-entries", "512".to_string()),
+        ("zset-max-listpack-entries", "128".to_string()),
+        ("zset-max-listpack-value", "64".to_string()),
+        ("active-expire-effort", "1".to_string()),
+        ("hz", "10".to_string()),
+        ("dynamic-hz", "yes".to_string()),
+        ("lua-time-limit", "5000".to_string()),
+        ("cluster-enabled", "no".to_string()),
+        ("cluster-node-timeout", "15000".to_string()),
+        ("repl-timeout", "60".to_string()),
+        ("repl-backlog-size", "1048576".to_string()),
+        ("replica-read-only", "yes".to_string()),
+        ("replica-serve-stale-data", "yes".to_string()),
+        ("min-replicas-to-write", "0".to_string()),
+        ("min-replicas-max-lag", "10".to_string()),
+        ("requirepass", "".to_string()),
+        ("masterauth", "".to_string()),
+        (
+            "acllog-max-len",
+            server
+                .acl_log_max_len
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        ("protected-mode", "yes".to_string()),
+        ("daemonize", "no".to_string()),
+        ("pidfile", "".to_string()),
+        ("loglevel", "notice".to_string()),
+        ("logfile", "".to_string()),
+        ("save", "3600 1 300 100 60 10000".to_string()),
+        ("rdbcompression", "yes".to_string()),
+        ("rdbchecksum", "yes".to_string()),
+        ("stop-writes-on-bgsave-error", "yes".to_string()),
+        ("rdb-save-incremental-fsync", "yes".to_string()),
+        ("aof-use-rdb-preamble", "yes".to_string()),
+        ("auto-aof-rewrite-percentage", "100".to_string()),
+        ("auto-aof-rewrite-min-size", "67108864".to_string()),
+        ("aof-rewrite-incremental-fsync", "yes".to_string()),
+        ("aof-load-truncated", "yes".to_string()),
+        ("activerehashing", "yes".to_string()),
+        (
+            "client-output-buffer-limit",
+            "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60".to_string(),
+        ),
+        ("proto-max-bulk-len", "536870912".to_string()),
+        ("oom-score-adj", "no".to_string()),
+        ("oom-score-adj-values", "0 200 800".to_string()),
+        ("acl-pubsub-default", "allchannels".to_string()),
+        ("lazyfree-lazy-eviction", "no".to_string()),
+        ("lazyfree-lazy-expire", "no".to_string()),
+        ("lazyfree-lazy-server-del", "no".to_string()),
+        ("lazyfree-lazy-user-del", "no".to_string()),
+        ("replica-lazy-flush", "no".to_string()),
+        ("io-threads", "1".to_string()),
+        ("io-threads-do-reads", "no".to_string()),
+    ];
+
+    // Pattern matching
+    let is_wildcard = pattern_str == "*";
+
+    for (name, value) in configs {
+        if is_wildcard || matches_pattern(pattern_str, name) {
+            result.push(RespValue::bulk_string(name));
+            result.push(RespValue::bulk_string(&value));
+        }
+    }
+
+    Ok(RespValue::array(result))
+}
+
+fn matches_pattern(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern.starts_with('*') && pattern.ends_with('*') {
+        let inner = &pattern[1..pattern.len() - 1];
+        return name.contains(inner);
+    }
+    if pattern.starts_with('*') {
+        return name.ends_with(&pattern[1..]);
+    }
+    if pattern.ends_with('*') {
+        return name.starts_with(&pattern[..pattern.len() - 1]);
+    }
+    name == pattern
 }

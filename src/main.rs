@@ -1,10 +1,17 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::BytesMut;
+use mimalloc::MiMalloc;
+
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
+
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 use sockudo_kv::PubSub;
 use sockudo_kv::client::ClientState;
@@ -24,6 +31,9 @@ use sockudo_kv::protocol::{Command, Parser, RespValue};
 use sockudo_kv::pubsub::PubSubMessage;
 use sockudo_kv::server_state::ServerState;
 use std::path::Path;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const READ_BUF_SIZE: usize = 64 * 1024;
 const WRITE_BUF_SIZE: usize = 64 * 1024;
@@ -52,8 +62,12 @@ async fn main() -> std::io::Result<()> {
         config.port, config.bind
     );
 
-    // Bind to addresses
+    // Bind TCP listeners using socket2 for proper configuration
     let mut listeners = Vec::new();
+    let tcp_backlog = config.tcp_backlog as i32;
+    #[cfg(target_os = "linux")]
+    let socket_mark = config.socket_mark_id;
+
     for bind_addr in &config.bind {
         let (addr_str, lenient) = if let Some(stripped) = bind_addr.strip_prefix('-') {
             (stripped, true)
@@ -61,56 +75,40 @@ async fn main() -> std::io::Result<()> {
             (bind_addr.as_str(), false)
         };
 
-        if addr_str == "*" {
-            // Bind to all interfaces?
-            // Redis treats * as "all interfaces" but TcpListener::bind("0.0.0.0") does that.
-            // If user puts *, we probably want 0.0.0.0 (IPv4) or :: (IPv6) depending on system?
-            // Actually * usually implies INADDR_ANY.
-            let addr = format!("0.0.0.0:{}", config.port);
-            match TcpListener::bind(&addr).await {
-                Ok(l) => {
+        let addrs_to_try: Vec<String> = if addr_str == "*" {
+            vec![
+                format!("0.0.0.0:{}", config.port),
+                format!("[::]:{}", config.port),
+            ]
+        } else {
+            vec![format!("{}:{}", addr_str, config.port)]
+        };
+
+        let mut bound = false;
+        for addr in addrs_to_try {
+            match create_tcp_listener(
+                &addr,
+                tcp_backlog,
+                #[cfg(target_os = "linux")]
+                socket_mark,
+            ) {
+                Ok(listener) => {
                     println!("Listening on {}", addr);
-                    listeners.push(l);
+                    listeners.push(listener);
+                    bound = true;
+                    break;
                 }
                 Err(e) => {
-                    // Try IPv6
-                    let addr_v6 = format!(":::{}", config.port);
-                    match TcpListener::bind(&addr_v6).await {
-                        Ok(l) => {
-                            println!("Listening on {}", addr_v6);
-                            listeners.push(l);
-                        }
-                        Err(e2) => {
-                            if !lenient {
-                                eprintln!("Failed to bind to * (0.0.0.0 or ::): {} / {}", e, e2);
-                                std::process::exit(1);
-                            } else {
-                                eprintln!("Warning: Failed to bind to *: {}", e);
-                            }
-                        }
+                    if !lenient {
+                        eprintln!("Failed to bind to {}: {}", addr, e);
                     }
                 }
             }
-            continue;
         }
 
-        let addr = format!("{}:{}", addr_str, config.port);
-        match TcpListener::bind(&addr).await {
-            Ok(l) => {
-                println!("Listening on {}", addr);
-                listeners.push(l);
-            }
-            Err(e) => {
-                if !lenient {
-                    eprintln!("Failed to bind to {}: {}", addr, e);
-                    std::process::exit(1);
-                } else {
-                    println!(
-                        "Warning: Could not bind to {}, ignoring (- prefix used). Error: {}",
-                        addr, e
-                    );
-                }
-            }
+        if !bound && !lenient && addr_str != "*" {
+            eprintln!("Failed to bind to {}", addr_str);
+            std::process::exit(1);
         }
     }
 
@@ -118,6 +116,77 @@ async fn main() -> std::io::Result<()> {
         eprintln!("Could not bind to any address.");
         std::process::exit(1);
     }
+
+    // Unix socket listener (cross-platform with cfg)
+    #[cfg(unix)]
+    let _unix_listener = if let Some(ref path) = config.unixsocket {
+        match create_unix_listener(path, config.unixsocketperm) {
+            Ok(listener) => {
+                println!("Listening on Unix socket: {}", path);
+                Some(listener)
+            }
+            Err(e) => {
+                eprintln!("Failed to create Unix socket {}: {}", path, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(not(unix))]
+    let _unix_listener: Option<()> = None;
+    #[cfg(not(unix))]
+    if config.unixsocket.is_some() {
+        eprintln!("Warning: Unix sockets are not supported on this platform");
+    }
+
+    // TLS listener setup
+    let tls_acceptor = if config.tls_port > 0 {
+        match (&config.tls_cert_file, &config.tls_key_file) {
+            (Some(cert_file), Some(key_file)) => {
+                match sockudo_kv::tls::load_tls_config(
+                    cert_file,
+                    key_file,
+                    config.tls_key_file_pass.as_deref(),
+                    config.tls_ca_cert_file.as_deref(),
+                ) {
+                    Ok(tls_config) => {
+                        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+                        // Create TLS listener
+                        match create_tcp_listener(
+                            &format!("0.0.0.0:{}", config.tls_port),
+                            tcp_backlog,
+                            #[cfg(target_os = "linux")]
+                            socket_mark,
+                        ) {
+                            Ok(listener) => {
+                                println!("TLS listening on 0.0.0.0:{}", config.tls_port);
+                                Some((acceptor, listener))
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to bind TLS listener: {}", e);
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load TLS config: {}", e);
+                        None
+                    }
+                }
+            }
+            _ => {
+                eprintln!("TLS port configured but no certificate/key files specified");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Suppress unused warning if TLS is not used yet
+    let _ = &tls_acceptor;
 
     // Global state - MultiStore with configured databases
     let multi_store = Arc::new(sockudo_kv::storage::MultiStore::with_capacity_and_count(
@@ -148,8 +217,39 @@ async fn main() -> std::io::Result<()> {
         server_state.set_default_user_password(pass);
     }
 
-    // In a real implementation we would apply more config flags here,
-    // e.g. persistence settings to replication manager, etc.
+    // Apply slow log configuration
+    server_state.slowlog_threshold_us.store(
+        config.slowlog_log_slower_than as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.slowlog_max_len.store(
+        config.slowlog_max_len as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // Apply latency monitor configuration
+    server_state.latency_threshold_ms.store(
+        config.latency_monitor_threshold,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // Apply ACL log configuration
+    server_state
+        .acl_log_max_len
+        .store(config.acllog_max_len, std::sync::atomic::Ordering::Relaxed);
+
+    // Apply database count
+    server_state
+        .databases
+        .store(config.databases, std::sync::atomic::Ordering::Relaxed);
+
+    // Apply AOF enabled flag
+    server_state
+        .aof_enabled
+        .store(config.appendonly, std::sync::atomic::Ordering::Relaxed);
+
+    // Apply maxclients limit
+    clients.set_maxclients(config.maxclients);
 
     // Load RDB if exists
     let rdb_path = Path::new(&config.dir).join(&config.dbfilename);
@@ -210,6 +310,16 @@ async fn main() -> std::io::Result<()> {
             loop {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
+                        // Check maxclients limit
+                        if !clients.can_accept() {
+                            // Send error response and close connection immediately
+                            let _ = socket.try_write(b"-ERR max number of clients reached\r\n");
+                            server_state
+                                .rejected_connections
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+
                         let multi_store = Arc::clone(&multi_store);
                         let pubsub = Arc::clone(&pubsub);
                         let clients = Arc::clone(&clients);
@@ -270,6 +380,11 @@ async fn handle_client(
     config: Arc<ServerConfig>,
 ) -> std::io::Result<()> {
     socket.set_nodelay(true)?;
+
+    // Apply TCP keepalive from config
+    if config.tcp_keepalive > 0 {
+        let _ = apply_tcp_keepalive(&socket, config.tcp_keepalive);
+    }
 
     // Register this client with PubSub
     let (sub_id, rx) = pubsub.register();
@@ -684,4 +799,86 @@ fn handle_select(client: &Arc<ClientState>, db_count: usize, args: &[bytes::Byte
 
     client.select_db(db_index as u64);
     RespValue::ok()
+}
+
+/// Create a TCP listener with socket2 for proper configuration (backlog, socket mark)
+fn create_tcp_listener(
+    addr: &str,
+    backlog: i32,
+    #[cfg(target_os = "linux")] socket_mark: u32,
+) -> std::io::Result<TcpListener> {
+    use std::net::SocketAddr;
+
+    let socket_addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let domain = if socket_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+
+    // Allow address reuse
+    socket.set_reuse_address(true)?;
+
+    // Set socket mark on Linux
+    #[cfg(target_os = "linux")]
+    if socket_mark != 0 {
+        // SO_MARK requires CAP_NET_ADMIN
+        let _ = socket.set_mark(socket_mark);
+    }
+
+    // Bind to address
+    socket.bind(&socket_addr.into())?;
+
+    // Listen with configured backlog
+    socket.listen(backlog)?;
+
+    // Set non-blocking for tokio
+    socket.set_nonblocking(true)?;
+
+    // Convert to tokio TcpListener
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
+}
+
+/// Apply TCP keepalive settings to a connected socket
+fn apply_tcp_keepalive(socket: &TcpStream, keepalive_secs: u32) -> std::io::Result<()> {
+    use socket2::SockRef;
+
+    if keepalive_secs > 0 {
+        let sock_ref = SockRef::from(socket);
+        let keepalive =
+            socket2::TcpKeepalive::new().with_time(Duration::from_secs(keepalive_secs as u64));
+
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+        let keepalive = keepalive
+            .with_interval(Duration::from_secs(keepalive_secs as u64 / 3))
+            .with_retries(3);
+
+        sock_ref.set_tcp_keepalive(&keepalive)?;
+    }
+    Ok(())
+}
+
+/// Create a Unix socket listener (Unix only)
+#[cfg(unix)]
+fn create_unix_listener(path: &str, perm: Option<u32>) -> std::io::Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Remove existing socket file if it exists
+    let _ = std::fs::remove_file(path);
+
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+
+    // Set permissions if specified
+    if let Some(mode) = perm {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+
+    UnixListener::from_std(listener)
 }

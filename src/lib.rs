@@ -5,12 +5,16 @@ pub mod cluster_state;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod keyspace_notify;
 pub mod lua_engine;
+pub mod persistence;
+pub mod process_mgmt;
 pub mod protocol;
 pub mod pubsub;
 pub mod replication;
 pub mod server_state;
 pub mod storage;
+pub mod tls;
 
 pub use client::ClientState;
 pub use client_manager::ClientManager;

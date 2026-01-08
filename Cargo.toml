@@ -28,6 +28,15 @@ fastrand = "2"
 mlua = { version = "0.11", features = ["luajit", "serialize"] }
 parking_lot = "0.12"
 roaring = "0.11"
+mimalloc = { version = "*", features = ["v3"] }
+
+# TLS Support
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "ring",
+] }
+rustls-pemfile = "2"
 
 
 [profile.release]

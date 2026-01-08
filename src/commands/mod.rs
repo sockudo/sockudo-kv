@@ -58,7 +58,7 @@ impl Dispatcher {
         let args = &cmd.args;
         let cmd_name = cmd.name();
 
-        // Server commands - need ServerState
+        // Server commands (need ServerState) - includes CONFIG now
         if is_server_command(cmd_name) {
             return match server {
                 Some(srv) => server::execute(store, srv, cmd_name, args),
@@ -68,10 +68,7 @@ impl Dispatcher {
             };
         }
 
-        // Config commands
-        if cmd.is_command(b"CONFIG") {
-            return cmd_config(args);
-        }
+        // Info command
         if cmd.is_command(b"INFO") {
             return Ok(cmd_info(args));
         }
@@ -290,50 +287,6 @@ fn cmd_type(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     )))
 }
 
-fn cmd_config(args: &[Bytes]) -> Result<RespValue> {
-    if args.is_empty() {
-        return Err(Error::Syntax);
-    }
-
-    let subcommand = &args[0];
-
-    // Case-insensitive comparison for subcommand
-    if subcommand.len() == 3 && subcommand.eq_ignore_ascii_case(b"GET") {
-        // CONFIG GET - return empty array or default values
-        if args.len() < 2 {
-            return Err(Error::WrongArity("CONFIG GET"));
-        }
-        // For redis-benchmark compatibility, return some common configs
-        let param = &args[1];
-        if param.as_ref() == b"save" || param.as_ref() == b"*save*" {
-            return Ok(RespValue::array(vec![
-                RespValue::bulk(Bytes::from_static(b"save")),
-                RespValue::bulk(Bytes::from_static(b"")),
-            ]));
-        }
-        if param.as_ref() == b"appendonly" || param.as_ref() == b"*append*" {
-            return Ok(RespValue::array(vec![
-                RespValue::bulk(Bytes::from_static(b"appendonly")),
-                RespValue::bulk(Bytes::from_static(b"no")),
-            ]));
-        }
-        // For any other parameter, return empty array
-        return Ok(RespValue::array(vec![]));
-    } else if subcommand.len() == 3 && subcommand.eq_ignore_ascii_case(b"SET") {
-        // CONFIG SET - accept but ignore
-        if args.len() < 3 {
-            return Err(Error::WrongArity("CONFIG SET"));
-        }
-        return Ok(RespValue::ok());
-    } else if subcommand.eq_ignore_ascii_case(b"RESETSTAT") {
-        return Ok(RespValue::ok());
-    } else if subcommand.eq_ignore_ascii_case(b"REWRITE") {
-        return Ok(RespValue::ok());
-    }
-
-    Err(Error::Syntax)
-}
-
 fn cmd_info(args: &[Bytes]) -> RespValue {
     // Return minimal INFO response for redis-benchmark compatibility
     let section = if args.is_empty() {
@@ -361,6 +314,7 @@ fn cmd_info(args: &[Bytes]) -> RespValue {
 fn is_server_command(cmd: &[u8]) -> bool {
     cmd.eq_ignore_ascii_case(b"ACL")
         || cmd.eq_ignore_ascii_case(b"COMMAND")
+        || cmd.eq_ignore_ascii_case(b"CONFIG")
         || cmd.eq_ignore_ascii_case(b"MEMORY")
         || cmd.eq_ignore_ascii_case(b"LATENCY")
         || cmd.eq_ignore_ascii_case(b"SLOWLOG")

@@ -1004,6 +1004,12 @@ pub struct Entry {
     expire_at: AtomicI64,
     /// Version number for optimistic locking (WATCH)
     version: AtomicU64,
+    /// Last access time in seconds since UNIX epoch (for LRU eviction)
+    /// Uses i32 stored as i64 for atomic access, wraps after 2038
+    lru_time: AtomicI64,
+    /// LFU counter (logarithmic, 0-255) for LFU eviction
+    /// Uses probabilistic increment like Redis
+    lfu_counter: std::sync::atomic::AtomicU8,
 }
 
 impl Entry {
@@ -1011,19 +1017,25 @@ impl Entry {
 
     #[inline]
     pub fn new(data: DataType) -> Self {
+        let now_secs = (now_ms() / 1000) as i64;
         Self {
             data,
             expire_at: AtomicI64::new(Self::NO_EXPIRE),
             version: AtomicU64::new(1),
+            lru_time: AtomicI64::new(now_secs),
+            lfu_counter: std::sync::atomic::AtomicU8::new(5), // Initial counter
         }
     }
 
     #[inline]
     pub fn with_expire(data: DataType, expire_at_ms: i64) -> Self {
+        let now_secs = (now_ms() / 1000) as i64;
         Self {
             data,
             expire_at: AtomicI64::new(expire_at_ms),
             version: AtomicU64::new(1),
+            lru_time: AtomicI64::new(now_secs),
+            lfu_counter: std::sync::atomic::AtomicU8::new(5),
         }
     }
 
@@ -1078,6 +1090,76 @@ impl Entry {
         } else {
             Some((exp - now_ms()).max(0))
         }
+    }
+
+    // ==================== LRU/LFU Methods ====================
+
+    /// Update LRU access time to now
+    #[inline]
+    pub fn touch_lru(&self) {
+        let now_secs = (now_ms() / 1000) as i64;
+        self.lru_time.store(now_secs, Ordering::Relaxed);
+    }
+
+    /// Get LRU access time in seconds since epoch
+    #[inline]
+    pub fn lru_time(&self) -> i64 {
+        self.lru_time.load(Ordering::Relaxed)
+    }
+
+    /// Get idle time in seconds since last access
+    #[inline]
+    pub fn idle_time(&self) -> i64 {
+        let now_secs = (now_ms() / 1000) as i64;
+        (now_secs - self.lru_time.load(Ordering::Relaxed)).max(0)
+    }
+
+    /// Increment LFU counter using probabilistic increment (Redis algorithm)
+    /// Counter grows logarithmically to prevent saturation
+    #[inline]
+    pub fn increment_lfu(&self) {
+        let counter = self.lfu_counter.load(Ordering::Relaxed);
+        if counter < 255 {
+            // Probabilistic increment: P = 1/(counter-LFU_INIT_VAL+1)
+            let base_val = counter.saturating_sub(5) as u32;
+            let p = 1.0 / ((base_val as f64) + 1.0);
+            if fastrand::f64() < p {
+                let _ = self.lfu_counter.compare_exchange(
+                    counter,
+                    counter.saturating_add(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+
+    /// Decay LFU counter based on time since last access
+    /// Called periodically to decrease counters of idle keys
+    #[inline]
+    pub fn decay_lfu(&self, lfu_decay_time: u32) {
+        if lfu_decay_time == 0 {
+            return;
+        }
+        let idle_secs = self.idle_time() as u32;
+        let num_decays = idle_secs / lfu_decay_time;
+        if num_decays > 0 {
+            let counter = self.lfu_counter.load(Ordering::Relaxed);
+            let new_counter = counter.saturating_sub(num_decays.min(255) as u8);
+            self.lfu_counter.store(new_counter, Ordering::Relaxed);
+        }
+    }
+
+    /// Get LFU counter value
+    #[inline]
+    pub fn lfu_counter(&self) -> u8 {
+        self.lfu_counter.load(Ordering::Relaxed)
+    }
+
+    /// Check if key has expiration set (for volatile-* eviction)
+    #[inline]
+    pub fn has_expire(&self) -> bool {
+        self.expire_at.load(Ordering::Relaxed) != Self::NO_EXPIRE
     }
 }
 
