@@ -35,6 +35,18 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     });
 
+    if config.daemonize {
+        println!(
+            "WARNING: daemonize yes is specified but not fully supported in this build. Running in foreground."
+        );
+    }
+
+    if !config.pidfile.is_empty() {
+        if let Err(e) = std::fs::write(&config.pidfile, std::process::id().to_string()) {
+            eprintln!("Failed to write pidfile {}: {}", config.pidfile, e);
+        }
+    }
+
     println!(
         "Starting sockudo-kv with config: port={}, bound to {:?}",
         config.port, config.bind

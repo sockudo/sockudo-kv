@@ -170,6 +170,32 @@ fn parse_config_file(path: &Path, config: &mut ServerConfig) -> Result<(), Strin
                 config.socket_mark_id = parse_u32(&args[0], "socket-mark-id")?
             }
             "protected-mode" if !args.is_empty() => config.protected_mode = parse_bool(&args[0])?,
+            "bind-source-addr" if !args.is_empty() => {
+                config.bind_source_addr = Some(args[0].clone())
+            }
+            "enable-protected-configs" if !args.is_empty() => {
+                config.enable_protected_configs = parse_bool(&args[0])?
+            }
+            "enable-debug-command" if !args.is_empty() => {
+                config.enable_debug_command = parse_bool(&args[0])?
+            }
+            "enable-module-command" if !args.is_empty() => {
+                config.enable_module_command = parse_bool(&args[0])?
+            }
+            "rename-command" if args.len() >= 2 => {
+                config
+                    .rename_command
+                    .insert(args[0].clone(), args[1].clone());
+            }
+
+            // Logging
+            "syslog-enabled" if !args.is_empty() => config.syslog_enabled = parse_bool(&args[0])?,
+            "syslog-ident" if !args.is_empty() => config.syslog_ident = args[0].clone(),
+            "syslog-facility" if !args.is_empty() => config.syslog_facility = args[0].clone(),
+            "hide-user-data-from-log" if !args.is_empty() => {
+                config.hide_user_data_from_log = parse_bool(&args[0])?
+            }
+            "locale-collate" if !args.is_empty() => config.locale_collate = args[0].clone(),
 
             "tls-port" if !args.is_empty() => config.tls_port = parse_u16(&args[0], "tls-port")?,
             "tls-cert-file" if !args.is_empty() => config.tls_cert_file = Some(args[0].clone()),
@@ -241,6 +267,10 @@ fn parse_config_file(path: &Path, config: &mut ServerConfig) -> Result<(), Strin
 
             "requirepass" if !args.is_empty() => config.requirepass = Some(args[0].clone()),
             "acl-pubsub-default" if !args.is_empty() => config.acl_pubsub_default = args[0].clone(),
+            "tracking-table-max-keys" if !args.is_empty() => {
+                config.tracking_table_max_keys = parse_u64(&args[0], "tracking-table-max-keys")?
+            }
+
             "acllog-max-len" if !args.is_empty() => {
                 config.acllog_max_len = parse_usize(&args[0], "acllog-max-len")?
             }
@@ -306,6 +336,11 @@ fn parse_config_file(path: &Path, config: &mut ServerConfig) -> Result<(), Strin
             "aof-timestamp-enabled" if !args.is_empty() => {
                 config.aof_timestamp_enabled = parse_bool(&args[0])?
             }
+            "aof-load-corrupt-tail-max-size" if !args.is_empty() => {
+                config.aof_load_corrupt_tail_max_size =
+                    parse_u64(&args[0], "aof-load-corrupt-tail-max-size")?
+            }
+
             "dbfilename" if !args.is_empty() => config.dbfilename = args[0].clone(),
             "dir" if !args.is_empty() => config.dir = args[0].clone(),
             "save" => {
@@ -391,6 +426,18 @@ fn parse_config_file(path: &Path, config: &mut ServerConfig) -> Result<(), Strin
             "min-replicas-max-lag" if !args.is_empty() => {
                 config.min_replicas_max_lag = parse_u64(&args[0], "min-replicas-max-lag")?
             }
+            "repl-ping-replica-period" if !args.is_empty() => {
+                config.repl_ping_replica_period = parse_u64(&args[0], "repl-ping-replica-period")?
+            }
+            "replica-full-sync-buffer-limit" if !args.is_empty() => {
+                config.replica_full_sync_buffer_limit = parse_memory(&args[0])?
+            }
+            "replica-announce-ip" if !args.is_empty() => {
+                config.replica_announce_ip = Some(args[0].clone())
+            }
+            "replica-announce-port" if !args.is_empty() => {
+                config.replica_announce_port = Some(parse_u16(&args[0], "replica-announce-port")?)
+            }
 
             "cluster-enabled" if !args.is_empty() => config.cluster_enabled = parse_bool(&args[0])?,
             "cluster-config-file" if !args.is_empty() => {
@@ -449,6 +496,20 @@ fn parse_config_file(path: &Path, config: &mut ServerConfig) -> Result<(), Strin
             }
             "cluster-preferred-endpoint-type" if !args.is_empty() => {
                 config.cluster_preferred_endpoint_type = args[0].clone()
+            }
+            "cluster-compatibility-sample-ratio" if !args.is_empty() => {
+                config.cluster_compatibility_sample_ratio =
+                    parse_u32(&args[0], "cluster-compatibility-sample-ratio")?
+            }
+            "cluster-slot-stats-enabled" if !args.is_empty() => {
+                config.cluster_slot_stats_enabled = parse_bool(&args[0])?
+            }
+            "cluster-slot-migration-write-pause-timeout" if !args.is_empty() => {
+                config.cluster_slot_migration_write_pause_timeout =
+                    parse_u64(&args[0], "cluster-slot-migration-write-pause-timeout")?
+            }
+            "cluster-slot-migration-handoff-max-lag-bytes" if !args.is_empty() => {
+                config.cluster_slot_migration_handoff_max_lag_bytes = parse_memory(&args[0])?
             }
 
             "maxclients" if !args.is_empty() => {
@@ -546,6 +607,76 @@ fn parse_config_file(path: &Path, config: &mut ServerConfig) -> Result<(), Strin
                 config.jemalloc_bg_thread = parse_bool(&args[0])?
             }
             "ignore-warnings" if !args.is_empty() => config.ignore_warnings = Some(args[0].clone()),
+
+            "lookahead" if !args.is_empty() => config.lookahead = parse_u32(&args[0], "lookahead")?,
+            "maxmemory-clients" if !args.is_empty() => config.maxmemory_clients = args[0].clone(),
+            "max-new-tls-connections-per-cycle" if !args.is_empty() => {
+                config.max_new_tls_connections_per_cycle =
+                    parse_u32(&args[0], "max-new-tls-connections-per-cycle")?
+            }
+
+            // Latency
+            "latency-tracking" if !args.is_empty() => {
+                config.latency_tracking = parse_bool(&args[0])?
+            }
+            "latency-tracking-info-percentiles" if !args.is_empty() => {
+                config.latency_tracking_info_percentiles =
+                    parse_f64_list(args, "latency-tracking-info-percentiles")?
+            }
+
+            // Threading/Kernel
+            "io-threads" if !args.is_empty() => {
+                config.io_threads = parse_usize(&args[0], "io-threads")?
+            }
+            "oom-score-adj" if !args.is_empty() => config.oom_score_adj = args[0].clone(),
+            "oom-score-adj-values" if args.len() >= 3 => {
+                config.oom_score_adj_values = parse_triple_i32(args, "oom-score-adj-values")?
+            }
+            "disable-thp" if !args.is_empty() => config.disable_thp = parse_bool(&args[0])?,
+            "server-cpulist" if !args.is_empty() => config.server_cpulist = Some(args[0].clone()),
+            "bio-cpulist" if !args.is_empty() => config.bio_cpulist = Some(args[0].clone()),
+            "aof-rewrite-cpulist" if !args.is_empty() => {
+                config.aof_rewrite_cpulist = Some(args[0].clone())
+            }
+            "bgsave-cpulist" if !args.is_empty() => config.bgsave_cpulist = Some(args[0].clone()),
+
+            // Shutdown
+            "shutdown-timeout" if !args.is_empty() => {
+                config.shutdown_timeout = parse_u64(&args[0], "shutdown-timeout")?
+            }
+            "shutdown-on-sigint" if !args.is_empty() => config.shutdown_on_sigint = args[0].clone(),
+            "shutdown-on-sigterm" if !args.is_empty() => {
+                config.shutdown_on_sigterm = args[0].clone()
+            }
+
+            // Lua
+            "lua-time-limit" | "busy-reply-threshold" if !args.is_empty() => {
+                config.lua_time_limit = parse_u64(&args[0], "lua-time-limit")?
+            }
+
+            // Active Defrag
+            "activedefrag" if !args.is_empty() => config.activedefrag = parse_bool(&args[0])?,
+            "active-defrag-ignore-bytes" if !args.is_empty() => {
+                config.active_defrag_ignore_bytes = parse_memory(&args[0])?
+            }
+            "active-defrag-threshold-lower" if !args.is_empty() => {
+                config.active_defrag_threshold_lower =
+                    parse_u32(&args[0], "active-defrag-threshold-lower")?
+            }
+            "active-defrag-threshold-upper" if !args.is_empty() => {
+                config.active_defrag_threshold_upper =
+                    parse_u32(&args[0], "active-defrag-threshold-upper")?
+            }
+            "active-defrag-cycle-min" if !args.is_empty() => {
+                config.active_defrag_cycle_min = parse_u32(&args[0], "active-defrag-cycle-min")?
+            }
+            "active-defrag-cycle-max" if !args.is_empty() => {
+                config.active_defrag_cycle_max = parse_u32(&args[0], "active-defrag-cycle-max")?
+            }
+            "active-defrag-max-scan-fields" if !args.is_empty() => {
+                config.active_defrag_max_scan_fields =
+                    parse_u32(&args[0], "active-defrag-max-scan-fields")?
+            }
 
             "include" if !args.is_empty() => {
                 let include_path = PathBuf::from(&args[0]);
@@ -698,6 +829,27 @@ fn parse_memory(s: &str) -> Result<u64, String> {
     Ok(num * unit)
 }
 
+fn parse_f64_list(args: &[String], field: &str) -> Result<Vec<f64>, String> {
+    let mut res = Vec::with_capacity(args.len());
+    for s in args {
+        res.push(
+            s.parse::<f64>()
+                .map_err(|_| format!("Invalid {}: {}", field, s))?,
+        );
+    }
+    Ok(res)
+}
+
+fn parse_triple_i32(args: &[String], field: &str) -> Result<(i32, i32, i32), String> {
+    if args.len() < 3 {
+        return Err(format!("Invalid {}: expected 3 arguments", field));
+    }
+    let a = parse_i32(&args[0], field)?;
+    let b = parse_i32(&args[1], field)?;
+    let c = parse_i32(&args[2], field)?;
+    Ok((a, b, c))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +908,122 @@ mod tests {
         assert_eq!(config.requirepass, Some("secret password".to_string()));
         assert_eq!(config.client_output_buffer_limit_replica, "256mb 64mb 60");
         assert_eq!(config.replicaof, Some(("master.host".to_string(), 6379)));
+
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn test_parse_new_configs() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let config_path = dir.join("redis_new_config_test.conf");
+        let mut file = std::fs::File::create(&config_path).unwrap();
+
+        write!(
+            file,
+            "
+            bind-source-addr 10.0.0.1
+            enable-protected-configs yes
+            enable-debug-command no
+            enable-module-command yes
+            rename-command CONFIG b840fc02d524045429941cc15f59e41cb7be6c52
+            syslog-enabled yes
+            syslog-ident sockudo
+            syslog-facility local1
+            hide-user-data-from-log yes
+            locale-collate en_US.UTF-8
+            tracking-table-max-keys 500
+            aof-timestamp-enabled yes
+            aof-load-corrupt-tail-max-size 1024
+            min-replicas-max-lag 5
+            repl-ping-replica-period 15
+            replica-full-sync-buffer-limit 32mb
+            replica-announce-ip 1.2.3.4
+            replica-announce-port 6380
+            cluster-preferred-endpoint-type hostname
+            cluster-compatibility-sample-ratio 50
+            cluster-slot-stats-enabled yes
+            cluster-slot-migration-write-pause-timeout 500
+            cluster-slot-migration-handoff-max-lag-bytes 2mb
+            lookahead 32
+            maxmemory-clients 5%
+            max-new-tls-connections-per-cycle 5
+            latency-tracking yes
+            latency-tracking-info-percentiles 50.0 99.0 99.99
+            io-threads 4
+            oom-score-adj relative
+            oom-score-adj-values 100 200 800
+            disable-thp yes
+            shutdown-timeout 5
+            shutdown-on-sigint save
+            shutdown-on-sigterm default
+            busy-reply-threshold 7000
+            activedefrag yes
+            active-defrag-ignore-bytes 50mb
+            active-defrag-threshold-lower 5
+            active-defrag-threshold-upper 90
+            active-defrag-cycle-min 2
+            active-defrag-cycle-max 30
+            active-defrag-max-scan-fields 500
+        "
+        )
+        .unwrap();
+
+        let mut config = ServerConfig::default();
+        parse_config_file(&config_path, &mut config).unwrap();
+
+        assert_eq!(config.bind_source_addr, Some("10.0.0.1".to_string()));
+        assert!(config.enable_protected_configs);
+        assert!(!config.enable_debug_command);
+        assert!(config.enable_module_command);
+        assert_eq!(
+            config.rename_command.get("CONFIG"),
+            Some(&"b840fc02d524045429941cc15f59e41cb7be6c52".to_string())
+        );
+        assert!(config.syslog_enabled);
+        assert_eq!(config.syslog_ident, "sockudo");
+        assert_eq!(config.syslog_facility, "local1");
+        assert!(config.hide_user_data_from_log);
+        assert_eq!(config.locale_collate, "en_US.UTF-8");
+        assert_eq!(config.tracking_table_max_keys, 500);
+        assert!(config.aof_timestamp_enabled);
+        assert_eq!(config.aof_load_corrupt_tail_max_size, 1024);
+        assert_eq!(config.min_replicas_max_lag, 5);
+        assert_eq!(config.repl_ping_replica_period, 15);
+        assert_eq!(config.replica_full_sync_buffer_limit, 32 * 1024 * 1024);
+        assert_eq!(config.replica_announce_ip, Some("1.2.3.4".to_string()));
+        assert_eq!(config.replica_announce_port, Some(6380));
+        assert_eq!(config.cluster_preferred_endpoint_type, "hostname");
+        assert_eq!(config.cluster_compatibility_sample_ratio, 50);
+        assert!(config.cluster_slot_stats_enabled);
+        assert_eq!(config.cluster_slot_migration_write_pause_timeout, 500);
+        assert_eq!(
+            config.cluster_slot_migration_handoff_max_lag_bytes,
+            2 * 1024 * 1024
+        );
+        assert_eq!(config.lookahead, 32);
+        assert_eq!(config.maxmemory_clients, "5%");
+        assert_eq!(config.max_new_tls_connections_per_cycle, 5);
+        assert!(config.latency_tracking);
+        assert_eq!(
+            config.latency_tracking_info_percentiles,
+            vec![50.0, 99.0, 99.99]
+        );
+        assert_eq!(config.io_threads, 4);
+        assert_eq!(config.oom_score_adj, "relative");
+        assert_eq!(config.oom_score_adj_values, (100, 200, 800));
+        assert!(config.disable_thp);
+        assert_eq!(config.shutdown_timeout, 5);
+        assert_eq!(config.shutdown_on_sigint, "save");
+        assert_eq!(config.shutdown_on_sigterm, "default");
+        assert_eq!(config.lua_time_limit, 7000);
+        assert!(config.activedefrag);
+        assert_eq!(config.active_defrag_ignore_bytes, 50 * 1024 * 1024);
+        assert_eq!(config.active_defrag_threshold_lower, 5);
+        assert_eq!(config.active_defrag_threshold_upper, 90);
+        assert_eq!(config.active_defrag_cycle_min, 2);
+        assert_eq!(config.active_defrag_cycle_max, 30);
+        assert_eq!(config.active_defrag_max_scan_fields, 500);
 
         let _ = std::fs::remove_file(config_path);
     }

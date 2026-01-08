@@ -1,5 +1,7 @@
 //! Server configuration
 
+use std::collections::HashMap;
+
 /// Redis eviction policies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MaxMemoryPolicy {
@@ -54,6 +56,7 @@ pub struct ServerConfig {
     pub socket_mark_id: u32,
     /// Protected mode (default: yes)
     pub protected_mode: bool,
+    pub bind_source_addr: Option<String>,
 
     // --- TLS/SSL ---
     /// TLS port (default: 0 - disabled)
@@ -96,11 +99,22 @@ pub struct ServerConfig {
     pub always_show_logo: bool,
     pub set_proc_title: bool,
     pub proc_title_template: String,
+    pub enable_protected_configs: bool,
+    pub enable_debug_command: bool,
+    pub enable_module_command: bool,
+    pub rename_command: HashMap<String, String>,
+    pub syslog_enabled: bool,
+    pub syslog_ident: String,
+    pub syslog_facility: String,
+    pub hide_user_data_from_log: bool,
+    pub locale_collate: String,
 
     // --- Security ---
     /// Password required for access (default user)
     pub requirepass: Option<String>,
     pub acl_pubsub_default: String,
+    pub tracking_table_max_keys: u64,
+
     pub acllog_max_len: usize,
     pub aclfile: Option<String>,
 
@@ -134,6 +148,7 @@ pub struct ServerConfig {
     pub aof_load_truncated: bool,
     pub aof_use_rdb_preamble: bool,
     pub aof_timestamp_enabled: bool,
+    pub aof_load_corrupt_tail_max_size: u64,
 
     /// RDB filename (default: dump.rdb)
     pub dbfilename: String,
@@ -170,6 +185,10 @@ pub struct ServerConfig {
     pub replica_announced: bool,
     pub min_replicas_to_write: u32,
     pub min_replicas_max_lag: u64,
+    pub repl_ping_replica_period: u64,
+    pub replica_full_sync_buffer_limit: u64,
+    pub replica_announce_ip: Option<String>,
+    pub replica_announce_port: Option<u16>,
 
     // --- Cluster ---
     pub cluster_enabled: bool,
@@ -191,6 +210,10 @@ pub struct ServerConfig {
     pub cluster_announce_hostname: Option<String>,
     pub cluster_announce_human_nodename: Option<String>,
     pub cluster_preferred_endpoint_type: String, // "ip", "hostname", "unknown-endpoint"
+    pub cluster_compatibility_sample_ratio: u32,
+    pub cluster_slot_stats_enabled: bool,
+    pub cluster_slot_migration_write_pause_timeout: u64,
+    pub cluster_slot_migration_handoff_max_lag_bytes: u64,
 
     // --- Limits & Others ---
     /// Max connected clients (default: 10000)
@@ -201,6 +224,31 @@ pub struct ServerConfig {
     pub slowlog_max_len: u64,
     pub latency_monitor_threshold: u64,
     pub notify_keyspace_events: String,
+    pub lookahead: u32,
+    pub maxmemory_clients: String, // Can be % or bytes
+    pub max_new_tls_connections_per_cycle: u32,
+
+    // Latency
+    pub latency_tracking: bool,
+    pub latency_tracking_info_percentiles: Vec<f64>,
+
+    // Threading/Kernel
+    pub io_threads: usize,
+    pub oom_score_adj: String, // "no", "yes", "absolute", "relative"
+    pub oom_score_adj_values: (i32, i32, i32),
+    pub disable_thp: bool,
+    pub server_cpulist: Option<String>,
+    pub bio_cpulist: Option<String>,
+    pub aof_rewrite_cpulist: Option<String>,
+    pub bgsave_cpulist: Option<String>,
+
+    // Shutdown
+    pub shutdown_timeout: u64,
+    pub shutdown_on_sigint: String,
+    pub shutdown_on_sigterm: String,
+
+    // Lua
+    pub lua_time_limit: u64, // ms
 
     // Hash, Set, ZSet, List limits
     pub hash_max_listpack_entries: usize,
@@ -234,6 +282,15 @@ pub struct ServerConfig {
     pub max_new_connections_per_cycle: u32,
     pub jemalloc_bg_thread: bool,
     pub ignore_warnings: Option<String>,
+
+    // Active Defrag
+    pub activedefrag: bool,
+    pub active_defrag_ignore_bytes: u64,
+    pub active_defrag_threshold_lower: u32,
+    pub active_defrag_threshold_upper: u32,
+    pub active_defrag_cycle_min: u32,
+    pub active_defrag_cycle_max: u32,
+    pub active_defrag_max_scan_fields: u32,
 }
 
 impl Default for ServerConfig {
@@ -249,6 +306,7 @@ impl Default for ServerConfig {
             timeout: 0,
             socket_mark_id: 0,
             protected_mode: true,
+            bind_source_addr: None,
 
             // TLS
             tls_port: 0,
@@ -285,11 +343,24 @@ impl Default for ServerConfig {
             always_show_logo: true, // Redis default is actually dependent on TTY but usually yes/no in conf
             set_proc_title: true,
             proc_title_template: "{title} {listen-addr} {server-mode}".to_string(),
+            enable_protected_configs: false, // Default is usually no in redis.conf for enabling mutable configs, but redis.conf says "enable-protected-configs no" means block.
+            // Config comment: "no - Block for any connection". Implementation might vary.
+            // Let's follow config default: "enable-protected-configs no"
+            enable_debug_command: false,
+            enable_module_command: false,
+            rename_command: HashMap::new(),
+            syslog_enabled: false,
+            syslog_ident: "redis".to_string(),
+            syslog_facility: "local0".to_string(),
+            hide_user_data_from_log: false,
+            locale_collate: "".to_string(),
 
             // Security
             requirepass: None,
             acl_pubsub_default: "resetchannels".to_string(),
+            tracking_table_max_keys: 1000000,
             acllog_max_len: 128,
+
             aclfile: None,
 
             // Memory
@@ -319,6 +390,7 @@ impl Default for ServerConfig {
             aof_load_truncated: true,
             aof_use_rdb_preamble: true,
             aof_timestamp_enabled: false,
+            aof_load_corrupt_tail_max_size: 0,
 
             dbfilename: "dump.rdb".to_string(),
             dir: "./".to_string(),
@@ -349,6 +421,10 @@ impl Default for ServerConfig {
             replica_announced: true,
             min_replicas_to_write: 0,
             min_replicas_max_lag: 10,
+            repl_ping_replica_period: 10,
+            replica_full_sync_buffer_limit: 0,
+            replica_announce_ip: None,
+            replica_announce_port: None,
 
             // Cluster
             cluster_enabled: false,
@@ -370,6 +446,10 @@ impl Default for ServerConfig {
             cluster_announce_hostname: None,
             cluster_announce_human_nodename: None,
             cluster_preferred_endpoint_type: "ip".to_string(),
+            cluster_compatibility_sample_ratio: 0,
+            cluster_slot_stats_enabled: false,
+            cluster_slot_migration_write_pause_timeout: 10000,
+            cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
 
             // Limits & Others
             maxclients: 10000,
@@ -377,6 +457,23 @@ impl Default for ServerConfig {
             slowlog_max_len: 128,
             latency_monitor_threshold: 0,
             notify_keyspace_events: "".to_string(),
+            lookahead: 16,
+            maxmemory_clients: "0".to_string(),
+            max_new_tls_connections_per_cycle: 1,
+            latency_tracking: true,
+            latency_tracking_info_percentiles: vec![50.0, 99.0, 99.9],
+            io_threads: 1,
+            oom_score_adj: "no".to_string(),
+            oom_score_adj_values: (0, 200, 800),
+            disable_thp: true,
+            server_cpulist: None,
+            bio_cpulist: None,
+            aof_rewrite_cpulist: None,
+            bgsave_cpulist: None,
+            shutdown_timeout: 10,
+            shutdown_on_sigint: "default".to_string(),
+            shutdown_on_sigterm: "default".to_string(),
+            lua_time_limit: 5000,
 
             hash_max_listpack_entries: 512,
             hash_max_listpack_value: 64,
@@ -409,6 +506,13 @@ impl Default for ServerConfig {
             max_new_connections_per_cycle: 10,
             jemalloc_bg_thread: true,
             ignore_warnings: None,
+            activedefrag: false,
+            active_defrag_ignore_bytes: 100 * 1024 * 1024,
+            active_defrag_threshold_lower: 10,
+            active_defrag_threshold_upper: 100,
+            active_defrag_cycle_min: 1,
+            active_defrag_cycle_max: 25,
+            active_defrag_max_scan_fields: 1000,
         }
     }
 }
