@@ -534,11 +534,14 @@ fn cmd_command_list(args: &[Bytes]) -> Result<RespValue> {
     let mut result: Vec<&str> = all_cmds.clone();
 
     // Handle FILTERBY
-    if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"FILTERBY")
-        && args.len() >= 3 && args[1].eq_ignore_ascii_case(b"ACLCAT") {
-            let cat = std::str::from_utf8(&args[2]).unwrap_or("");
-            result = get_commands_in_category(cat);
-        }
+    if args.len() >= 2
+        && args[0].eq_ignore_ascii_case(b"FILTERBY")
+        && args.len() >= 3
+        && args[1].eq_ignore_ascii_case(b"ACLCAT")
+    {
+        let cat = std::str::from_utf8(&args[2]).unwrap_or("");
+        result = get_commands_in_category(cat);
+    }
 
     let resp: Vec<RespValue> = result
         .iter()

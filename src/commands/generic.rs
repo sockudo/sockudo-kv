@@ -507,9 +507,10 @@ fn sort_impl(store: &Store, args: &[Bytes], read_only: bool) -> Result<RespValue
                 let lookup_key = substitute_pattern(pattern, &e);
                 if let Some(entry) = store.data.get(lookup_key.as_ref())
                     && !entry.is_expired()
-                        && let Some(s) = entry.data.as_string() {
-                            return (e, parse_sort_key(s, alpha), Some(s.clone()));
-                        }
+                    && let Some(s) = entry.data.as_string()
+                {
+                    return (e, parse_sort_key(s, alpha), Some(s.clone()));
+                }
                 (e.clone(), None, None)
             } else {
                 (e.clone(), parse_sort_key(&e, alpha), None)
@@ -547,10 +548,11 @@ fn sort_impl(store: &Store, args: &[Bytes], read_only: bool) -> Result<RespValue
                     let lookup_key = substitute_pattern(pattern, e);
                     if let Some(entry) = store.data.get(lookup_key.as_ref())
                         && !entry.is_expired()
-                            && let Some(s) = entry.data.as_string() {
-                                res.push(s.clone());
-                                continue;
-                            }
+                        && let Some(s) = entry.data.as_string()
+                    {
+                        res.push(s.clone());
+                        continue;
+                    }
                     res.push(Bytes::new()); // nil equivalent
                 }
             }

@@ -89,12 +89,13 @@ impl Store {
             let mut merged = HyperLogLogData::new();
             for key in keys {
                 if let Some(e) = self.data.get(key.as_ref())
-                    && !e.is_expired() {
-                        match e.data.as_hyperloglog() {
-                            Some(hll) => merged.merge(hll),
-                            None => return 0,
-                        }
+                    && !e.is_expired()
+                {
+                    match e.data.as_hyperloglog() {
+                        Some(hll) => merged.merge(hll),
+                        None => return 0,
                     }
+                }
             }
             merged.count()
         }
@@ -107,12 +108,13 @@ impl Store {
 
         for source in sources {
             if let Some(e) = self.data.get(source.as_ref())
-                && !e.is_expired() {
-                    match e.data.as_hyperloglog() {
-                        Some(hll) => merged.merge(hll),
-                        None => return Err(Error::WrongType),
-                    }
+                && !e.is_expired()
+            {
+                match e.data.as_hyperloglog() {
+                    Some(hll) => merged.merge(hll),
+                    None => return Err(Error::WrongType),
                 }
+            }
         }
 
         // Store merged HLL in destination

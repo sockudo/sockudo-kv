@@ -586,12 +586,13 @@ fn cmd_client_tracking(
 
     // Validate redirect client exists
     if let Some(redir_id) = redirect_id
-        && manager.get_client(redir_id).is_none() {
-            return Err(Error::Custom(format!(
-                "ERR The client ID {} does not exist",
-                redir_id
-            )));
-        }
+        && manager.get_client(redir_id).is_none()
+    {
+        return Err(Error::Custom(format!(
+            "ERR The client ID {} does not exist",
+            redir_id
+        )));
+    }
 
     // Apply settings
     client.tracking.enabled.store(true, Ordering::Relaxed);
@@ -685,7 +686,9 @@ fn cmd_hello(
             .map_err(|_| Error::NotInteger)?;
 
         if !(2..=3).contains(&protover) {
-            return Err(Error::Custom("NOPROTO sorry this protocol version is not supported".to_string()));
+            return Err(Error::Custom(
+                "NOPROTO sorry this protocol version is not supported".to_string(),
+            ));
         }
         i = 1;
     }

@@ -71,8 +71,7 @@ impl Store {
                 let entry = e.get_mut();
                 match &mut entry.data {
                     DataType::TimeSeries(ts) => {
-                        ts.add_sample(timestamp, value)
-                            .map_err(Error::Other)?;
+                        ts.add_sample(timestamp, value).map_err(Error::Other)?;
                         Ok(timestamp)
                     }
                     _ => Err(Error::WrongType),
@@ -81,8 +80,7 @@ impl Store {
             DashEntry::Vacant(e) => {
                 // Auto-create timeseries
                 let mut ts = TimeSeriesData::new();
-                ts.add_sample(timestamp, value)
-                    .map_err(Error::Other)?;
+                ts.add_sample(timestamp, value).map_err(Error::Other)?;
                 e.insert(Entry::new(DataType::TimeSeries(Box::new(ts))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(timestamp)

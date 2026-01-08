@@ -577,9 +577,10 @@ fn cmd_cluster_replicas(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<R
 
     for node in cluster.nodes.iter() {
         if let Some(ref mid) = node.master_id
-            && mid == master_id {
-                replicas.push(RespValue::bulk(Bytes::from(node.format_nodes_line())));
-            }
+            && mid == master_id
+        {
+            replicas.push(RespValue::bulk(Bytes::from(node.format_nodes_line())));
+        }
     }
 
     Ok(RespValue::array(replicas))

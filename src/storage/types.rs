@@ -1332,10 +1332,11 @@ impl VectorSetData {
     /// Set attributes for an element
     pub fn set_attributes(&mut self, element: &[u8], attrs: Option<Box<JsonValue>>) -> bool {
         if let Some(&idx) = self.element_index.get(element)
-            && let Some(node) = self.nodes.get_mut(idx as usize) {
-                node.attributes = attrs;
-                return true;
-            }
+            && let Some(node) = self.nodes.get_mut(idx as usize)
+        {
+            node.attributes = attrs;
+            return true;
+        }
         false
     }
 

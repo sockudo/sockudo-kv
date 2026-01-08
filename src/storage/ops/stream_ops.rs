@@ -165,9 +165,10 @@ impl Store {
                     None => Err(Error::WrongType),
                 };
                 if let Ok(deleted) = result
-                    && deleted > 0 {
-                        e.bump_version();
-                    }
+                    && deleted > 0
+                {
+                    e.bump_version();
+                }
                 result
             }
             None => Ok(0),
@@ -255,9 +256,10 @@ impl Store {
                     None => Err(Error::WrongType),
                 };
                 if let Ok(trimmed) = result
-                    && trimmed > 0 {
-                        e.bump_version();
-                    }
+                    && trimmed > 0
+                {
+                    e.bump_version();
+                }
                 result
             }
             None => Ok(0),
@@ -382,7 +384,9 @@ impl Store {
                     Some(stream) => {
                         match stream.groups.get_mut(group) {
                             Some(group_data) => {
-                                if let std::collections::hash_map::Entry::Vacant(e) = group_data.consumers.entry(consumer) {
+                                if let std::collections::hash_map::Entry::Vacant(e) =
+                                    group_data.consumers.entry(consumer)
+                                {
                                     e.insert(Consumer::default());
                                     Ok(true)
                                 } else {
@@ -655,9 +659,10 @@ impl Store {
                     None => Err(Error::WrongType),
                 };
                 if let Ok(acked) = result
-                    && acked > 0 {
-                        e.bump_version();
-                    }
+                    && acked > 0
+                {
+                    e.bump_version();
+                }
                 result
             }
             None => Ok(0),
@@ -723,9 +728,9 @@ impl Store {
                             if let Some(pe) = group_data.pending.get(id)
                                 && let Some(old_consumer) =
                                     group_data.consumers.get_mut(&pe.consumer)
-                                {
-                                    old_consumer.pending.remove(id);
-                                }
+                            {
+                                old_consumer.pending.remove(id);
+                            }
 
                             // Add to new consumer
                             let delivery_time = time.unwrap_or_else(|| now - idle.unwrap_or(0));
@@ -765,9 +770,10 @@ impl Store {
                     None => Err(Error::WrongType),
                 };
                 if let Ok(ref claimed) = result
-                    && !claimed.is_empty() {
-                        e.bump_version();
-                    }
+                    && !claimed.is_empty()
+                {
+                    e.bump_version();
+                }
                 result
             }
             None => Ok(vec![]),
@@ -893,9 +899,10 @@ impl Store {
                     None => Err(Error::WrongType),
                 };
                 if let Ok(ref res) = result
-                    && (!res.claimed.is_empty() || !res.deleted_ids.is_empty()) {
-                        e.bump_version();
-                    }
+                    && (!res.claimed.is_empty() || !res.deleted_ids.is_empty())
+                {
+                    e.bump_version();
+                }
                 result
             }
             None => Ok(AutoClaimResult {

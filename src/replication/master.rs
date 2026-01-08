@@ -110,11 +110,11 @@ pub fn handle_replconf(
                         .ok()
                         .and_then(|s| s.parse::<i64>().ok())
                         .ok_or("invalid offset")
-                    {
-                        replica
-                            .ack_offset
-                            .store(offset, std::sync::atomic::Ordering::Relaxed);
-                    }
+                {
+                    replica
+                        .ack_offset
+                        .store(offset, std::sync::atomic::Ordering::Relaxed);
+                }
                 i += 2;
             }
             b"GETACK" => {

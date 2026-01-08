@@ -264,15 +264,17 @@ impl Store {
                 // GT: only set if new > current (or current is None)
                 if gt
                     && let Some(curr) = current
-                        && timestamp_ms <= curr {
-                            return false;
-                        }
+                    && timestamp_ms <= curr
+                {
+                    return false;
+                }
                 // LT: only set if new < current (or current is None)
                 if lt
                     && let Some(curr) = current
-                        && timestamp_ms >= curr {
-                            return false;
-                        }
+                    && timestamp_ms >= curr
+                {
+                    return false;
+                }
 
                 entry.set_expire_at(timestamp_ms);
                 true
@@ -355,9 +357,10 @@ impl Store {
 
             // Pattern filter
             if let Some(pat) = pattern
-                && !match_pattern(pat, entry.key()) {
-                    continue;
-                }
+                && !match_pattern(pat, entry.key())
+            {
+                continue;
+            }
 
             result.push(entry.key().clone());
             items_returned += 1;
@@ -474,11 +477,12 @@ impl Store {
         let mut count = 0i64;
         for key in keys {
             if let Some(entry) = self.data.get(key.as_ref())
-                && !entry.is_expired() {
-                    // Just accessing the entry updates LRU in most implementations
-                    // We don't have explicit LRU tracking, so this is a no-op
-                    count += 1;
-                }
+                && !entry.is_expired()
+            {
+                // Just accessing the entry updates LRU in most implementations
+                // We don't have explicit LRU tracking, so this is a no-op
+                count += 1;
+            }
         }
         count
     }
@@ -496,9 +500,10 @@ impl Store {
                         // Check if it's a small integer
                         if s.len() <= 20
                             && let Ok(s_str) = std::str::from_utf8(s)
-                                && s_str.parse::<i64>().is_ok() {
-                                    return Some("int");
-                                }
+                            && s_str.parse::<i64>().is_ok()
+                        {
+                            return Some("int");
+                        }
                         if s.len() <= 44 { "embstr" } else { "raw" }
                     }
                     DataType::List(l) => {

@@ -543,11 +543,12 @@ impl Store {
         for key in &keys[1..] {
             if let Some(e) = self.data.get(key)
                 && !e.is_expired()
-                    && let Some(ss) = e.data.as_sorted_set() {
-                        for member in ss.scores.keys() {
-                            result.remove(member);
-                        }
-                    }
+                && let Some(ss) = e.data.as_sorted_set()
+            {
+                for member in ss.scores.keys() {
+                    result.remove(member);
+                }
+            }
         }
 
         result
@@ -687,24 +688,25 @@ impl Store {
         for (i, key) in keys.iter().enumerate() {
             if let Some(e) = self.data.get(key)
                 && !e.is_expired()
-                    && let Some(ss) = e.data.as_sorted_set() {
-                        let w = weights
-                            .map(|ws| ws.get(i).copied().unwrap_or(1.0))
-                            .unwrap_or(1.0);
-                        for (member, &score) in &ss.scores {
-                            let weighted = score * w;
-                            result
-                                .entry(member.clone())
-                                .and_modify(|existing| {
-                                    *existing = match aggregate.to_uppercase().as_str() {
-                                        "MIN" => existing.min(weighted),
-                                        "MAX" => existing.max(weighted),
-                                        _ => *existing + weighted, // SUM
-                                    };
-                                })
-                                .or_insert(weighted);
-                        }
-                    }
+                && let Some(ss) = e.data.as_sorted_set()
+            {
+                let w = weights
+                    .map(|ws| ws.get(i).copied().unwrap_or(1.0))
+                    .unwrap_or(1.0);
+                for (member, &score) in &ss.scores {
+                    let weighted = score * w;
+                    result
+                        .entry(member.clone())
+                        .and_modify(|existing| {
+                            *existing = match aggregate.to_uppercase().as_str() {
+                                "MIN" => existing.min(weighted),
+                                "MAX" => existing.max(weighted),
+                                _ => *existing + weighted, // SUM
+                            };
+                        })
+                        .or_insert(weighted);
+                }
+            }
         }
 
         result

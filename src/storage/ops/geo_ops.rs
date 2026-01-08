@@ -215,10 +215,7 @@ impl Store {
     pub fn geo_hash(&self, key: &[u8], members: &[Bytes]) -> Vec<Option<String>> {
         members
             .iter()
-            .map(|member| {
-                self.zscore(key, member)
-                    .map(geohash_to_string)
-            })
+            .map(|member| self.zscore(key, member).map(geohash_to_string))
             .collect()
     }
 

@@ -227,23 +227,20 @@ fn format_geo_result(
 
     let mut arr = vec![RespValue::bulk(result.member)];
 
-    if with_dist
-        && let Some(d) = result.distance {
-            arr.push(RespValue::bulk_string(&format!("{:.4}", d)));
-        }
+    if with_dist && let Some(d) = result.distance {
+        arr.push(RespValue::bulk_string(&format!("{:.4}", d)));
+    }
 
-    if with_hash
-        && let Some(h) = result.hash {
-            arr.push(RespValue::integer(h as i64));
-        }
+    if with_hash && let Some(h) = result.hash {
+        arr.push(RespValue::integer(h as i64));
+    }
 
-    if with_coord
-        && let (Some(lon), Some(lat)) = (result.longitude, result.latitude) {
-            arr.push(RespValue::array(vec![
-                RespValue::bulk_string(&format!("{:.17}", lon)),
-                RespValue::bulk_string(&format!("{:.17}", lat)),
-            ]));
-        }
+    if with_coord && let (Some(lon), Some(lat)) = (result.longitude, result.latitude) {
+        arr.push(RespValue::array(vec![
+            RespValue::bulk_string(&format!("{:.17}", lon)),
+            RespValue::bulk_string(&format!("{:.17}", lat)),
+        ]));
+    }
 
     RespValue::array(arr)
 }

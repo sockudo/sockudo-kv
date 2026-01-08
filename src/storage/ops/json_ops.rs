@@ -739,9 +739,10 @@ fn json_path_get(root: &Value, path: &str) -> Option<Vec<Value>> {
                 if let Ok(idx) = inner.parse::<i64>() {
                     if let Some(arr) = value.as_array()
                         && let Some(normalized) = normalize_array_index(idx, arr.len())
-                            && let Some(v) = arr.get(normalized) {
-                                new_results.push(v.clone());
-                            }
+                        && let Some(v) = arr.get(normalized)
+                    {
+                        new_results.push(v.clone());
+                    }
                 } else {
                     // Quoted key like ['field']
                     let key = inner.trim_matches(|c| c == '\'' || c == '"');
@@ -820,22 +821,23 @@ fn set_nested(
         let inner = &part[1..part.len() - 1];
         if let Ok(idx) = inner.parse::<i64>() {
             if let Some(arr) = current.as_array_mut()
-                && let Some(normalized) = normalize_array_index(idx, arr.len()) {
-                    if remaining.is_empty() {
-                        if xx && arr.get(normalized).map(|v| v.is_null()).unwrap_or(true) {
-                            return Ok(false);
-                        }
-                        if nx && arr.get(normalized).map(|v| !v.is_null()).unwrap_or(false) {
-                            return Ok(false);
-                        }
-                        if let Some(elem) = arr.get_mut(normalized) {
-                            *elem = value;
-                            return Ok(true);
-                        }
-                    } else if let Some(elem) = arr.get_mut(normalized) {
-                        return set_nested(elem, remaining, value, nx, xx);
+                && let Some(normalized) = normalize_array_index(idx, arr.len())
+            {
+                if remaining.is_empty() {
+                    if xx && arr.get(normalized).map(|v| v.is_null()).unwrap_or(true) {
+                        return Ok(false);
                     }
+                    if nx && arr.get(normalized).map(|v| !v.is_null()).unwrap_or(false) {
+                        return Ok(false);
+                    }
+                    if let Some(elem) = arr.get_mut(normalized) {
+                        *elem = value;
+                        return Ok(true);
+                    }
+                } else if let Some(elem) = arr.get_mut(normalized) {
+                    return set_nested(elem, remaining, value, nx, xx);
                 }
+            }
             return Ok(false);
         }
     }
@@ -901,14 +903,16 @@ fn delete_nested(current: &mut Value, parts: &[&str]) -> Result<usize> {
             let inner = &part[1..part.len() - 1];
             if let Ok(idx) = inner.parse::<i64>()
                 && let Some(arr) = current.as_array_mut()
-                    && let Some(normalized) = normalize_array_index(idx, arr.len()) {
-                        arr.remove(normalized);
-                        return Ok(1);
-                    }
-        } else if let Some(obj) = current.as_object_mut()
-            && obj.remove(&part.to_string()).is_some() {
+                && let Some(normalized) = normalize_array_index(idx, arr.len())
+            {
+                arr.remove(normalized);
                 return Ok(1);
             }
+        } else if let Some(obj) = current.as_object_mut()
+            && obj.remove(&part.to_string()).is_some()
+        {
+            return Ok(1);
+        }
         return Ok(0);
     }
 
@@ -930,14 +934,16 @@ fn delete_nested(current: &mut Value, parts: &[&str]) -> Result<usize> {
         let inner = &part[1..part.len() - 1];
         if let Ok(idx) = inner.parse::<i64>()
             && let Some(arr) = current.as_array_mut()
-                && let Some(normalized) = normalize_array_index(idx, arr.len())
-                    && let Some(elem) = arr.get_mut(normalized) {
-                        count += delete_nested(elem, remaining)?;
-                    }
-    } else if let Some(obj) = current.as_object_mut()
-        && let Some(child) = obj.get_mut(&part.to_string()) {
-            count += delete_nested(child, remaining)?;
+            && let Some(normalized) = normalize_array_index(idx, arr.len())
+            && let Some(elem) = arr.get_mut(normalized)
+        {
+            count += delete_nested(elem, remaining)?;
         }
+    } else if let Some(obj) = current.as_object_mut()
+        && let Some(child) = obj.get_mut(&part.to_string())
+    {
+        count += delete_nested(child, remaining)?;
+    }
 
     Ok(count)
 }
@@ -1262,16 +1268,18 @@ fn json_clear_impl(root: &mut Value, path: &str) -> Result<usize> {
     for target in targets {
         if target.is_array() {
             if let Some(arr) = target.as_array_mut()
-                && !arr.is_empty() {
-                    arr.clear();
-                    count += 1;
-                }
+                && !arr.is_empty()
+            {
+                arr.clear();
+                count += 1;
+            }
         } else if target.is_object() {
             if let Some(obj) = target.as_object_mut()
-                && !obj.is_empty() {
-                    obj.clear();
-                    count += 1;
-                }
+                && !obj.is_empty()
+            {
+                obj.clear();
+                count += 1;
+            }
         } else if target.is_number() {
             *target = sonic_rs::json!(0);
             count += 1;
@@ -1344,18 +1352,20 @@ fn get_mutable_nested<'a>(current: &'a mut Value, parts: &[&str]) -> Result<Vec<
         if let Ok(idx) = inner.parse::<i64>() {
             if let Some(arr) = current.as_array_mut()
                 && let Some(normalized) = normalize_array_index(idx, arr.len())
-                    && let Some(elem) = arr.get_mut(normalized) {
-                        return get_mutable_nested(elem, remaining);
-                    }
+                && let Some(elem) = arr.get_mut(normalized)
+            {
+                return get_mutable_nested(elem, remaining);
+            }
             return Ok(vec![]);
         }
     }
 
     // Object field
     if let Some(obj) = current.as_object_mut()
-        && let Some(child) = obj.get_mut(&part.to_string()) {
-            return get_mutable_nested(child, remaining);
-        }
+        && let Some(child) = obj.get_mut(&part.to_string())
+    {
+        return get_mutable_nested(child, remaining);
+    }
 
     Ok(vec![])
 }

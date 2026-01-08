@@ -81,9 +81,10 @@ pub async fn connect_to_master(
         // Partial sync - parse new offset if provided
         let parts: Vec<&str> = response_str.split_whitespace().collect();
         if parts.len() >= 2
-            && let Ok(new_offset) = parts[1].parse::<i64>() {
-                repl.master_repl_offset.store(new_offset, Ordering::Relaxed);
-            }
+            && let Ok(new_offset) = parts[1].parse::<i64>()
+        {
+            repl.master_repl_offset.store(new_offset, Ordering::Relaxed);
+        }
     }
 
     // Mark as connected
