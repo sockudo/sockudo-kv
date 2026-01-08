@@ -4,6 +4,7 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 
 use sockudo_kv::PubSub;
 use sockudo_kv::client::ClientState;
@@ -34,9 +35,77 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     });
 
-    let addr = format!("{}:{}", config.bind, config.port);
-    let listener = TcpListener::bind(&addr).await?;
-    println!("sockudo-kv listening on {}", addr);
+    println!(
+        "Starting sockudo-kv with config: port={}, bound to {:?}",
+        config.port, config.bind
+    );
+
+    // Bind to addresses
+    let mut listeners = Vec::new();
+    for bind_addr in &config.bind {
+        let (addr_str, lenient) = if let Some(stripped) = bind_addr.strip_prefix('-') {
+            (stripped, true)
+        } else {
+            (bind_addr.as_str(), false)
+        };
+
+        if addr_str == "*" {
+            // Bind to all interfaces?
+            // Redis treats * as "all interfaces" but TcpListener::bind("0.0.0.0") does that.
+            // If user puts *, we probably want 0.0.0.0 (IPv4) or :: (IPv6) depending on system?
+            // Actually * usually implies INADDR_ANY.
+            let addr = format!("0.0.0.0:{}", config.port);
+            match TcpListener::bind(&addr).await {
+                Ok(l) => {
+                    println!("Listening on {}", addr);
+                    listeners.push(l);
+                }
+                Err(e) => {
+                    // Try IPv6
+                    let addr_v6 = format!(":::{}", config.port);
+                    match TcpListener::bind(&addr_v6).await {
+                        Ok(l) => {
+                            println!("Listening on {}", addr_v6);
+                            listeners.push(l);
+                        }
+                        Err(e2) => {
+                            if !lenient {
+                                eprintln!("Failed to bind to * (0.0.0.0 or ::): {} / {}", e, e2);
+                                std::process::exit(1);
+                            } else {
+                                eprintln!("Warning: Failed to bind to *: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        let addr = format!("{}:{}", addr_str, config.port);
+        match TcpListener::bind(&addr).await {
+            Ok(l) => {
+                println!("Listening on {}", addr);
+                listeners.push(l);
+            }
+            Err(e) => {
+                if !lenient {
+                    eprintln!("Failed to bind to {}: {}", addr, e);
+                    std::process::exit(1);
+                } else {
+                    println!(
+                        "Warning: Could not bind to {}, ignoring (- prefix used). Error: {}",
+                        addr, e
+                    );
+                }
+            }
+        }
+    }
+
+    if listeners.is_empty() {
+        eprintln!("Could not bind to any address.");
+        std::process::exit(1);
+    }
 
     // Global state - MultiStore with configured databases
     let multi_store = Arc::new(sockudo_kv::storage::MultiStore::with_capacity_and_count(
@@ -66,6 +135,9 @@ async fn main() -> std::io::Result<()> {
     if let Some(pass) = &config.requirepass {
         server_state.set_default_user_password(pass);
     }
+
+    // In a real implementation we would apply more config flags here,
+    // e.g. persistence settings to replication manager, etc.
 
     // Load RDB if exists
     let rdb_path = Path::new(&config.dir).join(&config.dbfilename);
@@ -110,8 +182,10 @@ async fn main() -> std::io::Result<()> {
 
     let config = Arc::new(config);
 
-    loop {
-        let (socket, addr) = listener.accept().await?;
+    // Spawn listener tasks
+    let mut tasks = JoinSet::new();
+
+    for listener in listeners {
         let multi_store = Arc::clone(&multi_store);
         let pubsub = Arc::clone(&pubsub);
         let clients = Arc::clone(&clients);
@@ -119,21 +193,56 @@ async fn main() -> std::io::Result<()> {
         let cluster_state = Arc::clone(&cluster_state);
         let replication = Arc::clone(&replication);
         let config = Arc::clone(&config);
-        tokio::spawn(async move {
-            let _ = handle_client(
-                socket,
-                addr,
-                multi_store,
-                pubsub,
-                clients,
-                server_state,
-                cluster_state,
-                replication,
-                config,
-            )
-            .await;
+
+        tasks.spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((socket, addr)) => {
+                        let multi_store = Arc::clone(&multi_store);
+                        let pubsub = Arc::clone(&pubsub);
+                        let clients = Arc::clone(&clients);
+                        let server_state = Arc::clone(&server_state);
+                        let cluster_state = Arc::clone(&cluster_state);
+                        let replication = Arc::clone(&replication);
+                        let config = Arc::clone(&config);
+
+                        tokio::spawn(async move {
+                            let _ = handle_client(
+                                socket,
+                                addr,
+                                multi_store,
+                                pubsub,
+                                clients,
+                                server_state,
+                                cluster_state,
+                                replication,
+                                config,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("Accept error: {}", e);
+                        // Backoff slightly to avoid spinning if there's a permanent error?
+                        // If it's pure logic, maybe not.
+                    }
+                }
+            }
         });
     }
+
+    // Wait for all listeners (they shouldn't exit)
+    // Also handle shutdown signal?
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+             println!("Shutdown signal received.");
+        }
+        _ = async { while tasks.join_next().await.is_some() {} } => {
+             println!("All listeners stopped unexpectedly.");
+        }
+    }
+
+    Ok(())
 }
 
 #[inline(always)]
@@ -149,20 +258,6 @@ async fn handle_client(
     config: Arc<ServerConfig>,
 ) -> std::io::Result<()> {
     socket.set_nodelay(true)?;
-
-    // Check protected mode
-    // If protected-mode is yes, and no bind address (or 0.0.0.0?? actually bind handles this),
-    // and no password, we might restrict access?
-    // Redis default: protected-mode yes.
-    // If enabled, only loopback allowed if no password configured and no bind address.
-    // We already bind to specific address in main.
-    // So we just check TCP keepalive here.
-
-    // if config.tcp_keepalive > 0 {
-    //     let _ = socket.set_keepalive(Some(std::time::Duration::from_secs(
-    //         config.tcp_keepalive as u64,
-    //     )));
-    // }
 
     // Register this client with PubSub
     let (sub_id, rx) = pubsub.register();
@@ -240,11 +335,7 @@ async fn handle_client_inner(
                                         write_buf.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
                                         // continue to next command in buffer (but we are in a match, so we need to just stop processing this cmd)
                                         // Since we write invalid response, we must skip the rest of logic for this command.
-                                        continue; // This continues the loop match Command::from_resp
-                                        // Wait, continue inside match arm? No, continue applies to the inner loop.
-                                        // The inner loop iterates over parsed commands.
-                                        // Yes, check line 133: `loop { match Parser::parse...`
-                                        // So `continue` here goes to next iteration of inner loop -> next command. Correct.
+                                        continue;
                                     }
                                 }
 
@@ -354,12 +445,6 @@ async fn handle_client_inner(
                                             }
                                         }
                                     } else if cmd.is_command(b"BGSAVE") {
-                                        // Asynchronous BGSAVE (mock implementation - running sync for now but conceptually separate)
-                                        // In real redis this forks. Here we could spawn_blocking but MultiStore access is shared.
-                                        // To be safe we just do it here or spawn.
-                                        // Since we use parking_lot RwLock, read lock is cheap but serialization takes time.
-                                        // Let's mimic what we had (sync) but maybe wrapping in spawn would require 'static args.
-                                        // For now, keep it sync to ensure correctness, as Rust BGSAVE without fork is hard (CoW needed).
                                         use sockudo_kv::replication::rdb::generate_rdb;
                                         let rdb_data = generate_rdb(multi_store);
                                         let rdb_path = Path::new(&config.dir).join(&config.dbfilename);
