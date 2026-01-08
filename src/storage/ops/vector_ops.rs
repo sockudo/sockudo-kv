@@ -20,9 +20,12 @@ use crate::storage::types::{DataType, Entry, VectorNode, VectorQuantization, Vec
 
 /// Dot product of two vectors (auto-vectorized)
 #[inline]
-fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+fn dot_product(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() {
+        return None;
+    }
+
+    Some(a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum())
 }
 
 /// Magnitude squared of a vector
@@ -33,34 +36,40 @@ fn magnitude_sq(v: &[f32]) -> f32 {
 
 /// Cosine similarity (1 = identical, 0 = orthogonal, -1 = opposite)
 #[inline]
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot = dot_product(a, b);
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    let dot = dot_product(a, b)?;
     let mag_a = magnitude_sq(a).sqrt();
     let mag_b = magnitude_sq(b).sqrt();
     if mag_a < 1e-10 || mag_b < 1e-10 {
-        return 0.0;
+        return Some(0.0);
     }
-    dot / (mag_a * mag_b)
+    Some(dot / (mag_a * mag_b))
 }
 
 /// Cosine distance (0 = identical, 2 = opposite)
 #[inline]
-pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    1.0 - cosine_similarity(a, b)
+pub fn cosine_distance(a: &[f32], b: &[f32]) -> Option<f32> {
+    Some(1.0 - cosine_similarity(a, b)?)
 }
 
 /// Euclidean distance squared (faster, avoids sqrt)
 #[inline]
 #[allow(dead_code)]
-pub fn euclidean_distance_sq(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    a.iter()
+pub fn euclidean_distance_sq(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() {
+        return None;
+    }
+
+    let distance = a
+        .iter()
         .zip(b.iter())
         .map(|(&x, &y)| {
             let diff = x - y;
             diff * diff
         })
-        .sum()
+        .sum();
+
+    Some(distance)
 }
 
 // ==================== HNSW Helper Types ====================
@@ -173,7 +182,10 @@ fn search_layer_impl(
     let mut results = BinaryHeap::new();
 
     let ep_dist = match vs.nodes.get(ep as usize) {
-        Some(n) => cosine_distance(query, &n.vector),
+        Some(n) => match cosine_distance(query, &n.vector) {
+            Some(d) => d,
+            None => return vec![],
+        },
         None => return vec![],
     };
 
@@ -200,7 +212,10 @@ fn search_layer_impl(
                 if visited.insert(neighbor)
                     && let Some(n) = vs.nodes.get(neighbor as usize)
                 {
-                    let dist = cosine_distance(query, &n.vector);
+                    let dist = match cosine_distance(query, &n.vector) {
+                        Some(d) => d,
+                        None => continue,
+                    };
                     let furthest = results.peek().map(|c| c.distance).unwrap_or(f32::MAX);
 
                     if dist < furthest || results.len() < ef {
@@ -650,7 +665,7 @@ impl Store {
                     .filter_map(|&neighbor_idx| {
                         let neighbor = vs.nodes.get(neighbor_idx as usize)?;
                         let score = if with_scores {
-                            Some(cosine_similarity(&node_vector, &neighbor.vector))
+                            cosine_similarity(&node_vector, &neighbor.vector)
                         } else {
                             None
                         };
