@@ -1,0 +1,39 @@
+[package]
+name = "sockudo-kv"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "macros",
+    "sync",
+    "time",
+] }
+clap = { version = "4", features = ["derive", "env"] }
+bytes = "1"
+thiserror = "2"
+dashmap = "6"
+sha2 = "0.10"
+sha1 = "0.10"
+hex = "0.4"
+memchr = "2"
+itoa = "1"
+socket2 = { version = "0.6", features = ["all"] }
+sonic-rs = "0.5"
+fastrand = "2"
+mlua = { version = "0.11", features = ["luajit", "serialize"] }
+parking_lot = "0.12"
+roaring = "0.11"
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
