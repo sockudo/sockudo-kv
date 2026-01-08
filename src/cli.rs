@@ -8,7 +8,7 @@ use std::str::FromStr;
 #[derive(Parser, Debug)]
 #[command(name = "sockudo-kv")]
 #[command(author = "Sockudo Team")]
-#[command(version = "0.2.0")]
+#[command(version = "1.0.0")]
 #[command(about = "A high-performance Redis-compatible key-value store", long_about = None)]
 pub struct Cli {
     /// Configuration file path
@@ -70,6 +70,372 @@ pub struct Cli {
     /// Replica of master (host port)
     #[arg(long, num_args = 2, value_names = ["HOST", "PORT"])]
     pub replicaof: Option<Vec<String>>,
+
+    // --- Network ---
+    #[arg(long)]
+    pub tcp_backlog: Option<u32>,
+    #[arg(long)]
+    pub unixsocket: Option<String>,
+    #[arg(long)]
+    pub unixsocketperm: Option<u32>,
+    #[arg(long)]
+    pub tcp_keepalive: Option<u32>,
+    #[arg(long)]
+    pub timeout: Option<u64>,
+    #[arg(long)]
+    pub socket_mark_id: Option<u32>,
+    #[arg(long)]
+    pub bind_source_addr: Option<String>,
+
+    // --- TLS/SSL ---
+    #[arg(long)]
+    pub tls_port: Option<u16>,
+    #[arg(long)]
+    pub tls_cert_file: Option<String>,
+    #[arg(long)]
+    pub tls_key_file: Option<String>,
+    #[arg(long)]
+    pub tls_key_file_pass: Option<String>,
+    #[arg(long)]
+    pub tls_client_cert_file: Option<String>,
+    #[arg(long)]
+    pub tls_client_key_file: Option<String>,
+    #[arg(long)]
+    pub tls_client_key_file_pass: Option<String>,
+    #[arg(long)]
+    pub tls_dh_params_file: Option<String>,
+    #[arg(long)]
+    pub tls_ca_cert_file: Option<String>,
+    #[arg(long)]
+    pub tls_ca_cert_dir: Option<String>,
+    #[arg(long)]
+    pub tls_auth_clients: Option<String>,
+    #[arg(long)]
+    pub tls_auth_clients_user: Option<String>,
+    #[arg(long)]
+    pub tls_replication: Option<String>,
+    #[arg(long)]
+    pub tls_cluster: Option<String>,
+    #[arg(long)]
+    pub tls_protocols: Option<String>,
+    #[arg(long)]
+    pub tls_ciphers: Option<String>,
+    #[arg(long)]
+    pub tls_ciphersuites: Option<String>,
+    #[arg(long)]
+    pub tls_prefer_server_ciphers: Option<String>,
+    #[arg(long)]
+    pub tls_session_caching: Option<String>,
+    #[arg(long)]
+    pub tls_session_cache_size: Option<usize>,
+    #[arg(long)]
+    pub tls_session_cache_timeout: Option<u64>,
+
+    // --- General ---
+    #[arg(long)]
+    pub supervised: Option<String>,
+    #[arg(long)]
+    pub pidfile: Option<String>,
+    #[arg(long)]
+    pub crash_log_enabled: Option<String>,
+    #[arg(long)]
+    pub crash_memcheck_enabled: Option<String>,
+    #[arg(long)]
+    pub always_show_logo: Option<String>,
+    #[arg(long)]
+    pub set_proc_title: Option<String>,
+    #[arg(long)]
+    pub proc_title_template: Option<String>,
+    #[arg(long)]
+    pub enable_protected_configs: Option<String>,
+    #[arg(long)]
+    pub enable_debug_command: Option<String>,
+    #[arg(long)]
+    pub enable_module_command: Option<String>,
+    #[arg(long)]
+    pub syslog_enabled: Option<String>,
+    #[arg(long)]
+    pub syslog_ident: Option<String>,
+    #[arg(long)]
+    pub syslog_facility: Option<String>,
+    #[arg(long)]
+    pub hide_user_data_from_log: Option<String>,
+    #[arg(long)]
+    pub locale_collate: Option<String>,
+
+    // --- Security ---
+    #[arg(long)]
+    pub acl_pubsub_default: Option<String>,
+    #[arg(long)]
+    pub tracking_table_max_keys: Option<u64>,
+    #[arg(long)]
+    pub acllog_max_len: Option<usize>,
+    #[arg(long)]
+    pub aclfile: Option<String>,
+
+    // --- Memory ---
+    #[arg(long)]
+    pub maxmemory_samples: Option<usize>,
+    #[arg(long)]
+    pub maxmemory_eviction_tenacity: Option<u32>,
+    #[arg(long)]
+    pub replica_ignore_maxmemory: Option<String>,
+    #[arg(long)]
+    pub active_expire_effort: Option<u32>,
+
+    // --- Lazy Freeing ---
+    #[arg(long)]
+    pub lazyfree_lazy_eviction: Option<String>,
+    #[arg(long)]
+    pub lazyfree_lazy_expire: Option<String>,
+    #[arg(long)]
+    pub lazyfree_lazy_server_del: Option<String>,
+    #[arg(long)]
+    pub replica_lazy_flush: Option<String>,
+    #[arg(long)]
+    pub lazyfree_lazy_user_del: Option<String>,
+    #[arg(long)]
+    pub lazyfree_lazy_user_flush: Option<String>,
+
+    // --- Persistence ---
+    #[arg(long)]
+    pub appendfilename: Option<String>,
+    #[arg(long)]
+    pub appenddirname: Option<String>,
+    #[arg(long)]
+    pub appendfsync: Option<String>,
+    #[arg(long)]
+    pub no_appendfsync_on_rewrite: Option<String>,
+    #[arg(long)]
+    pub auto_aof_rewrite_percentage: Option<u32>,
+    #[arg(long)]
+    pub auto_aof_rewrite_min_size: Option<String>,
+    #[arg(long)]
+    pub aof_load_truncated: Option<String>,
+    #[arg(long)]
+    pub aof_use_rdb_preamble: Option<String>,
+    #[arg(long)]
+    pub aof_timestamp_enabled: Option<String>,
+    #[arg(long)]
+    pub aof_load_corrupt_tail_max_size: Option<u64>,
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub save: Option<Vec<String>>,
+    #[arg(long)]
+    pub stop_writes_on_bgsave_error: Option<String>,
+    #[arg(long)]
+    pub rdbcompression: Option<String>,
+    #[arg(long)]
+    pub rdbchecksum: Option<String>,
+    #[arg(long)]
+    pub sanitize_dump_payload: Option<String>,
+    #[arg(long)]
+    pub rdb_del_sync_files: Option<String>,
+
+    // --- Replication ---
+    #[arg(long)]
+    pub masterauth: Option<String>,
+    #[arg(long)]
+    pub masteruser: Option<String>,
+    #[arg(long)]
+    pub replica_read_only: Option<String>,
+    #[arg(long)]
+    pub replica_serve_stale_data: Option<String>,
+    #[arg(long)]
+    pub repl_diskless_sync: Option<String>,
+    #[arg(long)]
+    pub repl_diskless_sync_delay: Option<u64>,
+    #[arg(long)]
+    pub repl_diskless_sync_max_replicas: Option<u32>,
+    #[arg(long)]
+    pub repl_diskless_load: Option<String>,
+    #[arg(long)]
+    pub repl_backlog_size: Option<String>,
+    #[arg(long)]
+    pub repl_backlog_ttl: Option<u64>,
+    #[arg(long)]
+    pub repl_timeout: Option<u64>,
+    #[arg(long)]
+    pub repl_disable_tcp_nodelay: Option<String>,
+    #[arg(long)]
+    pub replica_priority: Option<u32>,
+    #[arg(long)]
+    pub propagation_error_behavior: Option<String>,
+    #[arg(long)]
+    pub replica_ignore_disk_write_errors: Option<String>,
+    #[arg(long)]
+    pub replica_announced: Option<String>,
+    #[arg(long)]
+    pub min_replicas_to_write: Option<u32>,
+    #[arg(long)]
+    pub min_replicas_max_lag: Option<u64>,
+    #[arg(long)]
+    pub repl_ping_replica_period: Option<u64>,
+    #[arg(long)]
+    pub replica_full_sync_buffer_limit: Option<String>,
+    #[arg(long)]
+    pub replica_announce_ip: Option<String>,
+    #[arg(long)]
+    pub replica_announce_port: Option<u16>,
+
+    // --- Cluster ---
+    #[arg(long)]
+    pub cluster_enabled: Option<String>,
+    #[arg(long)]
+    pub cluster_config_file: Option<String>,
+    #[arg(long)]
+    pub cluster_node_timeout: Option<u64>,
+    #[arg(long)]
+    pub cluster_port: Option<u16>,
+    #[arg(long)]
+    pub cluster_replica_validity_factor: Option<u32>,
+    #[arg(long)]
+    pub cluster_migration_barrier: Option<u32>,
+    #[arg(long)]
+    pub cluster_allow_replica_migration: Option<String>,
+    #[arg(long)]
+    pub cluster_require_full_coverage: Option<String>,
+    #[arg(long)]
+    pub cluster_replica_no_failover: Option<String>,
+    #[arg(long)]
+    pub cluster_allow_reads_when_down: Option<String>,
+    #[arg(long)]
+    pub cluster_allow_pubsubshard_when_down: Option<String>,
+    #[arg(long)]
+    pub cluster_link_sendbuf_limit: Option<String>,
+    #[arg(long)]
+    pub cluster_announce_ip: Option<String>,
+    #[arg(long)]
+    pub cluster_announce_port: Option<u16>,
+    #[arg(long)]
+    pub cluster_announce_tls_port: Option<u16>,
+    #[arg(long)]
+    pub cluster_announce_bus_port: Option<u16>,
+    #[arg(long)]
+    pub cluster_announce_hostname: Option<String>,
+    #[arg(long)]
+    pub cluster_announce_human_nodename: Option<String>,
+    #[arg(long)]
+    pub cluster_preferred_endpoint_type: Option<String>,
+    #[arg(long)]
+    pub cluster_compatibility_sample_ratio: Option<u32>,
+    #[arg(long)]
+    pub cluster_slot_stats_enabled: Option<String>,
+    #[arg(long)]
+    pub cluster_slot_migration_write_pause_timeout: Option<u64>,
+    #[arg(long)]
+    pub cluster_slot_migration_handoff_max_lag_bytes: Option<String>,
+
+    // --- Limits & Others ---
+    #[arg(long)]
+    pub maxclients: Option<u32>,
+    #[arg(long)]
+    pub slowlog_log_slower_than: Option<i64>,
+    #[arg(long)]
+    pub slowlog_max_len: Option<u64>,
+    #[arg(long)]
+    pub latency_monitor_threshold: Option<u64>,
+    #[arg(long)]
+    pub notify_keyspace_events: Option<String>,
+    #[arg(long)]
+    pub lookahead: Option<u32>,
+    #[arg(long)]
+    pub maxmemory_clients: Option<String>,
+    #[arg(long)]
+    pub max_new_tls_connections_per_cycle: Option<u32>,
+    #[arg(long)]
+    pub latency_tracking: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    pub latency_tracking_info_percentiles: Option<String>, // Space separated list
+    #[arg(long)]
+    pub io_threads: Option<usize>,
+    #[arg(long)]
+    pub oom_score_adj: Option<String>,
+    #[arg(long)]
+    pub oom_score_adj_values: Option<String>, // Space separated triple
+    #[arg(long)]
+    pub disable_thp: Option<String>,
+    #[arg(long)]
+    pub server_cpulist: Option<String>,
+    #[arg(long)]
+    pub bio_cpulist: Option<String>,
+    #[arg(long)]
+    pub aof_rewrite_cpulist: Option<String>,
+    #[arg(long)]
+    pub bgsave_cpulist: Option<String>,
+    #[arg(long)]
+    pub shutdown_timeout: Option<u64>,
+    #[arg(long)]
+    pub shutdown_on_sigint: Option<String>,
+    #[arg(long)]
+    pub shutdown_on_sigterm: Option<String>,
+    #[arg(long)]
+    pub lua_time_limit: Option<u64>,
+
+    // --- Hash, Set, ZSet, List, Stream limits ---
+    #[arg(long)]
+    pub hash_max_listpack_entries: Option<usize>,
+    #[arg(long)]
+    pub hash_max_listpack_value: Option<usize>,
+    #[arg(long)]
+    pub list_max_listpack_size: Option<i32>,
+    #[arg(long)]
+    pub list_compress_depth: Option<u32>,
+    #[arg(long)]
+    pub set_max_intset_entries: Option<usize>,
+    #[arg(long)]
+    pub set_max_listpack_entries: Option<usize>,
+    #[arg(long)]
+    pub set_max_listpack_value: Option<usize>,
+    #[arg(long)]
+    pub zset_max_listpack_entries: Option<usize>,
+    #[arg(long)]
+    pub zset_max_listpack_value: Option<usize>,
+    #[arg(long)]
+    pub hll_sparse_max_bytes: Option<usize>,
+    #[arg(long)]
+    pub stream_node_max_bytes: Option<String>,
+    #[arg(long)]
+    pub stream_node_max_entries: Option<usize>,
+    #[arg(long)]
+    pub activerehashing: Option<String>,
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub client_output_buffer_limit: Option<Vec<String>>,
+    #[arg(long)]
+    pub client_query_buffer_limit: Option<String>,
+    #[arg(long)]
+    pub proto_max_bulk_len: Option<String>,
+    #[arg(long)]
+    pub hz: Option<u32>,
+    #[arg(long)]
+    pub dynamic_hz: Option<String>,
+    #[arg(long)]
+    pub aof_rewrite_incremental_fsync: Option<String>,
+    #[arg(long)]
+    pub rdb_save_incremental_fsync: Option<String>,
+    #[arg(long)]
+    pub lfu_log_factor: Option<u32>,
+    #[arg(long)]
+    pub lfu_decay_time: Option<u32>,
+    #[arg(long)]
+    pub max_new_connections_per_cycle: Option<u32>,
+    #[arg(long)]
+    pub jemalloc_bg_thread: Option<String>,
+    #[arg(long)]
+    pub ignore_warnings: Option<String>,
+    #[arg(long)]
+    pub activedefrag: Option<String>,
+    #[arg(long)]
+    pub active_defrag_ignore_bytes: Option<String>,
+    #[arg(long)]
+    pub active_defrag_threshold_lower: Option<u32>,
+    #[arg(long)]
+    pub active_defrag_threshold_upper: Option<u32>,
+    #[arg(long)]
+    pub active_defrag_cycle_min: Option<u32>,
+    #[arg(long)]
+    pub active_defrag_cycle_max: Option<u32>,
+    #[arg(long)]
+    pub active_defrag_max_scan_fields: Option<u32>,
 }
 
 impl Cli {
@@ -128,6 +494,602 @@ impl Cli {
                 .parse::<u16>()
                 .map_err(|_| "Invalid replicaof port")?;
             config.replicaof = Some((args[0].clone(), port));
+        }
+
+        // --- Network ---
+        if let Some(v) = cli.tcp_backlog {
+            config.tcp_backlog = v;
+        }
+        if let Some(v) = cli.unixsocket {
+            config.unixsocket = Some(v);
+        }
+        if let Some(v) = cli.unixsocketperm {
+            config.unixsocketperm = Some(v);
+        }
+        if let Some(v) = cli.tcp_keepalive {
+            config.tcp_keepalive = v;
+        }
+        if let Some(v) = cli.timeout {
+            config.timeout = v;
+        }
+        if let Some(v) = cli.socket_mark_id {
+            config.socket_mark_id = v;
+        }
+        if let Some(v) = cli.bind_source_addr {
+            config.bind_source_addr = Some(v);
+        }
+
+        // --- TLS/SSL ---
+        if let Some(v) = cli.tls_port {
+            config.tls_port = v;
+        }
+        if let Some(v) = cli.tls_cert_file {
+            config.tls_cert_file = Some(v);
+        }
+        if let Some(v) = cli.tls_key_file {
+            config.tls_key_file = Some(v);
+        }
+        if let Some(v) = cli.tls_key_file_pass {
+            config.tls_key_file_pass = Some(v);
+        }
+        if let Some(v) = cli.tls_client_cert_file {
+            config.tls_client_cert_file = Some(v);
+        }
+        if let Some(v) = cli.tls_client_key_file {
+            config.tls_client_key_file = Some(v);
+        }
+        if let Some(v) = cli.tls_client_key_file_pass {
+            config.tls_client_key_file_pass = Some(v);
+        }
+        if let Some(v) = cli.tls_dh_params_file {
+            config.tls_dh_params_file = Some(v);
+        }
+        if let Some(v) = cli.tls_ca_cert_file {
+            config.tls_ca_cert_file = Some(v);
+        }
+        if let Some(v) = cli.tls_ca_cert_dir {
+            config.tls_ca_cert_dir = Some(v);
+        }
+        if let Some(v) = cli.tls_auth_clients {
+            config.tls_auth_clients = v;
+        }
+        if let Some(v) = cli.tls_auth_clients_user {
+            config.tls_auth_clients_user = Some(v);
+        }
+        if let Some(v) = cli.tls_replication {
+            config.tls_replication = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.tls_cluster {
+            config.tls_cluster = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.tls_protocols {
+            config.tls_protocols = Some(v);
+        }
+        if let Some(v) = cli.tls_ciphers {
+            config.tls_ciphers = Some(v);
+        }
+        if let Some(v) = cli.tls_ciphersuites {
+            config.tls_ciphersuites = Some(v);
+        }
+        if let Some(v) = cli.tls_prefer_server_ciphers {
+            config.tls_prefer_server_ciphers = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.tls_session_caching {
+            config.tls_session_caching = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.tls_session_cache_size {
+            config.tls_session_cache_size = v;
+        }
+        if let Some(v) = cli.tls_session_cache_timeout {
+            config.tls_session_cache_timeout = v;
+        }
+
+        // --- General ---
+        if let Some(v) = cli.supervised {
+            config.supervised = v;
+        }
+        if let Some(v) = cli.pidfile {
+            config.pidfile = v;
+        }
+        if let Some(v) = cli.crash_log_enabled {
+            config.crash_log_enabled = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.crash_memcheck_enabled {
+            config.crash_memcheck_enabled = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.always_show_logo {
+            config.always_show_logo = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.set_proc_title {
+            config.set_proc_title = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.proc_title_template {
+            config.proc_title_template = v;
+        }
+        if let Some(v) = cli.enable_protected_configs {
+            config.enable_protected_configs = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.enable_debug_command {
+            config.enable_debug_command = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.enable_module_command {
+            config.enable_module_command = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.syslog_enabled {
+            config.syslog_enabled = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.syslog_ident {
+            config.syslog_ident = v;
+        }
+        if let Some(v) = cli.syslog_facility {
+            config.syslog_facility = v;
+        }
+        if let Some(v) = cli.hide_user_data_from_log {
+            config.hide_user_data_from_log = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.locale_collate {
+            config.locale_collate = v;
+        }
+
+        // --- Security ---
+        if let Some(v) = cli.acl_pubsub_default {
+            config.acl_pubsub_default = v;
+        }
+        if let Some(v) = cli.tracking_table_max_keys {
+            config.tracking_table_max_keys = v;
+        }
+        if let Some(v) = cli.acllog_max_len {
+            config.acllog_max_len = v;
+        }
+        if let Some(v) = cli.aclfile {
+            config.aclfile = Some(v);
+        }
+
+        // --- Memory ---
+        if let Some(v) = cli.maxmemory_samples {
+            config.maxmemory_samples = v;
+        }
+        if let Some(v) = cli.maxmemory_eviction_tenacity {
+            config.maxmemory_eviction_tenacity = v;
+        }
+        if let Some(v) = cli.replica_ignore_maxmemory {
+            config.replica_ignore_maxmemory = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.active_expire_effort {
+            config.active_expire_effort = v;
+        }
+
+        // --- Lazy Freeing ---
+        if let Some(v) = cli.lazyfree_lazy_eviction {
+            config.lazyfree_lazy_eviction = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.lazyfree_lazy_expire {
+            config.lazyfree_lazy_expire = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.lazyfree_lazy_server_del {
+            config.lazyfree_lazy_server_del = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.replica_lazy_flush {
+            config.replica_lazy_flush = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.lazyfree_lazy_user_del {
+            config.lazyfree_lazy_user_del = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.lazyfree_lazy_user_flush {
+            config.lazyfree_lazy_user_flush = parse_bool(&v).unwrap_or(false);
+        }
+
+        // --- Persistence ---
+        if let Some(v) = cli.appendfilename {
+            config.appendfilename = v;
+        }
+        if let Some(v) = cli.appenddirname {
+            config.appenddirname = v;
+        }
+        if let Some(v) = cli.appendfsync {
+            config.appendfsync = v;
+        }
+        if let Some(v) = cli.no_appendfsync_on_rewrite {
+            config.no_appendfsync_on_rewrite = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.auto_aof_rewrite_percentage {
+            config.auto_aof_rewrite_percentage = v;
+        }
+        if let Some(v) = cli.auto_aof_rewrite_min_size {
+            config.auto_aof_rewrite_min_size = parse_memory(&v)
+                .map_err(|e| format!("Invalid auto-aof-rewrite-min-size: {}", e))?;
+        }
+        if let Some(v) = cli.aof_load_truncated {
+            config.aof_load_truncated = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.aof_use_rdb_preamble {
+            config.aof_use_rdb_preamble = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.aof_timestamp_enabled {
+            config.aof_timestamp_enabled = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.aof_load_corrupt_tail_max_size {
+            config.aof_load_corrupt_tail_max_size = v;
+        }
+        if let Some(args) = cli.save {
+            config.save_points.clear();
+            for arg in args {
+                let parts: Vec<&str> = arg.split_whitespace().collect();
+                if parts.len() == 2 {
+                    let sec = parts[0]
+                        .parse::<u64>()
+                        .map_err(|_| "Invalid save seconds")?;
+                    let changes = parts[1]
+                        .parse::<u64>()
+                        .map_err(|_| "Invalid save changes")?;
+                    config.save_points.push((sec, changes));
+                } else if parts.len() == 1 && parts[0].is_empty() {
+                    config.save_points.clear();
+                }
+            }
+        }
+        if let Some(v) = cli.stop_writes_on_bgsave_error {
+            config.stop_writes_on_bgsave_error = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.rdbcompression {
+            config.rdbcompression = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.rdbchecksum {
+            config.rdbchecksum = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.sanitize_dump_payload {
+            config.sanitize_dump_payload = v;
+        }
+        if let Some(v) = cli.rdb_del_sync_files {
+            config.rdb_del_sync_files = parse_bool(&v).unwrap_or(false);
+        }
+
+        // --- Replication ---
+        if let Some(v) = cli.masterauth {
+            config.masterauth = Some(v);
+        }
+        if let Some(v) = cli.masteruser {
+            config.masteruser = Some(v);
+        }
+        if let Some(v) = cli.replica_read_only {
+            config.replica_read_only = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.replica_serve_stale_data {
+            config.replica_serve_stale_data = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.repl_diskless_sync {
+            config.repl_diskless_sync = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.repl_diskless_sync_delay {
+            config.repl_diskless_sync_delay = v;
+        }
+        if let Some(v) = cli.repl_diskless_sync_max_replicas {
+            config.repl_diskless_sync_max_replicas = v;
+        }
+        if let Some(v) = cli.repl_diskless_load {
+            config.repl_diskless_load = v;
+        }
+        if let Some(v) = cli.repl_backlog_size {
+            config.repl_backlog_size =
+                parse_memory(&v).map_err(|e| format!("Invalid repl-backlog-size: {}", e))?;
+        }
+        if let Some(v) = cli.repl_backlog_ttl {
+            config.repl_backlog_ttl = v;
+        }
+        if let Some(v) = cli.repl_timeout {
+            config.repl_timeout = v;
+        }
+        if let Some(v) = cli.repl_disable_tcp_nodelay {
+            config.repl_disable_tcp_nodelay = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.replica_priority {
+            config.replica_priority = v;
+        }
+        if let Some(v) = cli.propagation_error_behavior {
+            config.propagation_error_behavior = v;
+        }
+        if let Some(v) = cli.replica_ignore_disk_write_errors {
+            config.replica_ignore_disk_write_errors = v;
+        }
+        if let Some(v) = cli.replica_announced {
+            config.replica_announced = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.min_replicas_to_write {
+            config.min_replicas_to_write = v;
+        }
+        if let Some(v) = cli.min_replicas_max_lag {
+            config.min_replicas_max_lag = v;
+        }
+        if let Some(v) = cli.repl_ping_replica_period {
+            config.repl_ping_replica_period = v;
+        }
+        if let Some(v) = cli.replica_full_sync_buffer_limit {
+            config.replica_full_sync_buffer_limit = parse_memory(&v)
+                .map_err(|e| format!("Invalid replica-full-sync-buffer-limit: {}", e))?;
+        }
+        if let Some(v) = cli.replica_announce_ip {
+            config.replica_announce_ip = Some(v);
+        }
+        if let Some(v) = cli.replica_announce_port {
+            config.replica_announce_port = Some(v);
+        }
+
+        // --- Cluster ---
+        if let Some(v) = cli.cluster_enabled {
+            config.cluster_enabled = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.cluster_config_file {
+            config.cluster_config_file = v;
+        }
+        if let Some(v) = cli.cluster_node_timeout {
+            config.cluster_node_timeout = v;
+        }
+        if let Some(v) = cli.cluster_port {
+            config.cluster_port = v;
+        }
+        if let Some(v) = cli.cluster_replica_validity_factor {
+            config.cluster_replica_validity_factor = v;
+        }
+        if let Some(v) = cli.cluster_migration_barrier {
+            config.cluster_migration_barrier = v;
+        }
+        if let Some(v) = cli.cluster_allow_replica_migration {
+            config.cluster_allow_replica_migration = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.cluster_require_full_coverage {
+            config.cluster_require_full_coverage = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.cluster_replica_no_failover {
+            config.cluster_replica_no_failover = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.cluster_allow_reads_when_down {
+            config.cluster_allow_reads_when_down = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.cluster_allow_pubsubshard_when_down {
+            config.cluster_allow_pubsubshard_when_down = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.cluster_link_sendbuf_limit {
+            config.cluster_link_sendbuf_limit = parse_memory(&v)
+                .map_err(|e| format!("Invalid cluster-link-sendbuf-limit: {}", e))?;
+        }
+        if let Some(v) = cli.cluster_announce_ip {
+            config.cluster_announce_ip = Some(v);
+        }
+        if let Some(v) = cli.cluster_announce_port {
+            config.cluster_announce_port = Some(v);
+        }
+        if let Some(v) = cli.cluster_announce_tls_port {
+            config.cluster_announce_tls_port = Some(v);
+        }
+        if let Some(v) = cli.cluster_announce_bus_port {
+            config.cluster_announce_bus_port = Some(v);
+        }
+        if let Some(v) = cli.cluster_announce_hostname {
+            config.cluster_announce_hostname = Some(v);
+        }
+        if let Some(v) = cli.cluster_announce_human_nodename {
+            config.cluster_announce_human_nodename = Some(v);
+        }
+        if let Some(v) = cli.cluster_preferred_endpoint_type {
+            config.cluster_preferred_endpoint_type = v;
+        }
+        if let Some(v) = cli.cluster_compatibility_sample_ratio {
+            config.cluster_compatibility_sample_ratio = v;
+        }
+        if let Some(v) = cli.cluster_slot_stats_enabled {
+            config.cluster_slot_stats_enabled = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.cluster_slot_migration_write_pause_timeout {
+            config.cluster_slot_migration_write_pause_timeout = v;
+        }
+        if let Some(v) = cli.cluster_slot_migration_handoff_max_lag_bytes {
+            config.cluster_slot_migration_handoff_max_lag_bytes =
+                parse_memory(&v).map_err(|e| {
+                    format!(
+                        "Invalid cluster-slot-migration-handoff-max-lag-bytes: {}",
+                        e
+                    )
+                })?;
+        }
+
+        // --- Limits & Others ---
+        if let Some(v) = cli.maxclients {
+            config.maxclients = v;
+        }
+        if let Some(v) = cli.slowlog_log_slower_than {
+            config.slowlog_log_slower_than = v;
+        }
+        if let Some(v) = cli.slowlog_max_len {
+            config.slowlog_max_len = v;
+        }
+        if let Some(v) = cli.latency_monitor_threshold {
+            config.latency_monitor_threshold = v;
+        }
+        if let Some(v) = cli.notify_keyspace_events {
+            config.notify_keyspace_events = v;
+        }
+        if let Some(v) = cli.lookahead {
+            config.lookahead = v;
+        }
+        if let Some(v) = cli.maxmemory_clients {
+            config.maxmemory_clients = v;
+        }
+        if let Some(v) = cli.max_new_tls_connections_per_cycle {
+            config.max_new_tls_connections_per_cycle = v;
+        }
+        if let Some(v) = cli.latency_tracking {
+            config.latency_tracking = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.latency_tracking_info_percentiles {
+            let mut percentiles = Vec::new();
+            for part in v.split_whitespace() {
+                let p = part
+                    .parse::<f64>()
+                    .map_err(|_| "Invalid latency percentile")?;
+                percentiles.push(p);
+            }
+            config.latency_tracking_info_percentiles = percentiles;
+        }
+        if let Some(v) = cli.io_threads {
+            config.io_threads = v;
+        }
+        if let Some(v) = cli.oom_score_adj {
+            config.oom_score_adj = v;
+        }
+        if let Some(v) = cli.oom_score_adj_values {
+            let parts: Vec<&str> = v.split_whitespace().collect();
+            if parts.len() == 3 {
+                let p1 = parts[0]
+                    .parse::<i32>()
+                    .map_err(|_| "Invalid oom-score-adj-value")?;
+                let p2 = parts[1]
+                    .parse::<i32>()
+                    .map_err(|_| "Invalid oom-score-adj-value")?;
+                let p3 = parts[2]
+                    .parse::<i32>()
+                    .map_err(|_| "Invalid oom-score-adj-value")?;
+                config.oom_score_adj_values = (p1, p2, p3);
+            }
+        }
+        if let Some(v) = cli.disable_thp {
+            config.disable_thp = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.server_cpulist {
+            config.server_cpulist = Some(v);
+        }
+        if let Some(v) = cli.bio_cpulist {
+            config.bio_cpulist = Some(v);
+        }
+        if let Some(v) = cli.aof_rewrite_cpulist {
+            config.aof_rewrite_cpulist = Some(v);
+        }
+        if let Some(v) = cli.bgsave_cpulist {
+            config.bgsave_cpulist = Some(v);
+        }
+        if let Some(v) = cli.shutdown_timeout {
+            config.shutdown_timeout = v;
+        }
+        if let Some(v) = cli.shutdown_on_sigint {
+            config.shutdown_on_sigint = v;
+        }
+        if let Some(v) = cli.shutdown_on_sigterm {
+            config.shutdown_on_sigterm = v;
+        }
+        if let Some(v) = cli.lua_time_limit {
+            config.lua_time_limit = v;
+        }
+        if let Some(v) = cli.hash_max_listpack_entries {
+            config.hash_max_listpack_entries = v;
+        }
+        if let Some(v) = cli.hash_max_listpack_value {
+            config.hash_max_listpack_value = v;
+        }
+        if let Some(v) = cli.list_max_listpack_size {
+            config.list_max_listpack_size = v;
+        }
+        if let Some(v) = cli.list_compress_depth {
+            config.list_compress_depth = v;
+        }
+        if let Some(v) = cli.set_max_intset_entries {
+            config.set_max_intset_entries = v;
+        }
+        if let Some(v) = cli.set_max_listpack_entries {
+            config.set_max_listpack_entries = v;
+        }
+        if let Some(v) = cli.set_max_listpack_value {
+            config.set_max_listpack_value = v;
+        }
+        if let Some(v) = cli.zset_max_listpack_entries {
+            config.zset_max_listpack_entries = v;
+        }
+        if let Some(v) = cli.zset_max_listpack_value {
+            config.zset_max_listpack_value = v;
+        }
+        if let Some(v) = cli.hll_sparse_max_bytes {
+            config.hll_sparse_max_bytes = v;
+        }
+        if let Some(v) = cli.stream_node_max_bytes {
+            config.stream_node_max_bytes = parse_memory(&v)
+                .map_err(|e| format!("Invalid stream-node-max-bytes: {}", e))?
+                as usize;
+        }
+        if let Some(v) = cli.stream_node_max_entries {
+            config.stream_node_max_entries = v;
+        }
+        if let Some(v) = cli.activerehashing {
+            config.activerehashing = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(args) = cli.client_output_buffer_limit {
+            for arg in args {
+                let parts: Vec<&str> = arg.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    let class = parts[0];
+                    let limit = format!("{} {} {}", parts[1], parts[2], parts[3]);
+                    match class.to_lowercase().as_str() {
+                        "normal" => config.client_output_buffer_limit_normal = limit,
+                        "replica" => config.client_output_buffer_limit_replica = limit,
+                        "pubsub" => config.client_output_buffer_limit_pubsub = limit,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(v) = cli.client_query_buffer_limit {
+            config.client_query_buffer_limit = parse_memory(&v)
+                .map_err(|e| format!("Invalid client-query-buffer-limit: {}", e))?;
+        }
+        if let Some(v) = cli.proto_max_bulk_len {
+            config.proto_max_bulk_len =
+                parse_memory(&v).map_err(|e| format!("Invalid proto-max-bulk-len: {}", e))?;
+        }
+        if let Some(v) = cli.hz {
+            config.hz = v;
+        }
+        if let Some(v) = cli.dynamic_hz {
+            config.dynamic_hz = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.aof_rewrite_incremental_fsync {
+            config.aof_rewrite_incremental_fsync = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.rdb_save_incremental_fsync {
+            config.rdb_save_incremental_fsync = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.lfu_log_factor {
+            config.lfu_log_factor = v;
+        }
+        if let Some(v) = cli.lfu_decay_time {
+            config.lfu_decay_time = v;
+        }
+        if let Some(v) = cli.max_new_connections_per_cycle {
+            config.max_new_connections_per_cycle = v;
+        }
+        if let Some(v) = cli.jemalloc_bg_thread {
+            config.jemalloc_bg_thread = parse_bool(&v).unwrap_or(true);
+        }
+        if let Some(v) = cli.ignore_warnings {
+            config.ignore_warnings = Some(v);
+        }
+        if let Some(v) = cli.activedefrag {
+            config.activedefrag = parse_bool(&v).unwrap_or(false);
+        }
+        if let Some(v) = cli.active_defrag_ignore_bytes {
+            config.active_defrag_ignore_bytes = parse_memory(&v)
+                .map_err(|e| format!("Invalid active-defrag-ignore-bytes: {}", e))?;
+        }
+        if let Some(v) = cli.active_defrag_threshold_lower {
+            config.active_defrag_threshold_lower = v;
+        }
+        if let Some(v) = cli.active_defrag_threshold_upper {
+            config.active_defrag_threshold_upper = v;
+        }
+        if let Some(v) = cli.active_defrag_cycle_min {
+            config.active_defrag_cycle_min = v;
+        }
+        if let Some(v) = cli.active_defrag_cycle_max {
+            config.active_defrag_cycle_max = v;
+        }
+        if let Some(v) = cli.active_defrag_max_scan_fields {
+            config.active_defrag_max_scan_fields = v;
         }
 
         Ok(config)

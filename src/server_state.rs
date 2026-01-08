@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::config::ServerConfig;
+
 /// Maximum slow log entries (default 128)
 pub const DEFAULT_SLOWLOG_MAX_LEN: usize = 128;
 /// Slow log threshold in microseconds (default 10000 = 10ms)
@@ -252,6 +254,7 @@ pub struct ServerState {
     pub databases: AtomicUsize,
     pub maxmemory: AtomicU64,
     pub maxmemory_policy: RwLock<String>,
+    pub config: RwLock<ServerConfig>,
 }
 
 impl ServerState {
@@ -294,6 +297,7 @@ impl ServerState {
             databases: AtomicUsize::new(16),
             maxmemory: AtomicU64::new(0),
             maxmemory_policy: RwLock::new("noeviction".to_string()),
+            config: RwLock::new(ServerConfig::default()),
         };
 
         // Create default user

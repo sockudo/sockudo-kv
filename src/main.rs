@@ -211,6 +211,11 @@ async fn main() -> std::io::Result<()> {
         .store(config.port as u64, std::sync::atomic::Ordering::Relaxed);
 
     // Apply configurations to server state
+    {
+        let mut cfg = server_state.config.write();
+        *cfg = config.clone();
+    }
+
     server_state.set_maxmemory(config.maxmemory);
     server_state.set_maxmemory_policy(&format!("{:?}", config.maxmemory_policy));
     if let Some(pass) = &config.requirepass {

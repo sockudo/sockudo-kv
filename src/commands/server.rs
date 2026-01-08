@@ -5,6 +5,7 @@
 use bytes::Bytes;
 use std::sync::Arc;
 
+use crate::config_table::{CONFIG_TABLE, ConfigFlags, find_config, matches_pattern};
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use crate::server_state::{
@@ -1143,68 +1144,30 @@ fn cmd_config(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
 }
 
 fn cmd_config_set(server: &Arc<ServerState>, parameter: &[u8], value: &[u8]) -> Result<RespValue> {
-    let param_str = String::from_utf8_lossy(parameter).to_lowercase();
-    let value_str = String::from_utf8_lossy(value);
+    let param_str = std::str::from_utf8(parameter)
+        .map_err(|_| Error::Custom("Invalid parameter name".into()))?;
+    let value_str =
+        std::str::from_utf8(value).map_err(|_| Error::Custom("Invalid value".into()))?;
 
-    match param_str.as_str() {
-        "slowlog-log-slower-than" => {
-            let val: u64 = value_str
-                .parse()
-                .map_err(|_| Error::Custom("Invalid argument".into()))?;
-            server
-                .slowlog_threshold_us
-                .store(val, std::sync::atomic::Ordering::Relaxed);
-        }
-        "slowlog-max-len" => {
-            let val: usize = value_str
-                .parse()
-                .map_err(|_| Error::Custom("Invalid argument".into()))?;
-            server
-                .slowlog_max_len
-                .store(val, std::sync::atomic::Ordering::Relaxed);
-        }
-        "latency-monitor-threshold" => {
-            let val: u64 = value_str
-                .parse()
-                .map_err(|_| Error::Custom("Invalid argument".into()))?;
-            server
-                .latency_threshold_ms
-                .store(val, std::sync::atomic::Ordering::Relaxed);
-        }
-        "acllog-max-len" => {
-            let val: usize = value_str
-                .parse()
-                .map_err(|_| Error::Custom("Invalid argument".into()))?;
-            server
-                .acl_log_max_len
-                .store(val, std::sync::atomic::Ordering::Relaxed);
-        }
-        "appendonly" => {
-            let val = match value_str.to_lowercase().as_str() {
-                "yes" => true,
-                "no" => false,
-                _ => return Err(Error::Custom("Invalid argument 'yes' or 'no'".into())),
-            };
-            server
-                .aof_enabled
-                .store(val, std::sync::atomic::Ordering::Relaxed);
-        }
-        // Supported but read-only in this context or complex logical update needed
-        "databases" | "maxclients" | "port" | "bind" | "dir" | "dbfilename" | "appendfilename" => {
-            return Err(Error::Custom(format!(
-                "ERR Unsupported CONFIG parameter: {}",
-                param_str
-            )));
-        }
-        // Silent ignore for others to allow some compatibility
-        _ => {
-            // For strictness we could error, but for compatibility we might just return OK or error
-            // Redis returns error for unknown parameters
-            return Err(Error::Custom(format!(
-                "ERR Unsupported CONFIG parameter: {}",
-                param_str
-            )));
-        }
+    // Find config entry in table
+    let entry = find_config(param_str)
+        .ok_or_else(|| Error::Custom(format!("ERR Unknown CONFIG parameter: {}", param_str)))?;
+
+    // Check if config is immutable
+    if entry.flags.contains(ConfigFlags::IMMUTABLE) {
+        return Err(Error::Custom(format!(
+            "ERR CONFIG parameter '{}' is immutable",
+            param_str
+        )));
+    }
+
+    // Acquire lock and apply setter
+    let mut config = server.config.write();
+    (entry.setter)(&mut config, value_str).map_err(|e| Error::Custom(format!("ERR {}", e)))?;
+
+    // Apply runtime changes if applier exists
+    if let Some(applier) = entry.applier {
+        applier(server, &config);
     }
 
     Ok(RespValue::ok())
@@ -1212,153 +1175,133 @@ fn cmd_config_set(server: &Arc<ServerState>, parameter: &[u8], value: &[u8]) -> 
 
 fn cmd_config_get(server: &Arc<ServerState>, pattern: &[u8]) -> Result<RespValue> {
     let pattern_str = std::str::from_utf8(pattern).unwrap_or("*");
+    let config = server.config.read();
     let mut result = Vec::new();
 
-    // All config parameters with their values
-    let configs: Vec<(&str, String)> = vec![
-        (
-            "databases",
-            server
-                .databases
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .to_string(),
-        ),
-        ("maxclients", "10000".to_string()),
-        ("timeout", "0".to_string()),
-        ("tcp-keepalive", "300".to_string()),
-        ("tcp-backlog", "511".to_string()),
-        ("port", "6379".to_string()),
-        ("bind", "127.0.0.1".to_string()),
-        (
-            "appendonly",
-            if server
-                .aof_enabled
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                "yes"
-            } else {
-                "no"
+    // Use CONFIG_TABLE for configs in the table
+    for entry in CONFIG_TABLE.iter() {
+        if matches_pattern(pattern_str, entry.name) {
+            result.push(RespValue::bulk_string(entry.name));
+            result.push(RespValue::bulk_string(&(entry.getter)(&config)));
+        }
+        // Also check alias
+        if let Some(alias) = entry.alias {
+            if matches_pattern(pattern_str, alias) {
+                result.push(RespValue::bulk_string(alias));
+                result.push(RespValue::bulk_string(&(entry.getter)(&config)));
             }
-            .to_string(),
-        ),
-        ("appendfsync", "everysec".to_string()),
-        ("appendfilename", "appendonly.aof".to_string()),
-        ("dbfilename", "dump.rdb".to_string()),
-        ("dir", ".".to_string()),
-        ("maxmemory", "0".to_string()),
-        ("maxmemory-policy", "noeviction".to_string()),
-        ("maxmemory-samples", "5".to_string()),
-        ("lfu-decay-time", "1".to_string()),
-        ("lfu-log-factor", "10".to_string()),
-        (
-            "slowlog-log-slower-than",
-            server
-                .slowlog_threshold_us
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .to_string(),
-        ),
-        (
-            "slowlog-max-len",
-            server
-                .slowlog_max_len
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .to_string(),
-        ),
-        (
-            "latency-monitor-threshold",
-            server
-                .latency_threshold_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .to_string(),
-        ),
-        ("notify-keyspace-events", "".to_string()),
-        ("hash-max-listpack-entries", "512".to_string()),
-        ("hash-max-listpack-value", "64".to_string()),
-        ("list-max-listpack-size", "-2".to_string()),
-        ("list-compress-depth", "0".to_string()),
-        ("set-max-intset-entries", "512".to_string()),
-        ("zset-max-listpack-entries", "128".to_string()),
-        ("zset-max-listpack-value", "64".to_string()),
-        ("active-expire-effort", "1".to_string()),
-        ("hz", "10".to_string()),
-        ("dynamic-hz", "yes".to_string()),
-        ("lua-time-limit", "5000".to_string()),
-        ("cluster-enabled", "no".to_string()),
-        ("cluster-node-timeout", "15000".to_string()),
-        ("repl-timeout", "60".to_string()),
-        ("repl-backlog-size", "1048576".to_string()),
-        ("replica-read-only", "yes".to_string()),
-        ("replica-serve-stale-data", "yes".to_string()),
-        ("min-replicas-to-write", "0".to_string()),
-        ("min-replicas-max-lag", "10".to_string()),
-        ("requirepass", "".to_string()),
-        ("masterauth", "".to_string()),
-        (
-            "acllog-max-len",
-            server
-                .acl_log_max_len
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .to_string(),
-        ),
-        ("protected-mode", "yes".to_string()),
-        ("daemonize", "no".to_string()),
-        ("pidfile", "".to_string()),
-        ("loglevel", "notice".to_string()),
-        ("logfile", "".to_string()),
-        ("save", "3600 1 300 100 60 10000".to_string()),
-        ("rdbcompression", "yes".to_string()),
-        ("rdbchecksum", "yes".to_string()),
-        ("stop-writes-on-bgsave-error", "yes".to_string()),
-        ("rdb-save-incremental-fsync", "yes".to_string()),
-        ("aof-use-rdb-preamble", "yes".to_string()),
-        ("auto-aof-rewrite-percentage", "100".to_string()),
-        ("auto-aof-rewrite-min-size", "67108864".to_string()),
-        ("aof-rewrite-incremental-fsync", "yes".to_string()),
-        ("aof-load-truncated", "yes".to_string()),
-        ("activerehashing", "yes".to_string()),
-        (
-            "client-output-buffer-limit",
-            "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60".to_string(),
-        ),
-        ("proto-max-bulk-len", "536870912".to_string()),
-        ("oom-score-adj", "no".to_string()),
-        ("oom-score-adj-values", "0 200 800".to_string()),
-        ("acl-pubsub-default", "allchannels".to_string()),
-        ("lazyfree-lazy-eviction", "no".to_string()),
-        ("lazyfree-lazy-expire", "no".to_string()),
-        ("lazyfree-lazy-server-del", "no".to_string()),
-        ("lazyfree-lazy-user-del", "no".to_string()),
-        ("replica-lazy-flush", "no".to_string()),
-        ("io-threads", "1".to_string()),
-        ("io-threads-do-reads", "no".to_string()),
-    ];
-
-    // Pattern matching
-    let is_wildcard = pattern_str == "*";
-
-    for (name, value) in configs {
-        if is_wildcard || matches_pattern(pattern_str, name) {
-            result.push(RespValue::bulk_string(name));
-            result.push(RespValue::bulk_string(&value));
         }
     }
 
-    Ok(RespValue::array(result))
-}
+    // Add configs with optional values or special formatting (not in table)
+    let mut add_legacy = |name: &str, value: String| {
+        if find_config(name).is_none() && matches_pattern(pattern_str, name) {
+            result.push(RespValue::bulk_string(name));
+            result.push(RespValue::bulk_string(&value));
+        }
+    };
 
-fn matches_pattern(pattern: &str, name: &str) -> bool {
-    if pattern == "*" {
-        return true;
+    // Optional string configs (can't use macros for Option<String>)
+    if let Some(v) = &config.unixsocket {
+        add_legacy("unixsocket", v.clone());
     }
-    if pattern.starts_with('*') && pattern.ends_with('*') {
-        let inner = &pattern[1..pattern.len() - 1];
-        return name.contains(inner);
+    if let Some(v) = config.unixsocketperm {
+        add_legacy("unixsocketperm", v.to_string());
     }
-    if pattern.starts_with('*') {
-        return name.ends_with(&pattern[1..]);
+    if let Some(v) = &config.bind_source_addr {
+        add_legacy("bind-source-addr", v.clone());
     }
-    if pattern.ends_with('*') {
-        return name.starts_with(&pattern[..pattern.len() - 1]);
+    if let Some(v) = &config.tls_cert_file {
+        add_legacy("tls-cert-file", v.clone());
     }
-    name == pattern
+    if let Some(v) = &config.tls_key_file {
+        add_legacy("tls-key-file", v.clone());
+    }
+    if let Some(v) = &config.tls_key_file_pass {
+        add_legacy("tls-key-file-pass", v.clone());
+    }
+    if let Some(v) = &config.tls_client_cert_file {
+        add_legacy("tls-client-cert-file", v.clone());
+    }
+    if let Some(v) = &config.tls_client_key_file {
+        add_legacy("tls-client-key-file", v.clone());
+    }
+    if let Some(v) = &config.tls_dh_params_file {
+        add_legacy("tls-dh-params-file", v.clone());
+    }
+    if let Some(v) = &config.tls_ca_cert_file {
+        add_legacy("tls-ca-cert-file", v.clone());
+    }
+    if let Some(v) = &config.tls_ca_cert_dir {
+        add_legacy("tls-ca-cert-dir", v.clone());
+    }
+    if let Some(v) = &config.tls_protocols {
+        add_legacy("tls-protocols", v.clone());
+    }
+    if let Some(v) = &config.tls_ciphers {
+        add_legacy("tls-ciphers", v.clone());
+    }
+    if let Some(v) = &config.tls_ciphersuites {
+        add_legacy("tls-ciphersuites", v.clone());
+    }
+    if let Some(v) = &config.requirepass {
+        add_legacy("requirepass", v.clone());
+    }
+    if let Some(v) = &config.masterauth {
+        add_legacy("masterauth", v.clone());
+    }
+    if let Some(v) = &config.masteruser {
+        add_legacy("masteruser", v.clone());
+    }
+    if let Some(v) = &config.aclfile {
+        add_legacy("aclfile", v.clone());
+    }
+    if let Some(v) = &config.server_cpulist {
+        add_legacy("server-cpulist", v.clone());
+    }
+    if let Some(v) = &config.bio_cpulist {
+        add_legacy("bio-cpulist", v.clone());
+    }
+    if let Some(v) = &config.aof_rewrite_cpulist {
+        add_legacy("aof-rewrite-cpulist", v.clone());
+    }
+    if let Some(v) = &config.bgsave_cpulist {
+        add_legacy("bgsave-cpulist", v.clone());
+    }
+    if let Some(v) = &config.ignore_warnings {
+        add_legacy("ignore-warnings", v.clone());
+    }
+    if let Some((host, port)) = &config.replicaof {
+        add_legacy("replicaof", format!("{} {}", host, port));
+    }
+    if let Some(v) = &config.replica_announce_ip {
+        add_legacy("replica-announce-ip", v.clone());
+    }
+    if let Some(v) = config.replica_announce_port {
+        add_legacy("replica-announce-port", v.to_string());
+    }
+    if let Some(v) = &config.cluster_announce_ip {
+        add_legacy("cluster-announce-ip", v.clone());
+    }
+    if let Some(v) = config.cluster_announce_port {
+        add_legacy("cluster-announce-port", v.to_string());
+    }
+    if let Some(v) = config.cluster_announce_bus_port {
+        add_legacy("cluster-announce-bus-port", v.to_string());
+    }
+    if let Some(v) = &config.cluster_announce_hostname {
+        add_legacy("cluster-announce-hostname", v.clone());
+    }
+    // Special formatting for save points
+    if matches_pattern(pattern_str, "save") {
+        let save_str = config
+            .save_points
+            .iter()
+            .map(|(s, c)| format!("{} {}", s, c))
+            .collect::<Vec<_>>()
+            .join(" ");
+        add_legacy("save", save_str);
+    }
+
+    Ok(RespValue::array(result))
 }
