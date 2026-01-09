@@ -294,7 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = sockudo_kv::replication::replica::connect_to_master(
                     repl_clone.clone(),
                     store_clone.clone(),
-                    host.clone(),
+                    &host,
                     port,
                 )
                 .await
@@ -372,8 +372,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = tokio::signal::ctrl_c() => {
              println!("Shutdown signal received.");
         }
-        _ = async { while tasks.join_next().await.is_some() {} } => {
-             println!("All listeners stopped unexpectedly.");
+        _ = async { tasks.join_all().await } => {
+            println!("All listeners stopped unexpectedly.");
         }
     }
 
