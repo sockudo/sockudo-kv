@@ -17,7 +17,7 @@ use crate::storage::MultiStore;
 pub async fn connect_to_master(
     repl: Arc<ReplicationManager>,
     multi_store: Arc<MultiStore>,
-    host: String,
+    host: &str,
     port: u16,
 ) -> Result<(), String> {
     let addr = format!("{}:{}", host, port);
