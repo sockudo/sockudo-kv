@@ -1,13 +1,13 @@
-//! Redis Cluster command handlers
+//! Redis Cluster command handlers - Dragonfly-style high performance
 //!
-//! Implements all cluster commands with ultra-high performance.
+//! Implements all cluster commands with O(1) operations where possible.
 //! Commands: ASKING, READONLY, READWRITE, CLUSTER *
 
 use bytes::Bytes;
 use std::sync::Arc;
 
 use crate::client::ClientState;
-use crate::cluster_state::{CLUSTER_SLOTS, ClusterState, SlotState, key_hash_slot};
+use crate::cluster_state::{CLUSTER_SLOTS, ClusterState, NodeRole, SlotState, key_hash_slot};
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use crate::storage::Store;
@@ -20,17 +20,17 @@ pub fn execute(
     cmd: &[u8],
     args: &[Bytes],
 ) -> Result<RespValue> {
-    // ASKING - set flag for -ASK redirect
+    // ASKING - set flag for -ASK redirect - O(1)
     if cmd.eq_ignore_ascii_case(b"ASKING") {
         return cmd_asking(client);
     }
 
-    // READONLY - enable replica reads
+    // READONLY - enable replica reads - O(1)
     if cmd.eq_ignore_ascii_case(b"READONLY") {
         return cmd_readonly(client);
     }
 
-    // READWRITE - disable replica reads
+    // READWRITE - disable replica reads - O(1)
     if cmd.eq_ignore_ascii_case(b"READWRITE") {
         return cmd_readwrite(client);
     }
@@ -83,154 +83,129 @@ fn cmd_cluster(
     let subcmd = &args[0];
     let subargs = &args[1..];
 
-    // CLUSTER ADDSLOTS slot [slot ...]
-    if subcmd.eq_ignore_ascii_case(b"ADDSLOTS") {
-        return cmd_cluster_addslots(cluster, subargs);
-    }
+    // Use a match-like approach for better performance (branch prediction)
+    let first_byte = subcmd.first().map(|b| b.to_ascii_uppercase());
 
-    // CLUSTER ADDSLOTSRANGE start-slot end-slot [start-slot end-slot ...]
-    if subcmd.eq_ignore_ascii_case(b"ADDSLOTSRANGE") {
-        return cmd_cluster_addslotsrange(cluster, subargs);
-    }
-
-    // CLUSTER BUMPEPOCH
-    if subcmd.eq_ignore_ascii_case(b"BUMPEPOCH") {
-        return cmd_cluster_bumpepoch(cluster);
-    }
-
-    // CLUSTER COUNT-FAILURE-REPORTS node-id
-    if subcmd.eq_ignore_ascii_case(b"COUNT-FAILURE-REPORTS") {
-        return cmd_cluster_count_failure_reports(cluster, subargs);
-    }
-
-    // CLUSTER COUNTKEYSINSLOT slot
-    if subcmd.eq_ignore_ascii_case(b"COUNTKEYSINSLOT") {
-        return cmd_cluster_countkeysinslot(store, subargs);
-    }
-
-    // CLUSTER DELSLOTS slot [slot ...]
-    if subcmd.eq_ignore_ascii_case(b"DELSLOTS") {
-        return cmd_cluster_delslots(cluster, subargs);
-    }
-
-    // CLUSTER DELSLOTSRANGE start-slot end-slot [start-slot end-slot ...]
-    if subcmd.eq_ignore_ascii_case(b"DELSLOTSRANGE") {
-        return cmd_cluster_delslotsrange(cluster, subargs);
-    }
-
-    // CLUSTER FAILOVER [FORCE|TAKEOVER]
-    if subcmd.eq_ignore_ascii_case(b"FAILOVER") {
-        return cmd_cluster_failover(subargs);
-    }
-
-    // CLUSTER FLUSHSLOTS
-    if subcmd.eq_ignore_ascii_case(b"FLUSHSLOTS") {
-        return cmd_cluster_flushslots(cluster);
-    }
-
-    // CLUSTER FORGET node-id
-    if subcmd.eq_ignore_ascii_case(b"FORGET") {
-        return cmd_cluster_forget(cluster, subargs);
-    }
-
-    // CLUSTER GETKEYSINSLOT slot count
-    if subcmd.eq_ignore_ascii_case(b"GETKEYSINSLOT") {
-        return cmd_cluster_getkeysinslot(store, subargs);
-    }
-
-    // CLUSTER INFO
-    if subcmd.eq_ignore_ascii_case(b"INFO") {
-        return cmd_cluster_info(cluster);
-    }
-
-    // CLUSTER KEYSLOT key
-    if subcmd.eq_ignore_ascii_case(b"KEYSLOT") {
-        return cmd_cluster_keyslot(subargs);
-    }
-
-    // CLUSTER LINKS
-    if subcmd.eq_ignore_ascii_case(b"LINKS") {
-        return cmd_cluster_links(cluster);
-    }
-
-    // CLUSTER MEET ip port [cluster-bus-port]
-    if subcmd.eq_ignore_ascii_case(b"MEET") {
-        return cmd_cluster_meet(cluster, subargs);
-    }
-
-    // CLUSTER MIGRATION ...
-    if subcmd.eq_ignore_ascii_case(b"MIGRATION") {
-        return cmd_cluster_migration(cluster, subargs);
-    }
-
-    // CLUSTER MYID
-    if subcmd.eq_ignore_ascii_case(b"MYID") {
-        return cmd_cluster_myid(cluster);
-    }
-
-    // CLUSTER MYSHARDID
-    if subcmd.eq_ignore_ascii_case(b"MYSHARDID") {
-        return cmd_cluster_myshardid(cluster);
-    }
-
-    // CLUSTER NODES
-    if subcmd.eq_ignore_ascii_case(b"NODES") {
-        return cmd_cluster_nodes(cluster);
-    }
-
-    // CLUSTER REPLICAS node-id
-    if subcmd.eq_ignore_ascii_case(b"REPLICAS") {
-        return cmd_cluster_replicas(cluster, subargs);
-    }
-
-    // CLUSTER REPLICATE node-id
-    if subcmd.eq_ignore_ascii_case(b"REPLICATE") {
-        return cmd_cluster_replicate(cluster, subargs);
-    }
-
-    // CLUSTER RESET [HARD|SOFT]
-    if subcmd.eq_ignore_ascii_case(b"RESET") {
-        return cmd_cluster_reset(cluster, subargs);
-    }
-
-    // CLUSTER SAVECONFIG
-    if subcmd.eq_ignore_ascii_case(b"SAVECONFIG") {
-        return cmd_cluster_saveconfig();
-    }
-
-    // CLUSTER SET-CONFIG-EPOCH config-epoch
-    if subcmd.eq_ignore_ascii_case(b"SET-CONFIG-EPOCH") {
-        return cmd_cluster_set_config_epoch(cluster, subargs);
-    }
-
-    // CLUSTER SETSLOT slot <IMPORTING|MIGRATING|NODE|STABLE> [node-id]
-    if subcmd.eq_ignore_ascii_case(b"SETSLOT") {
-        return cmd_cluster_setslot(cluster, subargs);
-    }
-
-    // CLUSTER SHARDS
-    if subcmd.eq_ignore_ascii_case(b"SHARDS") {
-        return cmd_cluster_shards(cluster);
-    }
-
-    // CLUSTER SLAVES node-id (deprecated, alias for REPLICAS)
-    if subcmd.eq_ignore_ascii_case(b"SLAVES") {
-        return cmd_cluster_replicas(cluster, subargs);
-    }
-
-    // CLUSTER SLOT-STATS <SLOTSRANGE start end | ORDERBY metric [LIMIT limit] [ASC|DESC]>
-    if subcmd.eq_ignore_ascii_case(b"SLOT-STATS") {
-        return cmd_cluster_slot_stats(cluster, store, subargs);
-    }
-
-    // CLUSTER SLOTS
-    if subcmd.eq_ignore_ascii_case(b"SLOTS") {
-        return cmd_cluster_slots(cluster);
-    }
-
-    // CLUSTER HELP
-    if subcmd.eq_ignore_ascii_case(b"HELP") {
-        return cmd_cluster_help();
+    match first_byte {
+        Some(b'A') => {
+            if subcmd.eq_ignore_ascii_case(b"ADDSLOTS") {
+                return cmd_cluster_addslots(cluster, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"ADDSLOTSRANGE") {
+                return cmd_cluster_addslotsrange(cluster, subargs);
+            }
+        }
+        Some(b'B') => {
+            if subcmd.eq_ignore_ascii_case(b"BUMPEPOCH") {
+                return cmd_cluster_bumpepoch(cluster);
+            }
+        }
+        Some(b'C') => {
+            if subcmd.eq_ignore_ascii_case(b"COUNT-FAILURE-REPORTS") {
+                return cmd_cluster_count_failure_reports(cluster, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"COUNTKEYSINSLOT") {
+                return cmd_cluster_countkeysinslot(store, subargs);
+            }
+        }
+        Some(b'D') => {
+            if subcmd.eq_ignore_ascii_case(b"DELSLOTS") {
+                return cmd_cluster_delslots(cluster, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"DELSLOTSRANGE") {
+                return cmd_cluster_delslotsrange(cluster, subargs);
+            }
+        }
+        Some(b'F') => {
+            if subcmd.eq_ignore_ascii_case(b"FAILOVER") {
+                return cmd_cluster_failover(subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"FLUSHSLOTS") {
+                return cmd_cluster_flushslots(cluster);
+            }
+            if subcmd.eq_ignore_ascii_case(b"FORGET") {
+                return cmd_cluster_forget(cluster, subargs);
+            }
+        }
+        Some(b'G') => {
+            if subcmd.eq_ignore_ascii_case(b"GETKEYSINSLOT") {
+                return cmd_cluster_getkeysinslot(store, subargs);
+            }
+        }
+        Some(b'H') => {
+            if subcmd.eq_ignore_ascii_case(b"HELP") {
+                return cmd_cluster_help();
+            }
+        }
+        Some(b'I') => {
+            if subcmd.eq_ignore_ascii_case(b"INFO") {
+                return cmd_cluster_info(cluster);
+            }
+        }
+        Some(b'K') => {
+            if subcmd.eq_ignore_ascii_case(b"KEYSLOT") {
+                return cmd_cluster_keyslot(subargs);
+            }
+        }
+        Some(b'L') => {
+            if subcmd.eq_ignore_ascii_case(b"LINKS") {
+                return cmd_cluster_links(cluster);
+            }
+        }
+        Some(b'M') => {
+            if subcmd.eq_ignore_ascii_case(b"MEET") {
+                return cmd_cluster_meet(cluster, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"MIGRATION") {
+                return cmd_cluster_migration(cluster, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"MYID") {
+                return cmd_cluster_myid(cluster);
+            }
+            if subcmd.eq_ignore_ascii_case(b"MYSHARDID") {
+                return cmd_cluster_myshardid(cluster);
+            }
+        }
+        Some(b'N') => {
+            if subcmd.eq_ignore_ascii_case(b"NODES") {
+                return cmd_cluster_nodes(cluster);
+            }
+        }
+        Some(b'R') => {
+            if subcmd.eq_ignore_ascii_case(b"REPLICAS") {
+                return cmd_cluster_replicas(cluster, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"REPLICATE") {
+                return cmd_cluster_replicate(cluster, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"RESET") {
+                return cmd_cluster_reset(cluster, subargs);
+            }
+        }
+        Some(b'S') => {
+            if subcmd.eq_ignore_ascii_case(b"SAVECONFIG") {
+                return cmd_cluster_saveconfig();
+            }
+            if subcmd.eq_ignore_ascii_case(b"SET-CONFIG-EPOCH") {
+                return cmd_cluster_set_config_epoch(cluster, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"SETSLOT") {
+                return cmd_cluster_setslot(cluster, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"SHARDS") {
+                return cmd_cluster_shards(cluster);
+            }
+            if subcmd.eq_ignore_ascii_case(b"SLAVES") {
+                return cmd_cluster_replicas(cluster, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"SLOT-STATS") {
+                return cmd_cluster_slot_stats(cluster, store, subargs);
+            }
+            if subcmd.eq_ignore_ascii_case(b"SLOTS") {
+                return cmd_cluster_slots(cluster);
+            }
+        }
+        _ => {}
     }
 
     Err(Error::Custom(format!(
@@ -239,7 +214,9 @@ fn cmd_cluster(
     )))
 }
 
-// === Individual command implementations ===
+// =============================================================================
+// Individual command implementations
+// =============================================================================
 
 /// CLUSTER ADDSLOTS slot [slot ...] - O(N)
 fn cmd_cluster_addslots(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespValue> {
@@ -262,7 +239,7 @@ fn cmd_cluster_addslots(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<R
 
 /// CLUSTER ADDSLOTSRANGE start-slot end-slot [start-slot end-slot ...] - O(N)
 fn cmd_cluster_addslotsrange(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespValue> {
-    if args.is_empty() || !args.len().is_multiple_of(2) {
+    if args.is_empty() || args.len() % 2 != 0 {
         return Err(Error::WrongArity("CLUSTER ADDSLOTSRANGE"));
     }
 
@@ -284,13 +261,10 @@ fn cmd_cluster_addslotsrange(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Res
 /// CLUSTER BUMPEPOCH - O(1)
 fn cmd_cluster_bumpepoch(cluster: &Arc<ClusterState>) -> Result<RespValue> {
     let epoch = cluster.bump_epoch();
-    Ok(RespValue::SimpleString(Bytes::from(format!(
-        "BUMPED {}",
-        epoch
-    ))))
+    Ok(RespValue::SimpleString(Bytes::from(format!("BUMPED {}", epoch))))
 }
 
-/// CLUSTER COUNT-FAILURE-REPORTS node-id - O(N)
+/// CLUSTER COUNT-FAILURE-REPORTS node-id - O(1)
 fn cmd_cluster_count_failure_reports(
     cluster: &Arc<ClusterState>,
     args: &[Bytes],
@@ -303,7 +277,7 @@ fn cmd_cluster_count_failure_reports(
     Ok(RespValue::integer(count as i64))
 }
 
-/// CLUSTER COUNTKEYSINSLOT slot - O(1)
+/// CLUSTER COUNTKEYSINSLOT slot - O(N) - iterates all keys
 fn cmd_cluster_countkeysinslot(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::WrongArity("CLUSTER COUNTKEYSINSLOT"));
@@ -311,7 +285,6 @@ fn cmd_cluster_countkeysinslot(store: &Store, args: &[Bytes]) -> Result<RespValu
 
     let slot = parse_slot(&args[0])?;
 
-    // Count keys in the slot by iterating and checking hash
     let mut count = 0i64;
     store.for_each_key(|key| {
         if key_hash_slot(key) == slot {
@@ -339,7 +312,7 @@ fn cmd_cluster_delslots(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<R
 
 /// CLUSTER DELSLOTSRANGE start-slot end-slot [start-slot end-slot ...] - O(N)
 fn cmd_cluster_delslotsrange(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespValue> {
-    if args.is_empty() || !args.len().is_multiple_of(2) {
+    if args.is_empty() || args.len() % 2 != 0 {
         return Err(Error::WrongArity("CLUSTER DELSLOTSRANGE"));
     }
 
@@ -370,12 +343,11 @@ fn cmd_cluster_failover(args: &[Bytes]) -> Result<RespValue> {
         return Err(Error::Syntax);
     };
 
-    // In standalone mode, we can't actually failover
-    // Return OK to maintain compatibility
+    // Return OK for compatibility (stub in standalone mode)
     Ok(RespValue::ok())
 }
 
-/// CLUSTER FLUSHSLOTS - O(1)
+/// CLUSTER FLUSHSLOTS - O(N)
 fn cmd_cluster_flushslots(cluster: &Arc<ClusterState>) -> Result<RespValue> {
     cluster.flush_slots();
     Ok(RespValue::ok())
@@ -387,10 +359,16 @@ fn cmd_cluster_forget(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<Res
         return Err(Error::WrongArity("CLUSTER FORGET"));
     }
 
-    if !cluster.forget(&args[0]) {
-        return Err(Error::Custom(
-            "ERR Unknown node or can not forget myself".to_string(),
-        ));
+    let node_id = &args[0];
+
+    // Check if trying to forget self
+    if node_id == &cluster.my_id {
+        return Err(Error::Custom("ERR I tried hard but I can't forget myself".to_string()));
+    }
+
+    // Try to forget - now properly removes from all indexes
+    if !cluster.forget(node_id) {
+        return Err(Error::Custom("ERR Unknown node".to_string()));
     }
 
     Ok(RespValue::ok())
@@ -405,7 +383,6 @@ fn cmd_cluster_getkeysinslot(store: &Store, args: &[Bytes]) -> Result<RespValue>
     let slot = parse_slot(&args[0])?;
     let count = parse_int(&args[1])?.max(0) as usize;
 
-    // Collect keys in the slot
     let mut keys = Vec::with_capacity(count.min(1000));
     store.for_each_key(|key| {
         if keys.len() < count && key_hash_slot(key) == slot {
@@ -469,10 +446,7 @@ fn cmd_cluster_meet(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespV
 
     let ip = String::from_utf8_lossy(&args[0]).to_string();
     let port = parse_int(&args[1])? as u16;
-    let cport = args
-        .get(2)
-        .and_then(|a| parse_int(a).ok())
-        .map(|v| v as u16);
+    let cport = args.get(2).and_then(|a| parse_int(a).ok()).map(|v| v as u16);
 
     cluster.meet(ip, port, cport);
     Ok(RespValue::ok())
@@ -487,9 +461,8 @@ fn cmd_cluster_migration(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<
     let subcmd = &args[0];
 
     if subcmd.eq_ignore_ascii_case(b"IMPORT") {
-        // CLUSTER MIGRATION IMPORT start-slot end-slot [start-slot end-slot ...]
         let slots_args = &args[1..];
-        if slots_args.is_empty() || !slots_args.len().is_multiple_of(2) {
+        if slots_args.is_empty() || slots_args.len() % 2 != 0 {
             return Err(Error::WrongArity("CLUSTER MIGRATION IMPORT"));
         }
 
@@ -497,7 +470,6 @@ fn cmd_cluster_migration(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<
             let start = parse_slot(&chunk[0])?;
             let end = parse_slot(&chunk[1])?;
             for slot in start..=end {
-                // Mark as importing (source unknown in this simplified version)
                 cluster.importing.insert(slot, Bytes::from_static(b""));
             }
         }
@@ -505,7 +477,6 @@ fn cmd_cluster_migration(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<
     }
 
     if subcmd.eq_ignore_ascii_case(b"CANCEL") {
-        // CLUSTER MIGRATION CANCEL <ID task-id | ALL>
         if args.len() < 2 {
             return Err(Error::WrongArity("CLUSTER MIGRATION CANCEL"));
         }
@@ -517,7 +488,6 @@ fn cmd_cluster_migration(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<
     }
 
     if subcmd.eq_ignore_ascii_case(b"STATUS") {
-        // CLUSTER MIGRATION STATUS <ID task-id | ALL>
         let mut tasks = Vec::new();
 
         for entry in cluster.migrating.iter() {
@@ -566,34 +536,52 @@ fn cmd_cluster_nodes(cluster: &Arc<ClusterState>) -> Result<RespValue> {
     Ok(RespValue::bulk(Bytes::from(cluster.format_nodes())))
 }
 
-/// CLUSTER REPLICAS node-id - O(N)
+/// CLUSTER REPLICAS node-id - O(1) using master->replicas index
 fn cmd_cluster_replicas(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::WrongArity("CLUSTER REPLICAS"));
     }
 
     let master_id = &args[0];
-    let mut replicas = Vec::new();
 
-    for node in cluster.nodes.iter() {
-        if let Some(ref mid) = node.master_id
-            && mid == master_id
-        {
-            replicas.push(RespValue::bulk(Bytes::from(node.format_nodes_line())));
-        }
-    }
+    // Use O(1) indexed lookup
+    let replicas = cluster.get_replicas(master_id);
 
-    Ok(RespValue::array(replicas))
+    let result: Vec<RespValue> = replicas
+        .iter()
+        .map(|node| RespValue::bulk(Bytes::from(node.format_nodes_line())))
+        .collect();
+
+    Ok(RespValue::array(result))
 }
 
 /// CLUSTER REPLICATE node-id - O(1)
-fn cmd_cluster_replicate(_cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespValue> {
+fn cmd_cluster_replicate(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::WrongArity("CLUSTER REPLICATE"));
     }
 
-    // In standalone mode, we can't actually become a replica
-    // Return OK for compatibility
+    let master_id = &args[0];
+
+    // Check if trying to replicate self
+    if master_id == &cluster.my_id {
+        return Err(Error::Custom("ERR Can't replicate myself".to_string()));
+    }
+
+    // Check if master exists in cluster
+    if !cluster.nodes.contains_key(master_id) {
+        return Err(Error::Custom("ERR Unknown node".to_string()));
+    }
+
+    // For this node itself (not in nodes map), we need to update our own state
+    // This is a simplification - in real Redis, we'd update global state differently
+    // For now, return OK since the master is valid
+
+    // Note: In a full implementation, we'd need to:
+    // 1. Stop serving writes
+    // 2. Connect to master for replication
+    // 3. Update our own role in cluster state
+
     Ok(RespValue::ok())
 }
 
@@ -615,8 +603,7 @@ fn cmd_cluster_reset(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<Resp
 
 /// CLUSTER SAVECONFIG - O(1)
 fn cmd_cluster_saveconfig() -> Result<RespValue> {
-    // In this implementation, config is not persisted
-    // Return OK for compatibility
+    // Return OK for compatibility (config persistence not implemented)
     Ok(RespValue::ok())
 }
 
@@ -675,7 +662,6 @@ fn cmd_cluster_setslot(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<Re
 
 /// CLUSTER SHARDS - O(N)
 fn cmd_cluster_shards(cluster: &Arc<ClusterState>) -> Result<RespValue> {
-    // Build shards info - in standalone, just return self
     let my_ip = cluster.my_ip.read().clone();
     let my_port = cluster.my_port.load(std::sync::atomic::Ordering::Relaxed) as u16;
     let slots = cluster.slots.get_ranges();
@@ -713,7 +699,7 @@ fn cmd_cluster_shards(cluster: &Arc<ClusterState>) -> Result<RespValue> {
     Ok(RespValue::array(vec![RespValue::array(shard)]))
 }
 
-/// CLUSTER SLOT-STATS <SLOTSRANGE start end | ORDERBY metric [LIMIT limit] [ASC|DESC]> - O(N)/O(N log N)
+/// CLUSTER SLOT-STATS <SLOTSRANGE start end | ORDERBY metric ...> - O(N)
 fn cmd_cluster_slot_stats(
     cluster: &Arc<ClusterState>,
     store: &Store,
@@ -734,7 +720,6 @@ fn cmd_cluster_slot_stats(
         let mut stats = Vec::new();
         for slot in start..=end {
             if cluster.slots.has_slot(slot) {
-                // Count keys in slot
                 let mut key_count = 0i64;
                 store.for_each_key(|key| {
                     if key_hash_slot(key) == slot {
@@ -756,31 +741,89 @@ fn cmd_cluster_slot_stats(
     }
 
     if args[0].eq_ignore_ascii_case(b"ORDERBY") {
-        // Not fully implemented - return empty for now
+        // Return empty for now
         return Ok(RespValue::array(vec![]));
     }
 
     Err(Error::Syntax)
 }
 
-/// CLUSTER SLOTS - O(N)
+/// CLUSTER SLOTS - O(N) with optimized slot range building
 fn cmd_cluster_slots(cluster: &Arc<ClusterState>) -> Result<RespValue> {
+    let my_id = &cluster.my_id;
     let my_ip = cluster.my_ip.read().clone();
     let my_port = cluster.my_port.load(std::sync::atomic::Ordering::Relaxed) as i64;
-    let slots = cluster.slots.get_ranges();
 
     let mut result = Vec::new();
-    for (start, end) in slots {
-        let slot_info = vec![
-            RespValue::integer(start as i64),
-            RespValue::integer(end as i64),
-            RespValue::array(vec![
-                RespValue::bulk_string(&my_ip),
-                RespValue::integer(my_port),
-                RespValue::bulk(cluster.my_id.clone()),
-            ]),
-        ];
-        result.push(RespValue::array(slot_info));
+    let mut start_slot: i64 = -1;
+    let mut current_owner_idx: u32 = 0;
+
+    // Use atomic slot owner table for faster iteration
+    for slot in 0..CLUSTER_SLOTS {
+        let owner_idx = cluster.get_slot_owner_index(slot as u16);
+
+        if owner_idx != current_owner_idx {
+            // Emit previous range if it had an owner
+            if start_slot >= 0 && current_owner_idx != 0 {
+                let (ip, port, id) = if current_owner_idx == 1 {
+                    (my_ip.clone(), my_port, my_id.clone())
+                } else if let Some(owner_id) = cluster.get_slot_owner(start_slot as u16) {
+                    if let Some(node) = cluster.nodes.get(&owner_id) {
+                        (node.ip.clone(), node.port as i64, owner_id)
+                    } else {
+                        ("".to_string(), 0, owner_id)
+                    }
+                } else {
+                    ("".to_string(), 0, Bytes::new())
+                };
+
+                if !id.is_empty() {
+                    let slot_info = vec![
+                        RespValue::integer(start_slot),
+                        RespValue::integer((slot - 1) as i64),
+                        RespValue::array(vec![
+                            RespValue::bulk_string(&ip),
+                            RespValue::integer(port),
+                            RespValue::bulk(id),
+                        ]),
+                    ];
+                    result.push(RespValue::array(slot_info));
+                }
+            }
+            start_slot = slot as i64;
+            current_owner_idx = owner_idx;
+        } else if start_slot < 0 && owner_idx != 0 {
+            start_slot = slot as i64;
+            current_owner_idx = owner_idx;
+        }
+    }
+
+    // Emit final range
+    if start_slot >= 0 && current_owner_idx != 0 {
+        let (ip, port, id) = if current_owner_idx == 1 {
+            (my_ip.clone(), my_port, my_id.clone())
+        } else if let Some(owner_id) = cluster.get_slot_owner(start_slot as u16) {
+            if let Some(node) = cluster.nodes.get(&owner_id) {
+                (node.ip.clone(), node.port as i64, owner_id)
+            } else {
+                ("".to_string(), 0, owner_id)
+            }
+        } else {
+            ("".to_string(), 0, Bytes::new())
+        };
+
+        if !id.is_empty() {
+            let slot_info = vec![
+                RespValue::integer(start_slot),
+                RespValue::integer(16383),
+                RespValue::array(vec![
+                    RespValue::bulk_string(&ip),
+                    RespValue::integer(port),
+                    RespValue::bulk(id),
+                ]),
+            ];
+            result.push(RespValue::array(slot_info));
+        }
     }
 
     Ok(RespValue::array(result))
@@ -829,9 +872,11 @@ fn cmd_cluster_help() -> Result<RespValue> {
     ))
 }
 
-// === Helper functions ===
+// =============================================================================
+// Helper functions
+// =============================================================================
 
-/// Parse slot number from argument
+/// Parse slot number from argument - O(1)
 #[inline]
 fn parse_slot(arg: &Bytes) -> Result<u16> {
     let s = std::str::from_utf8(arg).map_err(|_| Error::NotInteger)?;
@@ -846,7 +891,7 @@ fn parse_slot(arg: &Bytes) -> Result<u16> {
     Ok(slot as u16)
 }
 
-/// Parse integer from argument
+/// Parse integer from argument - O(1)
 #[inline]
 fn parse_int(arg: &Bytes) -> Result<i64> {
     let s = std::str::from_utf8(arg).map_err(|_| Error::NotInteger)?;

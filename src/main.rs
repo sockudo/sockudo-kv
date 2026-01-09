@@ -16,6 +16,7 @@ use tokio::net::UnixListener;
 use sockudo_kv::PubSub;
 use sockudo_kv::client::ClientState;
 use sockudo_kv::client_manager::ClientManager;
+use sockudo_kv::cluster::ClusterService;
 use sockudo_kv::cluster_state::ClusterState;
 use sockudo_kv::commands::Dispatcher;
 use sockudo_kv::commands::cluster as cluster_cmd;
@@ -39,7 +40,8 @@ const READ_BUF_SIZE: usize = 64 * 1024;
 const WRITE_BUF_SIZE: usize = 64 * 1024;
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
     let config = sockudo_kv::cli::Cli::load_config().unwrap_or_else(|e| {
         eprintln!("Error loading config: {}", e);
         std::process::exit(1);
@@ -202,11 +204,11 @@ async fn main() -> std::io::Result<()> {
         Arc::new(ClientManager::new())
     };
     let server_state = Arc::new(ServerState::new());
-    let cluster_state = Arc::new(ClusterState::new());
     let replication = Arc::new(sockudo_kv::ReplicationManager::new());
 
     // Set cluster port from config
-    cluster_state
+    server_state
+        .cluster
         .my_port
         .store(config.port as u64, std::sync::atomic::Ordering::Relaxed);
 
@@ -255,6 +257,13 @@ async fn main() -> std::io::Result<()> {
 
     // Apply maxclients limit
     clients.set_maxclients(config.maxclients);
+
+    // Initialize and start Cluster Service
+    let cluster_service = Arc::new(ClusterService::new(server_state.clone()));
+    let cs = cluster_service.clone();
+    tokio::spawn(async move {
+        cs.start().await;
+    });
 
     // Load RDB if exists
     let rdb_path = Path::new(&config.dir).join(&config.dbfilename);
@@ -307,7 +316,6 @@ async fn main() -> std::io::Result<()> {
         let pubsub = Arc::clone(&pubsub);
         let clients = Arc::clone(&clients);
         let server_state = Arc::clone(&server_state);
-        let cluster_state = Arc::clone(&cluster_state);
         let replication = Arc::clone(&replication);
         let config = Arc::clone(&config);
 
@@ -329,7 +337,7 @@ async fn main() -> std::io::Result<()> {
                         let pubsub = Arc::clone(&pubsub);
                         let clients = Arc::clone(&clients);
                         let server_state = Arc::clone(&server_state);
-                        let cluster_state = Arc::clone(&cluster_state);
+                        let cluster_state = Arc::clone(&server_state.cluster);
                         let replication = Arc::clone(&replication);
                         let config = Arc::clone(&config);
 

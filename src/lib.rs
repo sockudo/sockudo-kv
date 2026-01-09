@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod client;
 pub mod client_manager;
+pub mod cluster;
 pub mod cluster_state;
 pub mod commands;
 pub mod config;
@@ -27,3 +28,10 @@ pub use pubsub::PubSub;
 pub use replication::ReplicationManager;
 pub use server_state::ServerState;
 pub use storage::Store;
+
+#[cfg(test)]
+use mimalloc::MiMalloc;
+
+#[cfg(test)]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;

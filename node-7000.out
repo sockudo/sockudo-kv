@@ -1,0 +1,3 @@
+Failed to write pidfile /var/run/redis_6379.pid: Permission denied (os error 13)
+Starting sockudo-kv with config: port=7000, bound to ["127.0.0.1", "-::1"]
+Listening on 127.0.0.1:7000
