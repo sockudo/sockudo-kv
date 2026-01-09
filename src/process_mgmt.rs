@@ -10,9 +10,9 @@ pub fn notify_systemd_ready() -> bool {
         use std::os::unix::net::UnixDatagram;
 
         if let Ok(socket) = UnixDatagram::unbound() {
-            let path = if socket_path.starts_with('@') {
+            let path = if let Some(abstract_name) = socket_path.strip_prefix('@') {
                 // Abstract socket
-                format!("\0{}", &socket_path[1..])
+                format!("\0{}", abstract_name)
             } else {
                 socket_path
             };
@@ -36,8 +36,8 @@ pub fn notify_systemd_stopping() -> bool {
         use std::os::unix::net::UnixDatagram;
 
         if let Ok(socket) = UnixDatagram::unbound() {
-            let path = if socket_path.starts_with('@') {
-                format!("\0{}", &socket_path[1..])
+            let path = if let Some(abstract_name) = socket_path.strip_prefix('@') {
+                format!("\0{}", abstract_name)
             } else {
                 socket_path
             };
@@ -96,16 +96,20 @@ pub enum SupervisedMode {
     Auto,
 }
 
-impl SupervisedMode {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for SupervisedMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "upstart" => Self::Upstart,
             "systemd" => Self::Systemd,
             "auto" => Self::Auto,
             _ => Self::No,
-        }
+        })
     }
+}
 
+impl SupervisedMode {
     /// Detect and apply supervised mode
     pub fn apply(&self) {
         match self {
@@ -135,8 +139,14 @@ mod tests {
 
     #[test]
     fn test_supervised_mode_parse() {
-        assert_eq!(SupervisedMode::from_str("systemd"), SupervisedMode::Systemd);
-        assert_eq!(SupervisedMode::from_str("auto"), SupervisedMode::Auto);
-        assert_eq!(SupervisedMode::from_str("no"), SupervisedMode::No);
+        assert_eq!(
+            "systemd".parse::<SupervisedMode>().unwrap(),
+            SupervisedMode::Systemd
+        );
+        assert_eq!(
+            "auto".parse::<SupervisedMode>().unwrap(),
+            SupervisedMode::Auto
+        );
+        assert_eq!("no".parse::<SupervisedMode>().unwrap(), SupervisedMode::No);
     }
 }

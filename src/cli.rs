@@ -1683,21 +1683,19 @@ fn split_args(line: &str) -> Result<Vec<String>, String> {
             } else {
                 current.push(c);
             }
-        } else {
-            if c == '"' || c == '\'' {
-                in_quote = true;
-                quote_char = c;
-                token_started = true;
-            } else if c.is_whitespace() {
-                if token_started {
-                    args.push(current);
-                    current = String::new();
-                    token_started = false;
-                }
-            } else {
-                current.push(c);
-                token_started = true;
+        } else if c == '"' || c == '\'' {
+            in_quote = true;
+            quote_char = c;
+            token_started = true;
+        } else if c.is_whitespace() {
+            if token_started {
+                args.push(current);
+                current = String::new();
+                token_started = false;
             }
+        } else {
+            current.push(c);
+            token_started = true;
         }
     }
 

@@ -227,7 +227,7 @@ pub fn key_slot(key: &[u8]) -> u16 {
 fn crc16(buf: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for &byte in buf {
-        crc = ((crc << 8) ^ CRC16_TABLE[((crc >> 8) ^ (byte as u16)) as usize]) & 0xFFFF;
+        crc = (crc << 8) ^ CRC16_TABLE[((crc >> 8) ^ (byte as u16)) as usize];
     }
     crc
 }

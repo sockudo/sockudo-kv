@@ -218,8 +218,8 @@ impl Store {
                         } else {
                             // BYTE mode
                             let start_byte = normalize_index(start.unwrap_or(0), len) as usize;
-                            let end_byte = if end.is_some() {
-                                normalize_index(end.unwrap(), len) as usize
+                            let end_byte = if let Some(e) = end {
+                                normalize_index(e, len) as usize
                             } else {
                                 s.len() - 1
                             };
@@ -324,9 +324,9 @@ impl Store {
                 } else {
                     let mut result = vec![0xFF; max_len];
                     for s in &strings {
-                        for i in 0..max_len {
+                        for (i, r) in result.iter_mut().enumerate() {
                             let byte = s.get(i).copied().unwrap_or(0);
-                            result[i] &= byte;
+                            *r &= byte;
                         }
                     }
                     result
@@ -375,10 +375,10 @@ impl Store {
                     let mut result = vec![0u8; max_len];
                     let s1 = &strings[0];
                     let s2 = &strings[1];
-                    for i in 0..max_len {
+                    for (i, r) in result.iter_mut().enumerate() {
                         let b1 = s1.get(i).copied().unwrap_or(0);
                         let b2 = s2.get(i).copied().unwrap_or(0);
-                        result[i] = b1 ^ b2;
+                        *r = b1 ^ b2;
                     }
                     result
                 }
@@ -392,10 +392,10 @@ impl Store {
                     let s1 = &strings[0];
                     let s2 = &strings[1];
                     // First AND
-                    for i in 0..max_len {
+                    for (i, r) in result.iter_mut().enumerate() {
                         let b1 = s1.get(i).copied().unwrap_or(0);
                         let b2 = s2.get(i).copied().unwrap_or(0);
-                        result[i] = b1 & b2;
+                        *r = b1 & b2;
                     }
                     // Then OR with rest
                     for s in strings.iter().skip(2) {

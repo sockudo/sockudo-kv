@@ -1,3 +1,8 @@
+// Allow certain clippy lints that are intentional design decisions
+#![allow(clippy::too_many_arguments)] // Redis-like APIs often need many parameters
+#![allow(clippy::type_complexity)] // Complex types represent Redis data structures
+#![allow(clippy::large_enum_variant)] // DataType enum variants have intentionally different sizes
+
 pub mod cli;
 pub mod client;
 pub mod client_manager;

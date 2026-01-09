@@ -212,10 +212,8 @@ fn write_string(rdb: &mut Vec<u8>, s: &Bytes) {
 
 /// Write integer in RDB encoding
 fn write_int(rdb: &mut Vec<u8>, value: i64) {
-    if (0..=127).contains(&value) {
-        rdb.push(0xC0);
-        rdb.push(value as u8);
-    } else if (-128..=127).contains(&value) {
+    if (-128..=127).contains(&value) {
+        // RDB_ENC_INT8 - covers both positive 0-127 and negative -128..-1
         rdb.push(0xC0);
         rdb.push(value as u8);
     } else if (-32768..=32767).contains(&value) {

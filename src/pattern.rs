@@ -1,11 +1,11 @@
 /// Glob pattern matching implementation ported from Redis's util.c stringmatchlen.
 /// Supports:
-/// * - Matches any sequence of characters (including empty)
-/// ? - Matches any single character
-/// [abc] - Matches any character in the set
-/// [a-z] - Matches any character in the range
-/// [^...] - Negates the set
-/// \x - Matches generic character x
+///     * - Matches any sequence of characters (including empty)
+///     ? - Matches any single character
+///     [abc] - Matches any character in the set
+///     [a-z] - Matches any character in the range
+///     [^...] - Negates the set
+///     \x - Matches generic character x
 ///
 /// Returns true if the string matches the pattern.
 pub fn stringmatch(pattern: &str, text: &str, nocase: bool) -> bool {

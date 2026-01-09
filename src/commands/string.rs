@@ -161,11 +161,7 @@ fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         });
     }
     if opts.xx && !exists {
-        return Ok(if opts.get {
-            RespValue::null()
-        } else {
-            RespValue::null()
-        });
+        return Ok(RespValue::null());
     }
 
     // Calculate expiration

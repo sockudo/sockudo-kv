@@ -59,71 +59,71 @@ impl Dispatcher {
         let cmd_name = cmd.name();
 
         // Cluster Redirection Logic (if enabled)
-        if let Some(state) = server {
-            if state.config.read().cluster_enabled && !cmd.args.is_empty() {
-                // Check if command is key-based.
-                // For MVP, we assume first arg is key if it's not a server/cluster/script command.
-                // In production, we should look up command table.
+        if let Some(state) = server
+            && state.config.read().cluster_enabled
+            && !cmd.args.is_empty()
+        {
+            // Check if command is key-based.
+            // For MVP, we assume first arg is key if it's not a server/cluster/script command.
+            // In production, we should look up command table.
 
-                // Skip if command is in a strict allowlist for random nodes (e.g. INFO, PING, etc)
-                // or if it's already handled elsewhere (like CLUSTER command).
-                let skip = is_server_command(cmd_name)
-                    || is_cluster_protocol_command(cmd_name)
-                    || cmd.is_command(b"INFO")
-                    || cmd.is_command(b"DBSIZE")
-                    || cmd.is_command(b"KEYS");
+            // Skip if command is in a strict allowlist for random nodes (e.g. INFO, PING, etc)
+            // or if it's already handled elsewhere (like CLUSTER command).
+            let skip = is_server_command(cmd_name)
+                || is_cluster_protocol_command(cmd_name)
+                || cmd.is_command(b"INFO")
+                || cmd.is_command(b"DBSIZE")
+                || cmd.is_command(b"KEYS");
 
-                if !skip {
-                    // Calculate hashing slot for first key
-                    // Note: MGET/MSET etc might have multiple. We check first for now.
-                    let key = &args[0];
-                    let slot = crate::cluster::message::key_slot(key);
+            if !skip {
+                // Calculate hashing slot for first key
+                // Note: MGET/MSET etc might have multiple. We check first for now.
+                let key = &args[0];
+                let slot = crate::cluster::message::key_slot(key);
 
-                    // Cross-slot validation for multi-key commands
-                    let is_all_keys = cmd.is_command(b"MGET")
-                        || cmd.is_command(b"DEL")
-                        || cmd.is_command(b"EXISTS");
-                    let is_pair_keys = cmd.is_command(b"MSET") || cmd.is_command(b"MSETNX");
+                // Cross-slot validation for multi-key commands
+                let is_all_keys =
+                    cmd.is_command(b"MGET") || cmd.is_command(b"DEL") || cmd.is_command(b"EXISTS");
+                let is_pair_keys = cmd.is_command(b"MSET") || cmd.is_command(b"MSETNX");
 
-                    if is_all_keys {
-                        for i in 1..args.len() {
-                            if crate::cluster::message::key_slot(&args[i]) != slot {
-                                return Ok(RespValue::error(
-                                    "CROSSSLOT Keys in request don't hash to the same slot",
-                                ));
-                            }
-                        }
-                    } else if is_pair_keys {
-                        for i in (2..args.len()).step_by(2) {
-                            if crate::cluster::message::key_slot(&args[i]) != slot {
-                                return Ok(RespValue::error(
-                                    "CROSSSLOT Keys in request don't hash to the same slot",
-                                ));
-                            }
+                if is_all_keys {
+                    for arg in args.iter().skip(1) {
+                        if crate::cluster::message::key_slot(arg) != slot {
+                            return Ok(RespValue::error(
+                                "CROSSSLOT Keys in request don't hash to the same slot",
+                            ));
                         }
                     }
-
-                    if let Some(target) = state.cluster.get_slot_owner(slot) {
-                        // If target is not me
-                        if target != state.cluster.my_id {
-                            // Check for ASKING (implement later if needed, assume MOVED for now)
-
-                            // Find IP:Port of target
-                            if let Some(node) = state.cluster.nodes.get(&target) {
-                                let ip = &node.ip;
-                                let port = node.port;
-                                let err_msg = format!("MOVED {} {}:{}", slot, ip, port);
-                                return Ok(RespValue::error(&err_msg));
-                            } else {
-                                // Unknown node?
-                                // Fallthrough or error?
-                                // Maybe it's us but ID mismatch? Unlikely.
-                            }
+                } else if is_pair_keys {
+                    for i in (2..args.len()).step_by(2) {
+                        if crate::cluster::message::key_slot(&args[i]) != slot {
+                            return Ok(RespValue::error(
+                                "CROSSSLOT Keys in request don't hash to the same slot",
+                            ));
                         }
-                    } else {
-                        // Slot unassigned
-                        return Ok(RespValue::error("CLUSTERDOWN Hash slot not served"));
                     }
+                }
+
+                if let Some(target) = state.cluster.get_slot_owner(slot) {
+                    // If target is not me
+                    if target != state.cluster.my_id {
+                        // Check for ASKING (implement later if needed, assume MOVED for now)
+
+                        // Find IP:Port of target
+                        if let Some(node) = state.cluster.nodes.get(&target) {
+                            let ip = &node.ip;
+                            let port = node.port;
+                            let err_msg = format!("MOVED {} {}:{}", slot, ip, port);
+                            return Ok(RespValue::error(&err_msg));
+                        } else {
+                            // Unknown node?
+                            // Fallthrough or error?
+                            // Maybe it's us but ID mismatch? Unlikely.
+                        }
+                    }
+                } else {
+                    // Slot unassigned
+                    return Ok(RespValue::error("CLUSTERDOWN Hash slot not served"));
                 }
             }
         }

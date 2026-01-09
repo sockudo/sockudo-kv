@@ -404,14 +404,13 @@ fn cmd_ft_info(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     let info = store.ft_info(&args[0])?;
 
     // Build info response
-    let mut result = Vec::new();
-    result.push(RespValue::bulk(Bytes::from_static(b"index_name")));
-    result.push(RespValue::bulk(info.name.clone()));
-
-    result.push(RespValue::bulk(Bytes::from_static(b"index_options")));
-    result.push(RespValue::array(vec![]));
-
-    result.push(RespValue::bulk(Bytes::from_static(b"index_definition")));
+    let mut result = vec![
+        RespValue::bulk(Bytes::from_static(b"index_name")),
+        RespValue::bulk(info.name.clone()),
+        RespValue::bulk(Bytes::from_static(b"index_options")),
+        RespValue::array(vec![]),
+        RespValue::bulk(Bytes::from_static(b"index_definition")),
+    ];
     let mut def = Vec::new();
     def.push(RespValue::bulk(Bytes::from_static(b"key_type")));
     def.push(RespValue::bulk(Bytes::from_static(if info.on_hash {
@@ -889,15 +888,14 @@ fn cmd_ft_profile(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     response.push(RespValue::array(results_arr));
 
     // Profile info
-    let mut profile = Vec::new();
-    profile.push(RespValue::bulk(Bytes::from_static(b"Total profile time")));
-    profile.push(RespValue::bulk(Bytes::from_static(b"0.01")));
-    profile.push(RespValue::bulk(Bytes::from_static(b"Parsing time")));
-    profile.push(RespValue::bulk(Bytes::from_static(b"0.001")));
-    profile.push(RespValue::bulk(Bytes::from_static(
-        b"Pipeline creation time",
-    )));
-    profile.push(RespValue::bulk(Bytes::from_static(b"0.001")));
+    let profile = vec![
+        RespValue::bulk(Bytes::from_static(b"Total profile time")),
+        RespValue::bulk(Bytes::from_static(b"0.01")),
+        RespValue::bulk(Bytes::from_static(b"Parsing time")),
+        RespValue::bulk(Bytes::from_static(b"0.001")),
+        RespValue::bulk(Bytes::from_static(b"Pipeline creation time")),
+        RespValue::bulk(Bytes::from_static(b"0.001")),
+    ];
     response.push(RespValue::array(profile));
 
     Ok(RespValue::array(response))

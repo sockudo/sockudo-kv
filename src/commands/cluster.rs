@@ -7,7 +7,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 use crate::client::ClientState;
-use crate::cluster_state::{CLUSTER_SLOTS, ClusterState, NodeRole, SlotState, key_hash_slot};
+use crate::cluster_state::{CLUSTER_SLOTS, ClusterState, SlotState, key_hash_slot};
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use crate::storage::Store;
@@ -239,7 +239,7 @@ fn cmd_cluster_addslots(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<R
 
 /// CLUSTER ADDSLOTSRANGE start-slot end-slot [start-slot end-slot ...] - O(N)
 fn cmd_cluster_addslotsrange(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespValue> {
-    if args.is_empty() || args.len() % 2 != 0 {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
         return Err(Error::WrongArity("CLUSTER ADDSLOTSRANGE"));
     }
 
@@ -312,7 +312,7 @@ fn cmd_cluster_delslots(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<R
 
 /// CLUSTER DELSLOTSRANGE start-slot end-slot [start-slot end-slot ...] - O(N)
 fn cmd_cluster_delslotsrange(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespValue> {
-    if args.is_empty() || args.len() % 2 != 0 {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
         return Err(Error::WrongArity("CLUSTER DELSLOTSRANGE"));
     }
 
@@ -462,7 +462,7 @@ fn cmd_cluster_migration(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<
 
     if subcmd.eq_ignore_ascii_case(b"IMPORT") {
         let slots_args = &args[1..];
-        if slots_args.is_empty() || slots_args.len() % 2 != 0 {
+        if slots_args.is_empty() || !slots_args.len().is_multiple_of(2) {
             return Err(Error::WrongArity("CLUSTER MIGRATION IMPORT"));
         }
 

@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)] // Handler functions need many parameters
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,10 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    if !config.pidfile.is_empty() {
-        if let Err(e) = std::fs::write(&config.pidfile, std::process::id().to_string()) {
-            eprintln!("Failed to write pidfile {}: {}", config.pidfile, e);
-        }
+    if !config.pidfile.is_empty()
+        && let Err(e) = std::fs::write(&config.pidfile, std::process::id().to_string())
+    {
+        eprintln!("Failed to write pidfile {}: {}", config.pidfile, e);
     }
 
     println!(

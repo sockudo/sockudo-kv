@@ -1017,7 +1017,7 @@ impl Entry {
 
     #[inline]
     pub fn new(data: DataType) -> Self {
-        let now_secs = (now_ms() / 1000) as i64;
+        let now_secs = now_ms() / 1000;
         Self {
             data,
             expire_at: AtomicI64::new(Self::NO_EXPIRE),
@@ -1029,7 +1029,7 @@ impl Entry {
 
     #[inline]
     pub fn with_expire(data: DataType, expire_at_ms: i64) -> Self {
-        let now_secs = (now_ms() / 1000) as i64;
+        let now_secs = now_ms() / 1000;
         Self {
             data,
             expire_at: AtomicI64::new(expire_at_ms),
@@ -1097,7 +1097,7 @@ impl Entry {
     /// Update LRU access time to now
     #[inline]
     pub fn touch_lru(&self) {
-        let now_secs = (now_ms() / 1000) as i64;
+        let now_secs = now_ms() / 1000;
         self.lru_time.store(now_secs, Ordering::Relaxed);
     }
 
@@ -1110,7 +1110,7 @@ impl Entry {
     /// Get idle time in seconds since last access
     #[inline]
     pub fn idle_time(&self) -> i64 {
-        let now_secs = (now_ms() / 1000) as i64;
+        let now_secs = now_ms() / 1000;
         (now_secs - self.lru_time.load(Ordering::Relaxed)).max(0)
     }
 
@@ -1333,7 +1333,7 @@ impl VectorSetData {
         ef_construction: usize,
         quant: VectorQuantization,
     ) -> Self {
-        let m = m.max(2).min(128); // Clamp M to reasonable range
+        let m = m.clamp(2, 128); // Clamp M to reasonable range
         Self {
             dim,
             reduced_dim: None,

@@ -14,15 +14,15 @@
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
 use crate::cluster::message::{
-    ClusterMsg, CLUSTERMSG_TYPE_MEET, CLUSTERMSG_TYPE_PING, CLUSTERMSG_TYPE_PONG,
+    CLUSTERMSG_TYPE_MEET, CLUSTERMSG_TYPE_PING, CLUSTERMSG_TYPE_PONG, ClusterMsg,
 };
 use crate::cluster_state::{ClusterLink, LinkDirection};
 use crate::server_state::ServerState;
@@ -152,7 +152,10 @@ impl ClusterService {
             return;
         }
 
-        self.server.cluster.messages_received.fetch_add(1, Ordering::Relaxed);
+        self.server
+            .cluster
+            .messages_received
+            .fetch_add(1, Ordering::Relaxed);
 
         let bytes = &buf[..];
 
@@ -182,10 +185,18 @@ impl ClusterService {
         // Handle message type
         match type_u16 {
             CLUSTERMSG_TYPE_PING | CLUSTERMSG_TYPE_MEET => {
-                debug!("Received PING/MEET from {}", String::from_utf8_lossy(&sender));
+                debug!(
+                    "Received PING/MEET from {}",
+                    String::from_utf8_lossy(&sender)
+                );
 
                 // Update link info
-                if let Some(mut link) = self.server.cluster.links.get_mut(&Bytes::from(format!("{}:{}", peer_ip, declared_cport))) {
+                if let Some(mut link) = self
+                    .server
+                    .cluster
+                    .links
+                    .get_mut(&Bytes::from(format!("{}:{}", peer_ip, declared_cport)))
+                {
                     link.node_id = sender.clone();
                 }
 
@@ -196,14 +207,21 @@ impl ClusterService {
                 if let Err(e) = stream.write_all(&out).await {
                     warn!("Failed to send PONG: {}", e);
                 } else {
-                    self.server.cluster.messages_sent.fetch_add(1, Ordering::Relaxed);
+                    self.server
+                        .cluster
+                        .messages_sent
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
             CLUSTERMSG_TYPE_PONG => {
                 debug!("Received PONG from {}", String::from_utf8_lossy(&sender));
             }
             _ => {
-                debug!("Received unknown message type {} from {}", type_u16, String::from_utf8_lossy(&sender));
+                debug!(
+                    "Received unknown message type {} from {}",
+                    type_u16,
+                    String::from_utf8_lossy(&sender)
+                );
             }
         }
     }
@@ -264,12 +282,15 @@ impl ClusterService {
 
         // Update node timestamps
         if let Some(node) = self.server.cluster.get_node(sender) {
-            node.pong_recv.store(crate::storage::now_ms() as u64, Ordering::Relaxed);
+            node.pong_recv
+                .store(crate::storage::now_ms() as u64, Ordering::Relaxed);
             node.link_state.store(1, Ordering::Relaxed);
         }
 
         // Use batch update API - no per-slot locks, single write lock acquisition
-        self.server.cluster.batch_update_slots_from_gossip(sender, slots_bitmap);
+        self.server
+            .cluster
+            .batch_update_slots_from_gossip(sender, slots_bitmap);
     }
 
     /// Gossip loop - sends PINGs to random nodes
@@ -323,7 +344,10 @@ impl ClusterService {
                     return;
                 }
 
-                self.server.cluster.messages_sent.fetch_add(1, Ordering::Relaxed);
+                self.server
+                    .cluster
+                    .messages_sent
+                    .fetch_add(1, Ordering::Relaxed);
 
                 // Track outgoing link
                 let link_id = Bytes::from(format!("out:{}", addr));
@@ -341,10 +365,9 @@ impl ClusterService {
 
                 // Wait for PONG with timeout
                 resp_buf.clear();
-                match tokio::time::timeout(
-                    Duration::from_millis(500),
-                    stream.read_buf(resp_buf),
-                ).await {
+                match tokio::time::timeout(Duration::from_millis(500), stream.read_buf(resp_buf))
+                    .await
+                {
                     Ok(Ok(n)) if n > 0 => {
                         // Process PONG
                         let peer_ip = target.ip.clone();
@@ -386,8 +409,8 @@ impl ClusterService {
         msg.sender = self.server.cluster.my_id.clone();
 
         let port = self.server.config.read().port;
-        msg.port = port as u16;
-        msg.cport = (port + 10000) as u16;
+        msg.port = port;
+        msg.cport = port + 10000;
 
         // Serialize slots bitmap efficiently
         self.server.cluster.slots.to_bytes(&mut msg.myslots);

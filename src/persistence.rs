@@ -42,14 +42,16 @@ pub enum AppendFsync {
     No,
 }
 
-impl AppendFsync {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for AppendFsync {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "always" => Self::Always,
             "everysec" => Self::EverySecond,
             "no" => Self::No,
             _ => Self::EverySecond,
-        }
+        })
     }
 }
 
@@ -102,7 +104,7 @@ impl PersistenceManager {
             bgsave_in_progress: AtomicBool::new(false),
             last_bgsave_status: AtomicU64::new(0),
             aof_enabled: AtomicBool::new(config.appendonly),
-            aof_fsync: AppendFsync::from_str(&config.appendfsync),
+            aof_fsync: config.appendfsync.parse().unwrap(),
             rdb_path,
             aof_path,
         }
@@ -226,8 +228,14 @@ mod tests {
 
     #[test]
     fn test_appendfsync_parse() {
-        assert_eq!(AppendFsync::from_str("always"), AppendFsync::Always);
-        assert_eq!(AppendFsync::from_str("everysec"), AppendFsync::EverySecond);
-        assert_eq!(AppendFsync::from_str("no"), AppendFsync::No);
+        assert_eq!(
+            "always".parse::<AppendFsync>().unwrap(),
+            AppendFsync::Always
+        );
+        assert_eq!(
+            "everysec".parse::<AppendFsync>().unwrap(),
+            AppendFsync::EverySecond
+        );
+        assert_eq!("no".parse::<AppendFsync>().unwrap(), AppendFsync::No);
     }
 }

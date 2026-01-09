@@ -152,7 +152,7 @@ pub async fn connect_to_master(
             _ = ack_interval.tick() => {
                 // Send REPLCONF ACK with current offset
                 let offset = repl_clone.offset();
-                if let Err(_) = send_command(&mut stream, &["REPLCONF", "ACK", &offset.to_string()]).await {
+                if send_command(&mut stream, &["REPLCONF", "ACK", &offset.to_string()]).await.is_err() {
                     // Ignore ACK errors, master may not respond
                 }
             }

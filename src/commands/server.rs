@@ -346,28 +346,28 @@ fn apply_acl_rule(user: &mut AclUser, rule: &str) -> Result<()> {
         "nocommands" | "-@all" => user.commands.allow_all = false,
         r if r.starts_with('>') => user
             .passwords
-            .push(Bytes::copy_from_slice(r[1..].as_bytes())),
-        r if r.starts_with('<') => user.passwords.retain(|p| p.as_ref() != r[1..].as_bytes()),
-        r if r.starts_with("~") => user.keys.push(Bytes::copy_from_slice(r[1..].as_bytes())),
+            .push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
+        r if r.starts_with('<') => user.passwords.retain(|p| p.as_ref() != &r.as_bytes()[1..]),
+        r if r.starts_with("~") => user.keys.push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
         r if r.starts_with("&") => user
             .channels
-            .push(Bytes::copy_from_slice(r[1..].as_bytes())),
+            .push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
         r if r.starts_with("+@") => user
             .commands
             .allowed_cats
-            .push(Bytes::copy_from_slice(r[2..].as_bytes())),
+            .push(Bytes::copy_from_slice(&r.as_bytes()[2..])),
         r if r.starts_with("-@") => user
             .commands
             .denied_cats
-            .push(Bytes::copy_from_slice(r[2..].as_bytes())),
+            .push(Bytes::copy_from_slice(&r.as_bytes()[2..])),
         r if r.starts_with('+') => user
             .commands
             .allowed
-            .push(Bytes::copy_from_slice(r[1..].as_bytes())),
+            .push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
         r if r.starts_with('-') => user
             .commands
             .denied
-            .push(Bytes::copy_from_slice(r[1..].as_bytes())),
+            .push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
         _ => {}
     }
     Ok(())
@@ -1083,13 +1083,13 @@ fn cmd_slowlog(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
 
 fn cmd_lolwut(_args: &[Bytes]) -> Result<RespValue> {
     let art = r#"
-   _____            _              _       
-  / ____|          | |            | |      
- | (___   ___   ___| | ___   _  __| | ___  
-  \___ \ / _ \ / __| |/ / | | |/ _` |/ _ \ 
+   _____            _              _
+  / ____|          | |            | |
+ | (___   ___   ___| | ___   _  __| | ___
+  \___ \ / _ \ / __| |/ / | | |/ _` |/ _ \
   ____) | (_) | (__|   <| |_| | (_| | (_) |
- |_____/ \___/ \___|_|\_\\__,_|\__,_|\___/ 
-                                           
+ |_____/ \___/ \___|_|\_\\__,_|\__,_|\___/
+
 sockudo-kv ver. 7.0.0
 "#;
     Ok(RespValue::bulk_string(art))
@@ -1185,11 +1185,11 @@ fn cmd_config_get(server: &Arc<ServerState>, pattern: &[u8]) -> Result<RespValue
             result.push(RespValue::bulk_string(&(entry.getter)(&config)));
         }
         // Also check alias
-        if let Some(alias) = entry.alias {
-            if matches_pattern(pattern_str, alias) {
-                result.push(RespValue::bulk_string(alias));
-                result.push(RespValue::bulk_string(&(entry.getter)(&config)));
-            }
+        if let Some(alias) = entry.alias
+            && matches_pattern(pattern_str, alias)
+        {
+            result.push(RespValue::bulk_string(alias));
+            result.push(RespValue::bulk_string(&(entry.getter)(&config)));
         }
     }
 

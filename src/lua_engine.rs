@@ -475,7 +475,7 @@ fn lua_to_string(value: &Value) -> LuaResult<String> {
 }
 
 /// Convert Lua value to RespValue
-fn lua_value_to_resp(lua: &Lua, value: Value) -> Result<RespValue, String> {
+fn lua_value_to_resp(_lua: &Lua, value: Value) -> Result<RespValue, String> {
     match value {
         Value::Nil => Ok(RespValue::Null),
         Value::Boolean(b) => Ok(RespValue::integer(if b { 1 } else { 0 })),
@@ -505,7 +505,7 @@ fn lua_value_to_resp(lua: &Lua, value: Value) -> Result<RespValue, String> {
                 let val: Value = table
                     .get(i)
                     .map_err(|e| format!("Failed to get table[{}]: {}", i, e))?;
-                arr.push(lua_value_to_resp(lua, val)?);
+                arr.push(lua_value_to_resp(_lua, val)?);
             }
 
             Ok(RespValue::array(arr))
@@ -586,15 +586,14 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    if pattern.starts_with('*') && pattern.ends_with('*') {
-        let inner = &pattern[1..pattern.len() - 1];
-        return text.contains(inner);
+    if let Some(rest) = pattern.strip_prefix('*') {
+        if let Some(inner) = rest.strip_suffix('*') {
+            return text.contains(inner);
+        }
+        return text.ends_with(rest);
     }
-    if pattern.starts_with('*') {
-        return text.ends_with(&pattern[1..]);
-    }
-    if pattern.ends_with('*') {
-        return text.starts_with(&pattern[..pattern.len() - 1]);
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return text.starts_with(prefix);
     }
     pattern == text
 }

@@ -549,11 +549,8 @@ fn cmd_vsim(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             idx += 1;
         } else if eq_ignore_case(&args[idx], b"FILTER-EF") {
             idx += 2; // Skip FILTER-EF and value
-        } else if eq_ignore_case(&args[idx], b"TRUTH") {
-            idx += 1;
-        } else if eq_ignore_case(&args[idx], b"NOTHREAD") {
-            idx += 1;
         } else {
+            // Skip unknown options like TRUTH, NOTHREAD, etc.
             idx += 1;
         }
     }

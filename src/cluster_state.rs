@@ -1080,11 +1080,10 @@ impl ClusterState {
             self.master_replicas.remove(node_id);
 
             // Remove from any master's replica list
-            if let Some(master_id) = node.master_id.read().as_ref() {
-                if let Some(mut replicas) = self.master_replicas.get_mut(master_id) {
+            if let Some(master_id) = node.master_id.read().as_ref()
+                && let Some(mut replicas) = self.master_replicas.get_mut(master_id) {
                     replicas.retain(|id| id != node_id);
                 }
-            }
 
             return true;
         }
@@ -1137,7 +1136,7 @@ impl ClusterState {
             // Update master->replicas index
             self.master_replicas
                 .entry(master_id.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(replica_id.clone());
 
             Ok(())

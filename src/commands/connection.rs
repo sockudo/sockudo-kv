@@ -723,28 +723,22 @@ fn cmd_hello(
     }
 
     // Build HELLO response
-    let mut response = Vec::new();
-
-    response.push(RespValue::bulk_string("server"));
-    response.push(RespValue::bulk_string("sockudo-kv"));
-
-    response.push(RespValue::bulk_string("version"));
-    response.push(RespValue::bulk_string("7.0.0"));
-
-    response.push(RespValue::bulk_string("proto"));
-    response.push(RespValue::integer(protover));
-
-    response.push(RespValue::bulk_string("id"));
-    response.push(RespValue::integer(client.id as i64));
-
-    response.push(RespValue::bulk_string("mode"));
-    response.push(RespValue::bulk_string("standalone"));
-
-    response.push(RespValue::bulk_string("role"));
-    response.push(RespValue::bulk_string("master"));
-
-    response.push(RespValue::bulk_string("modules"));
-    response.push(RespValue::array(vec![]));
+    let response = vec![
+        RespValue::bulk_string("server"),
+        RespValue::bulk_string("sockudo-kv"),
+        RespValue::bulk_string("version"),
+        RespValue::bulk_string("7.0.0"),
+        RespValue::bulk_string("proto"),
+        RespValue::integer(protover),
+        RespValue::bulk_string("id"),
+        RespValue::integer(client.id as i64),
+        RespValue::bulk_string("mode"),
+        RespValue::bulk_string("standalone"),
+        RespValue::bulk_string("role"),
+        RespValue::bulk_string("master"),
+        RespValue::bulk_string("modules"),
+        RespValue::array(vec![]),
+    ];
 
     Ok(RespValue::array(response))
 }
