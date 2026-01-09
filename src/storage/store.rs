@@ -21,23 +21,31 @@ pub struct Store {
 }
 
 impl Store {
+    // ==================== Core Generic Operations ====================
+
     /// Create a new store with default capacity
     pub fn new() -> Self {
-        Self {
-            data: DashMap::new(),
-            key_count: AtomicU64::new(0),
-            search_indexes: DashMap::new(),
-            search_aliases: DashMap::new(),
-        }
+        Self::with_capacity(0)
     }
 
     /// Create a new store with specified capacity
+    /// Dragonfly-style: one shard per CPU core for optimal concurrency under load
+    /// Uses lazy allocation (capacity=0) for memory efficiency at cold start
     pub fn with_capacity(capacity: usize) -> Self {
+        // Dragonfly approach: shard count = CPU cores for minimal lock contention
+        let num_cpus = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+        // Clamp to reasonable range: min 4, max 64 shards
+        let shard_count = num_cpus.clamp(4, 64);
+
         Self {
-            data: DashMap::with_capacity(capacity),
+            // Dynamic shards based on CPU count for optimal concurrency
+            data: DashMap::with_capacity_and_shard_amount(capacity, shard_count),
             key_count: AtomicU64::new(0),
-            search_indexes: DashMap::new(),
-            search_aliases: DashMap::new(),
+            // Metadata maps rarely used, minimal 2 shards
+            search_indexes: DashMap::with_capacity_and_shard_amount(0, 2),
+            search_aliases: DashMap::with_capacity_and_shard_amount(0, 2),
         }
     }
 

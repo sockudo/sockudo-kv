@@ -95,7 +95,8 @@ impl PubSub {
     /// Register a new subscriber, returns (id, receiver)
     pub fn register(&self) -> (u64, broadcast::Receiver<PubSubMessage>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = broadcast::channel(1024); // Buffer 1024 messages
+        // Dragonfly-style: smaller buffer, grows via backpressure
+        let (tx, rx) = broadcast::channel(256);
         self.subscribers.insert(id, Subscriber::new(tx));
         (id, rx)
     }

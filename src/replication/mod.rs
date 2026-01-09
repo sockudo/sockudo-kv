@@ -65,7 +65,8 @@ pub struct ReplicationBacklog {
 impl ReplicationBacklog {
     pub fn new(max_size: usize) -> Self {
         Self {
-            buffer: RwLock::new(VecDeque::with_capacity(1024)),
+            // Dragonfly-style: minimal initial allocation, grows on demand
+            buffer: RwLock::new(VecDeque::with_capacity(64)),
             max_size,
             current_size: AtomicU64::new(0),
             start_offset: AtomicI64::new(0),
@@ -148,7 +149,8 @@ pub struct ReplicationManager {
 
 impl ReplicationManager {
     pub fn new() -> Self {
-        let (cmd_tx, _) = broadcast::channel(10000);
+        // Dragonfly-style: smaller buffer, memory efficient
+        let (cmd_tx, _) = broadcast::channel(1024);
 
         Self {
             role: RwLock::new(ReplicationRole::Master),
@@ -194,7 +196,8 @@ impl ReplicationManager {
     /// Register a new replica
     pub fn register_replica(&self, addr: SocketAddr) -> Arc<ConnectedReplica> {
         let id = self.next_replica_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, _) = broadcast::channel(10000);
+        // Dragonfly-style: smaller buffer for memory efficiency
+        let (tx, _) = broadcast::channel(1024);
 
         let replica = Arc::new(ConnectedReplica {
             id,

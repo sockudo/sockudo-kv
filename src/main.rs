@@ -189,8 +189,8 @@ async fn main() -> std::io::Result<()> {
     let _ = &tls_acceptor;
 
     // Global state - MultiStore with configured databases
-    let multi_store = Arc::new(sockudo_kv::storage::MultiStore::with_capacity_and_count(
-        100_000,
+    // Note: Use with_db_count to avoid pre-allocating DashMap capacity
+    let multi_store = Arc::new(sockudo_kv::storage::MultiStore::with_db_count(
         config.databases,
     ));
     let pubsub = Arc::new(PubSub::new());
