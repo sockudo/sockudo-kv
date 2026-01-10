@@ -29,6 +29,10 @@ mlua = { version = "0.11", features = ["luajit", "serialize"] }
 parking_lot = "0.12"
 roaring = "0.11"
 mimalloc = { version = "*", features = ["v3"] }
+wide = "1"
+rart = "0.2"
+rayon = "1.10"
+lru = "0.14"
 
 # TLS Support
 tokio-rustls = "0.26"

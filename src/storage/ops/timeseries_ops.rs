@@ -11,8 +11,9 @@ use std::sync::atomic::Ordering;
 
 use crate::error::{Error, Result};
 use crate::storage::Store;
+use crate::storage::timeseries::TimeSeries;
 use crate::storage::types::{
-    Aggregation, CompactionRule, DataType, DuplicatePolicy, Entry, TimeSeriesData,
+    Aggregation, CompactionRule, DataType, DuplicatePolicy, Entry, TimeSeriesInfo,
 };
 
 /// Label index for efficient filtering
@@ -31,21 +32,16 @@ impl Store {
         &self,
         key: Bytes,
         retention: i64,
-        chunk_size: usize,
         duplicate_policy: DuplicatePolicy,
-        ignore_max_time_diff: i64,
-        ignore_max_val_diff: f64,
         labels: Vec<(String, String)>,
     ) -> Result<()> {
         match self.data.entry(key.clone()) {
             DashEntry::Occupied(_) => Err(Error::Other("TSDB: key already exists")),
             DashEntry::Vacant(e) => {
-                let mut ts = TimeSeriesData::new();
-                ts.retention = retention;
-                ts.chunk_size = chunk_size;
+                let mut ts = TimeSeries::new();
+                ts.retention_ms = retention;
                 ts.duplicate_policy = duplicate_policy;
-                ts.ignore_max_time_diff = ignore_max_time_diff;
-                ts.ignore_max_val_diff = ignore_max_val_diff;
+                // chunk_size, ignore_* are not supported or handled differently
 
                 // Add labels and update index
                 for (label, value) in labels {
@@ -71,7 +67,7 @@ impl Store {
                 let entry = e.get_mut();
                 match &mut entry.data {
                     DataType::TimeSeries(ts) => {
-                        ts.add_sample(timestamp, value).map_err(Error::Other)?;
+                        ts.add(timestamp, value).map_err(Error::Other)?;
                         Ok(timestamp)
                     }
                     _ => Err(Error::WrongType),
@@ -79,8 +75,8 @@ impl Store {
             }
             DashEntry::Vacant(e) => {
                 // Auto-create timeseries
-                let mut ts = TimeSeriesData::new();
-                ts.add_sample(timestamp, value).map_err(Error::Other)?;
+                let mut ts = TimeSeries::new();
+                ts.add(timestamp, value).map_err(Error::Other)?;
                 e.insert(Entry::new(DataType::TimeSeries(Box::new(ts))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(timestamp)
@@ -120,35 +116,25 @@ impl Store {
 
     /// TS.INCRBY / TS.DECRBY
     pub fn ts_incrby(&self, key: Bytes, value: f64, timestamp: Option<i64>) -> Result<i64> {
-        let ts = timestamp.unwrap_or_else(crate::storage::value::now_ms);
+        let ts_val = timestamp.unwrap_or_else(crate::storage::value::now_ms);
 
         match self.data.entry(key.clone()) {
             DashEntry::Occupied(mut e) => {
                 let entry = e.get_mut();
                 match &mut entry.data {
-                    DataType::TimeSeries(tsdata) => {
-                        // Get current value at this timestamp or last value
-                        let current = tsdata
-                            .samples
-                            .get(&ts)
-                            .copied()
-                            .or_else(|| tsdata.get_latest().map(|(_, v)| v))
-                            .unwrap_or(0.0);
-
-                        tsdata
-                            .add_sample(ts, current + value)
-                            .map_err(Error::Other)?;
-                        Ok(ts)
+                    DataType::TimeSeries(ts) => {
+                        ts.incrby(value, ts_val).map_err(Error::Other)?;
+                        Ok(ts_val)
                     }
                     _ => Err(Error::WrongType),
                 }
             }
             DashEntry::Vacant(e) => {
-                let mut tsdata = TimeSeriesData::new();
-                tsdata.add_sample(ts, value).map_err(Error::Other)?;
+                let mut tsdata = TimeSeries::new();
+                tsdata.add(ts_val, value).map_err(Error::Other)?;
                 e.insert(Entry::new(DataType::TimeSeries(Box::new(tsdata))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
-                Ok(ts)
+                Ok(ts_val)
             }
         }
     }
@@ -158,7 +144,6 @@ impl Store {
         &self,
         key: &[u8],
         retention: Option<i64>,
-        chunk_size: Option<usize>,
         duplicate_policy: Option<DuplicatePolicy>,
         labels: Option<Vec<(String, String)>>,
     ) -> Result<()> {
@@ -168,11 +153,9 @@ impl Store {
                 match &mut entry.data {
                     DataType::TimeSeries(ts) => {
                         if let Some(r) = retention {
-                            ts.retention = r;
+                            ts.retention_ms = r;
                         }
-                        if let Some(c) = chunk_size {
-                            ts.chunk_size = c;
-                        }
+                        // chunk_size not directly supported for modification
                         if let Some(d) = duplicate_policy {
                             ts.duplicate_policy = d;
                         }
@@ -210,18 +193,7 @@ impl Store {
             if e.is_expired() {
                 None
             } else {
-                e.data.as_timeseries().map(|ts| TimeSeriesInfo {
-                    total_samples: ts.total_samples,
-                    memory_usage: ts.samples.len() * 16 + ts.labels.len() * 64,
-                    first_timestamp: ts.first_timestamp,
-                    last_timestamp: ts.last_timestamp,
-                    retention: ts.retention,
-                    chunk_count: 1,
-                    chunk_size: ts.chunk_size,
-                    duplicate_policy: ts.duplicate_policy,
-                    labels: ts.labels.clone(),
-                    rules: ts.rules.clone(),
-                })
+                e.data.as_timeseries().map(|ts| ts.info())
             }
         })
     }
@@ -249,8 +221,7 @@ impl Store {
                     }
                     result
                 } else {
-                    let mut result: Vec<(i64, f64)> =
-                        ts.range(from, to).map(|(&t, &v)| (t, v)).collect();
+                    let mut result = ts.range(from, to);
                     if let Some(c) = count {
                         result.truncate(c);
                     }
@@ -282,11 +253,7 @@ impl Store {
                     }
                     result
                 } else {
-                    let mut result: Vec<(i64, f64)> = ts
-                        .rev_range(from, to)
-                        .rev()
-                        .map(|(&t, &v)| (t, v))
-                        .collect();
+                    let mut result = ts.rev_range(from, to);
                     if let Some(c) = count {
                         result.truncate(c);
                     }
@@ -425,19 +392,4 @@ impl Store {
             None => Err(Error::Other("TSDB: the key does not exist")),
         }
     }
-}
-
-/// Info returned by TS.INFO
-#[derive(Debug)]
-pub struct TimeSeriesInfo {
-    pub total_samples: u64,
-    pub memory_usage: usize,
-    pub first_timestamp: i64,
-    pub last_timestamp: i64,
-    pub retention: i64,
-    pub chunk_count: usize,
-    pub chunk_size: usize,
-    pub duplicate_policy: DuplicatePolicy,
-    pub labels: std::collections::HashMap<String, String>,
-    pub rules: Vec<CompactionRule>,
 }

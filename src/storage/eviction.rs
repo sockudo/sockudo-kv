@@ -54,9 +54,10 @@ fn evict_volatile_lru(store: &Arc<Store>, samples: usize, count: usize) -> Evict
         if let Some((key, _)) = candidates
             .into_iter()
             .min_by_key(|(_, idle_time)| std::cmp::Reverse(*idle_time))
-            && store.del(&key) {
-                evicted += 1;
-            }
+            && store.del(&key)
+        {
+            evicted += 1;
+        }
     }
 
     EvictionResult {
@@ -78,9 +79,10 @@ fn evict_allkeys_lru(store: &Arc<Store>, samples: usize, count: usize) -> Evicti
         if let Some((key, _)) = candidates
             .into_iter()
             .min_by_key(|(_, idle_time)| std::cmp::Reverse(*idle_time))
-            && store.del(&key) {
-                evicted += 1;
-            }
+            && store.del(&key)
+        {
+            evicted += 1;
+        }
     }
 
     EvictionResult {
@@ -101,9 +103,10 @@ fn evict_volatile_lfu(store: &Arc<Store>, samples: usize, count: usize) -> Evict
 
         // Find key with lowest LFU counter
         if let Some((key, _)) = candidates.into_iter().min_by_key(|(_, lfu)| *lfu)
-            && store.del(&key) {
-                evicted += 1;
-            }
+            && store.del(&key)
+        {
+            evicted += 1;
+        }
     }
 
     EvictionResult {
@@ -123,9 +126,10 @@ fn evict_allkeys_lfu(store: &Arc<Store>, samples: usize, count: usize) -> Evicti
         }
 
         if let Some((key, _)) = candidates.into_iter().min_by_key(|(_, lfu)| *lfu)
-            && store.del(&key) {
-                evicted += 1;
-            }
+            && store.del(&key)
+        {
+            evicted += 1;
+        }
     }
 
     EvictionResult {
@@ -180,9 +184,10 @@ fn evict_volatile_ttl(store: &Arc<Store>, samples: usize, count: usize) -> Evict
 
         // Find key with smallest TTL
         if let Some((key, _)) = candidates.into_iter().min_by_key(|(_, ttl)| *ttl)
-            && store.del(&key) {
-                evicted += 1;
-            }
+            && store.del(&key)
+        {
+            evicted += 1;
+        }
     }
 
     EvictionResult {
@@ -303,9 +308,10 @@ fn sample_volatile_keys_ttl(store: &Arc<Store>, samples: usize) -> Vec<(Bytes, i
         if let Some(entry) = store.data.iter().nth(skip) {
             let e = entry.value();
             if !e.is_expired()
-                && let Some(ttl) = e.ttl_ms() {
-                    result.push((entry.key().clone(), ttl));
-                }
+                && let Some(ttl) = e.ttl_ms()
+            {
+                result.push((entry.key().clone(), ttl));
+            }
         }
         if result.len() >= samples {
             break;

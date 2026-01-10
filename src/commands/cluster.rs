@@ -261,7 +261,10 @@ fn cmd_cluster_addslotsrange(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Res
 /// CLUSTER BUMPEPOCH - O(1)
 fn cmd_cluster_bumpepoch(cluster: &Arc<ClusterState>) -> Result<RespValue> {
     let epoch = cluster.bump_epoch();
-    Ok(RespValue::SimpleString(Bytes::from(format!("BUMPED {}", epoch))))
+    Ok(RespValue::SimpleString(Bytes::from(format!(
+        "BUMPED {}",
+        epoch
+    ))))
 }
 
 /// CLUSTER COUNT-FAILURE-REPORTS node-id - O(1)
@@ -363,7 +366,9 @@ fn cmd_cluster_forget(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<Res
 
     // Check if trying to forget self
     if node_id == &cluster.my_id {
-        return Err(Error::Custom("ERR I tried hard but I can't forget myself".to_string()));
+        return Err(Error::Custom(
+            "ERR I tried hard but I can't forget myself".to_string(),
+        ));
     }
 
     // Try to forget - now properly removes from all indexes
@@ -446,7 +451,10 @@ fn cmd_cluster_meet(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespV
 
     let ip = String::from_utf8_lossy(&args[0]).to_string();
     let port = parse_int(&args[1])? as u16;
-    let cport = args.get(2).and_then(|a| parse_int(a).ok()).map(|v| v as u16);
+    let cport = args
+        .get(2)
+        .and_then(|a| parse_int(a).ok())
+        .map(|v| v as u16);
 
     cluster.meet(ip, port, cport);
     Ok(RespValue::ok())

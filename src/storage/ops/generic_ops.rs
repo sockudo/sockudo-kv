@@ -10,9 +10,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 
 use crate::storage::Store;
-use crate::storage::types::{
-    DataType, Entry, HyperLogLogData, SortedSetData, StreamData, TimeSeriesData, VectorSetData,
-};
+use crate::storage::types::{DataType, Entry, SortedSetData, StreamData, VectorSetData};
 use crate::storage::value::now_ms;
 
 // ======================== Pattern Matching ========================
@@ -165,26 +163,9 @@ impl Store {
                 };
                 DataType::Stream(new_stream)
             }
-            DataType::HyperLogLog(hll) => DataType::HyperLogLog(HyperLogLogData {
-                registers: hll.registers,
-            }),
+            DataType::HyperLogLog(hll) => DataType::HyperLogLog(hll.clone()),
             DataType::Json(j) => DataType::Json(j.clone()),
-            DataType::TimeSeries(ts) => {
-                let new_ts = TimeSeriesData {
-                    samples: ts.samples.clone(),
-                    labels: ts.labels.clone(),
-                    retention: ts.retention,
-                    chunk_size: ts.chunk_size,
-                    duplicate_policy: ts.duplicate_policy,
-                    ignore_max_time_diff: ts.ignore_max_time_diff,
-                    ignore_max_val_diff: ts.ignore_max_val_diff,
-                    rules: ts.rules.clone(),
-                    total_samples: ts.total_samples,
-                    first_timestamp: ts.first_timestamp,
-                    last_timestamp: ts.last_timestamp,
-                };
-                DataType::TimeSeries(Box::new(new_ts))
-            }
+            DataType::TimeSeries(ts) => DataType::TimeSeries(ts.clone()),
             DataType::VectorSet(vs) => {
                 // Deep clone vector set
                 let new_vs = VectorSetData {

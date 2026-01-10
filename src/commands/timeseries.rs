@@ -69,10 +69,10 @@ fn cmd_ts_create(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 
     let key = args[0].clone();
     let mut retention = 0i64;
-    let mut chunk_size = 4096usize;
+    let mut _chunk_size = 4096usize;
     let mut duplicate_policy = DuplicatePolicy::Block;
-    let mut ignore_max_time_diff = 0i64;
-    let mut ignore_max_val_diff = 0.0f64;
+    let mut _ignore_max_time_diff = 0i64;
+    let mut _ignore_max_val_diff = 0.0f64;
     let mut labels = Vec::new();
 
     let mut i = 1;
@@ -94,7 +94,7 @@ fn cmd_ts_create(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             if i >= args.len() {
                 return Err(Error::Syntax);
             }
-            chunk_size = parse_int(&args[i])? as usize;
+            _chunk_size = parse_int(&args[i])? as usize;
         } else if eq_ignore_ascii_case(opt, b"DUPLICATE_POLICY") {
             i += 1;
             if i >= args.len() {
@@ -106,12 +106,12 @@ fn cmd_ts_create(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             if i >= args.len() {
                 return Err(Error::Syntax);
             }
-            ignore_max_time_diff = parse_int(&args[i])?;
+            _ignore_max_time_diff = parse_int(&args[i])?;
             i += 1;
             if i >= args.len() {
                 return Err(Error::Syntax);
             }
-            ignore_max_val_diff = parse_float(&args[i])?;
+            _ignore_max_val_diff = parse_float(&args[i])?;
         } else if eq_ignore_ascii_case(opt, b"LABELS") {
             i += 1;
             while i + 1 < args.len() {
@@ -127,15 +127,7 @@ fn cmd_ts_create(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         i += 1;
     }
 
-    store.ts_create(
-        key,
-        retention,
-        chunk_size,
-        duplicate_policy,
-        ignore_max_time_diff,
-        ignore_max_val_diff,
-        labels,
-    )?;
+    store.ts_create(key, retention, duplicate_policy, labels)?;
     Ok(RespValue::ok())
 }
 
@@ -254,7 +246,7 @@ fn cmd_ts_alter(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 
     let key = &args[0];
     let mut retention = None;
-    let mut chunk_size = None;
+    let mut _chunk_size = None;
     let mut duplicate_policy = None;
     let mut labels = None;
 
@@ -272,7 +264,7 @@ fn cmd_ts_alter(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             if i >= args.len() {
                 return Err(Error::Syntax);
             }
-            chunk_size = Some(parse_int(&args[i])? as usize);
+            _chunk_size = Some(parse_int(&args[i])? as usize);
         } else if eq_ignore_ascii_case(opt, b"DUPLICATE_POLICY") {
             i += 1;
             if i >= args.len() {
@@ -294,7 +286,7 @@ fn cmd_ts_alter(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         i += 1;
     }
 
-    store.ts_alter(key, retention, chunk_size, duplicate_policy, labels)?;
+    store.ts_alter(key, retention, duplicate_policy, labels)?;
     Ok(RespValue::ok())
 }
 
@@ -316,7 +308,7 @@ fn cmd_ts_info(store: &Store, args: &[Bytes]) -> Result<RespValue> {
                 RespValue::bulk_string("lastTimestamp"),
                 RespValue::integer(info.last_timestamp),
                 RespValue::bulk_string("retentionTime"),
-                RespValue::integer(info.retention),
+                RespValue::integer(info.retention_ms),
                 RespValue::bulk_string("chunkCount"),
                 RespValue::integer(info.chunk_count as i64),
                 RespValue::bulk_string("chunkSize"),

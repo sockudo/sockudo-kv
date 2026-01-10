@@ -25,8 +25,8 @@ pub enum DataType {
     HyperLogLog(HyperLogLogData),
     /// JSON - sonic-rs high-performance JSON value
     Json(Box<JsonValue>),
-    /// TimeSeries - time-ordered samples with labels
-    TimeSeries(Box<TimeSeriesData>),
+    /// TimeSeries - Ultra-high-performance compressed time-series (Gorilla + B+Tree)
+    TimeSeries(Box<super::timeseries::TimeSeries>),
     /// VectorSet - HNSW-based vector similarity search
     VectorSet(Box<VectorSetData>),
 }
@@ -169,7 +169,7 @@ impl DataType {
     }
 
     #[inline]
-    pub fn as_timeseries(&self) -> Option<&TimeSeriesData> {
+    pub fn as_timeseries(&self) -> Option<&super::timeseries::TimeSeries> {
         match self {
             DataType::TimeSeries(ts) => Some(ts),
             _ => None,
@@ -177,7 +177,7 @@ impl DataType {
     }
 
     #[inline]
-    pub fn as_timeseries_mut(&mut self) -> Option<&mut TimeSeriesData> {
+    pub fn as_timeseries_mut(&mut self) -> Option<&mut super::timeseries::TimeSeries> {
         match self {
             DataType::TimeSeries(ts) => Some(ts),
             _ => None,
@@ -611,102 +611,8 @@ pub struct Consumer {
     pub last_seen: i64,
 }
 
-/// HyperLogLog for cardinality estimation
-/// Uses 16384 registers (2^14) with 6 bits each
-#[derive(Debug)]
-pub struct HyperLogLogData {
-    pub registers: [u8; 16384],
-}
-
-impl Default for HyperLogLogData {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HyperLogLogData {
-    const P: usize = 14; // log2(16384)
-    const M: usize = 16384;
-    const ALPHA: f64 = 0.7213 / (1.0 + 1.079 / 16384.0);
-
-    pub fn new() -> Self {
-        Self {
-            registers: [0; 16384],
-        }
-    }
-
-    /// Add an element, returns true if cardinality estimate changed
-    pub fn add(&mut self, data: &[u8]) -> bool {
-        let hash = Self::hash(data);
-        let index = (hash >> (64 - Self::P)) as usize;
-        let remaining = (hash << Self::P) | (1 << (Self::P - 1));
-        let zeros = remaining.leading_zeros() as u8 + 1;
-
-        if zeros > self.registers[index] {
-            self.registers[index] = zeros;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Estimate cardinality
-    pub fn count(&self) -> u64 {
-        let mut sum = 0.0f64;
-        let mut zeros = 0usize;
-
-        for &reg in &self.registers {
-            sum += 2.0f64.powi(-(reg as i32));
-            if reg == 0 {
-                zeros += 1;
-            }
-        }
-
-        let estimate = Self::ALPHA * (Self::M as f64) * (Self::M as f64) / sum;
-
-        // Small range correction
-        if estimate <= 2.5 * Self::M as f64 && zeros > 0 {
-            return (Self::M as f64 * (Self::M as f64 / zeros as f64).ln()) as u64;
-        }
-
-        // Large range correction
-        let two_pow_32 = 2.0f64.powi(32);
-        if estimate > two_pow_32 / 30.0 {
-            return (-two_pow_32 * (1.0 - estimate / two_pow_32).ln()) as u64;
-        }
-
-        estimate as u64
-    }
-
-    /// Merge another HLL into this one
-    pub fn merge(&mut self, other: &HyperLogLogData) {
-        for i in 0..Self::M {
-            self.registers[i] = self.registers[i].max(other.registers[i]);
-        }
-    }
-
-    /// Simple hash function (MurmurHash3 finalizer)
-    fn hash(data: &[u8]) -> u64 {
-        let mut h: u64 = 0;
-        for chunk in data.chunks(8) {
-            let mut k: u64 = 0;
-            for (i, &b) in chunk.iter().enumerate() {
-                k |= (b as u64) << (i * 8);
-            }
-            k = k.wrapping_mul(0xc4ceb9fe1a85ec53);
-            k ^= k >> 33;
-            k = k.wrapping_mul(0xff51afd7ed558ccd);
-            k ^= k >> 33;
-            h ^= k;
-            h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
-        }
-        h ^= data.len() as u64;
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51afd7ed558ccd);
-        h ^= h >> 33;
-        h
-    }
-}
+/// HyperLogLog type alias - uses high-performance implementation
+pub type HyperLogLogData = super::hyperloglog::HyperLogLog;
 
 // ======================== TimeSeries Data Structures ========================
 
@@ -799,200 +705,6 @@ pub struct CompactionRule {
     pub aggregation: Aggregation,
     pub bucket_duration: i64,
     pub align_timestamp: i64,
-}
-
-/// TimeSeries data - time-ordered samples with labels
-#[derive(Debug)]
-pub struct TimeSeriesData {
-    /// Samples: timestamp (ms) -> value
-    /// BTreeMap provides O(log n) range queries
-    pub samples: BTreeMap<i64, f64>,
-    /// Labels for filtering
-    pub labels: std::collections::HashMap<String, String>,
-    /// Retention period in ms (0 = infinite)
-    pub retention: i64,
-    /// Chunk size (for compatibility, we use BTreeMap internally)
-    pub chunk_size: usize,
-    /// Duplicate policy
-    pub duplicate_policy: DuplicatePolicy,
-    /// Ignore max time diff for dedup
-    pub ignore_max_time_diff: i64,
-    /// Ignore max value diff for dedup
-    pub ignore_max_val_diff: f64,
-    /// Compaction rules
-    pub rules: Vec<CompactionRule>,
-    /// Total sample count (for quick INFO)
-    pub total_samples: u64,
-    /// First timestamp
-    pub first_timestamp: i64,
-    /// Last timestamp
-    pub last_timestamp: i64,
-}
-
-impl Default for TimeSeriesData {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TimeSeriesData {
-    pub fn new() -> Self {
-        Self {
-            samples: BTreeMap::new(),
-            labels: std::collections::HashMap::new(),
-            retention: 0,
-            chunk_size: 4096,
-            duplicate_policy: DuplicatePolicy::Block,
-            ignore_max_time_diff: 0,
-            ignore_max_val_diff: 0.0,
-            rules: Vec::new(),
-            total_samples: 0,
-            first_timestamp: 0,
-            last_timestamp: 0,
-        }
-    }
-
-    /// Add a sample, applying duplicate policy
-    #[inline]
-    pub fn add_sample(&mut self, timestamp: i64, value: f64) -> Result<(), &'static str> {
-        // Check duplicate
-        if let Some(&existing) = self.samples.get(&timestamp) {
-            match self.duplicate_policy {
-                DuplicatePolicy::Block => return Err("TSDB: duplicate sample"),
-                DuplicatePolicy::First => return Ok(()), // Keep existing
-                DuplicatePolicy::Last => {
-                    self.samples.insert(timestamp, value);
-                }
-                DuplicatePolicy::Min => {
-                    self.samples.insert(timestamp, existing.min(value));
-                }
-                DuplicatePolicy::Max => {
-                    self.samples.insert(timestamp, existing.max(value));
-                }
-                DuplicatePolicy::Sum => {
-                    self.samples.insert(timestamp, existing + value);
-                }
-            }
-        } else {
-            self.samples.insert(timestamp, value);
-            self.total_samples += 1;
-        }
-
-        // Update first/last
-        if self.first_timestamp == 0 || timestamp < self.first_timestamp {
-            self.first_timestamp = timestamp;
-        }
-        if timestamp > self.last_timestamp {
-            self.last_timestamp = timestamp;
-        }
-
-        // Apply retention
-        if self.retention > 0 {
-            let cutoff = timestamp - self.retention;
-            self.samples = self.samples.split_off(&cutoff);
-        }
-
-        Ok(())
-    }
-
-    /// Get latest sample
-    #[inline]
-    pub fn get_latest(&self) -> Option<(i64, f64)> {
-        self.samples.iter().next_back().map(|(&t, &v)| (t, v))
-    }
-
-    /// Get range of samples
-    #[inline]
-    pub fn range(&self, from: i64, to: i64) -> impl Iterator<Item = (&i64, &f64)> {
-        self.samples.range(from..=to)
-    }
-
-    /// Get range in reverse
-    #[inline]
-    pub fn rev_range(&self, from: i64, to: i64) -> impl DoubleEndedIterator<Item = (&i64, &f64)> {
-        self.samples.range(from..=to)
-    }
-
-    /// Delete samples in range
-    pub fn delete_range(&mut self, from: i64, to: i64) -> usize {
-        let keys: Vec<i64> = self.samples.range(from..=to).map(|(&k, _)| k).collect();
-        let count = keys.len();
-        for key in keys {
-            self.samples.remove(&key);
-        }
-        self.total_samples = self.total_samples.saturating_sub(count as u64);
-        count
-    }
-
-    /// Apply aggregation to a range
-    pub fn aggregate(
-        &self,
-        from: i64,
-        to: i64,
-        agg: Aggregation,
-        bucket_duration: i64,
-    ) -> Vec<(i64, f64)> {
-        if bucket_duration <= 0 {
-            return vec![];
-        }
-
-        let mut result = Vec::new();
-        let mut bucket_start = (from / bucket_duration) * bucket_duration;
-
-        while bucket_start <= to {
-            let bucket_end = bucket_start + bucket_duration - 1;
-            let samples: Vec<f64> = self
-                .samples
-                .range(bucket_start..=bucket_end.min(to))
-                .map(|(_, &v)| v)
-                .collect();
-
-            if !samples.is_empty() {
-                let value = match agg {
-                    Aggregation::Avg => samples.iter().sum::<f64>() / samples.len() as f64,
-                    Aggregation::First => samples[0],
-                    Aggregation::Last => *samples.last().unwrap(),
-                    Aggregation::Min => samples.iter().cloned().fold(f64::INFINITY, f64::min),
-                    Aggregation::Max => samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-                    Aggregation::Sum => samples.iter().sum(),
-                    Aggregation::Range => {
-                        let min = samples.iter().cloned().fold(f64::INFINITY, f64::min);
-                        let max = samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                        max - min
-                    }
-                    Aggregation::Count => samples.len() as f64,
-                    Aggregation::StdP | Aggregation::StdS => {
-                        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-                        let variance: f64 = samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-                            / if matches!(agg, Aggregation::StdP) {
-                                samples.len() as f64
-                            } else {
-                                (samples.len() - 1).max(1) as f64
-                            };
-                        variance.sqrt()
-                    }
-                    Aggregation::VarP | Aggregation::VarS => {
-                        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-                        samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-                            / if matches!(agg, Aggregation::VarP) {
-                                samples.len() as f64
-                            } else {
-                                (samples.len() - 1).max(1) as f64
-                            }
-                    }
-                    Aggregation::Twa => {
-                        // Time-weighted average - simplified
-                        samples.iter().sum::<f64>() / samples.len() as f64
-                    }
-                };
-                result.push((bucket_start, value));
-            }
-
-            bucket_start += bucket_duration;
-        }
-
-        result
-    }
 }
 
 /// Entry stored in the main database
@@ -1461,4 +1173,23 @@ impl VectorSetData {
 
         result
     }
+}
+
+/// Info structure for TS.INFO
+#[derive(Debug, Clone)]
+pub struct TimeSeriesInfo {
+    pub total_samples: u64,
+    pub memory_usage: usize,
+    pub first_timestamp: i64,
+    pub last_timestamp: i64,
+    pub retention_ms: i64,
+    pub chunk_count: usize,
+    pub chunk_size: usize,
+    pub duplicate_policy: DuplicatePolicy,
+    pub rules: Vec<CompactionRule>,
+    pub compression_ratio: f64,
+    pub labels: std::collections::HashMap<String, String>,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_hit_rate: f64,
 }

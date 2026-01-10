@@ -133,4 +133,93 @@ impl Store {
 
         Ok(())
     }
+
+    /// Get HyperLogLog registers (for PFDEBUG GETREG)
+    #[inline]
+    pub fn pf_get_registers(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self.data.get(key) {
+            Some(e) => {
+                if e.is_expired() {
+                    return Ok(None);
+                }
+                match e.data.as_hyperloglog() {
+                    Some(hll) => Ok(Some(hll.get_registers())),
+                    None => Err(Error::WrongType),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Check if HyperLogLog uses sparse encoding (for PFDEBUG)
+    #[inline]
+    pub fn pf_is_sparse(&self, key: &[u8]) -> Result<Option<bool>> {
+        match self.data.get(key) {
+            Some(e) => {
+                if e.is_expired() {
+                    return Ok(None);
+                }
+                match e.data.as_hyperloglog() {
+                    Some(hll) => Ok(Some(hll.is_sparse())),
+                    None => Err(Error::WrongType),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get HyperLogLog encoding name (for PFDEBUG ENCODING)
+    #[inline]
+    pub fn pf_encoding(&self, key: &[u8]) -> Result<Option<&'static str>> {
+        match self.data.get(key) {
+            Some(e) => {
+                if e.is_expired() {
+                    return Ok(None);
+                }
+                match e.data.as_hyperloglog() {
+                    Some(hll) => Ok(Some(hll.encoding_name())),
+                    None => Err(Error::WrongType),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Promote HyperLogLog to dense encoding (for PFDEBUG TODENSE)
+    #[inline]
+    pub fn pf_to_dense(&self, key: &[u8]) -> Result<Option<bool>> {
+        match self.data.get_mut(key) {
+            Some(mut e) => {
+                if e.is_expired() {
+                    return Ok(None);
+                }
+                match &mut e.data {
+                    DataType::HyperLogLog(hll) => {
+                        let was_sparse = hll.is_sparse();
+                        hll.promote_to_dense();
+                        Ok(Some(was_sparse))
+                    }
+                    _ => Err(Error::WrongType),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get sparse decode string (for PFDEBUG DECODE)
+    #[inline]
+    pub fn pf_decode_sparse(&self, key: &[u8]) -> Result<Option<Option<String>>> {
+        match self.data.get(key) {
+            Some(e) => {
+                if e.is_expired() {
+                    return Ok(None);
+                }
+                match e.data.as_hyperloglog() {
+                    Some(hll) => Ok(Some(hll.decode_sparse())),
+                    None => Err(Error::WrongType),
+                }
+            }
+            None => Ok(None),
+        }
+    }
 }

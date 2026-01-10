@@ -157,7 +157,8 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType) {
             // Store as string (Redis stores HLL as special string)
             rdb.push(RDB_TYPE_STRING);
             write_string(rdb, key);
-            write_string(rdb, &Bytes::copy_from_slice(&hll.registers));
+            let regs = hll.get_registers();
+            write_string(rdb, &Bytes::copy_from_slice(&regs));
         }
         DataType::Json(json) => {
             // Serialize JSON as string
