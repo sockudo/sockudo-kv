@@ -97,8 +97,8 @@ impl<K: Clone + Ord, V: Clone> LeafNode<K, V> {
 #[derive(Debug, Clone)]
 struct InnerNode<K> {
     keys: Vec<K>,
-    children: Vec<usize>, // Indices into node storage
-    tree_count: u32,      // Total items in subtree
+    children: Vec<usize>,       // Indices into node storage
+    subtree_counts: Vec<usize>, // Count of items in each child's subtree
 }
 
 impl<K: Clone + Ord> InnerNode<K> {
@@ -106,7 +106,7 @@ impl<K: Clone + Ord> InnerNode<K> {
         Self {
             keys: Vec::with_capacity(MAX_INNER_KEYS),
             children: Vec::with_capacity(MAX_INNER_KEYS + 1),
-            tree_count: 0,
+            subtree_counts: Vec::with_capacity(MAX_INNER_KEYS + 1),
         }
     }
 
@@ -133,14 +133,16 @@ impl<K: Clone + Ord> InnerNode<K> {
         }
     }
 
-    fn insert(&mut self, pos: usize, key: K, right_child: usize) {
+    fn insert(&mut self, pos: usize, key: K, right_child: usize, right_count: usize) {
         self.keys.insert(pos, key);
         self.children.insert(pos + 1, right_child);
+        self.subtree_counts.insert(pos + 1, right_count);
     }
 
     fn remove(&mut self, pos: usize) -> K {
         let key = self.keys.remove(pos);
         self.children.remove(pos + 1);
+        self.subtree_counts.remove(pos + 1);
         key
     }
 
@@ -152,6 +154,7 @@ impl<K: Clone + Ord> InnerNode<K> {
         let mut right = Self::new();
         right.keys = self.keys.split_off(mid + 1);
         right.children = self.children.split_off(mid + 1);
+        right.subtree_counts = self.subtree_counts.split_off(mid + 1);
 
         // Remove the median from left
         self.keys.pop();
@@ -186,10 +189,10 @@ impl<K: Clone + Ord, V: Clone> Node<K, V> {
         }
     }
 
-    fn tree_count(&self) -> u32 {
+    fn tree_count(&self) -> usize {
         match self {
-            Node::Leaf(leaf) => leaf.len() as u32,
-            Node::Inner(inner) => inner.tree_count,
+            Node::Leaf(leaf) => leaf.len(),
+            Node::Inner(inner) => inner.subtree_counts.iter().sum(),
         }
     }
 }
@@ -259,6 +262,7 @@ impl BPTreePath {
 // ============================================================================
 
 /// A high-performance B+Tree map
+#[derive(Debug)]
 pub struct BPTree<K: Clone + Ord, V: Clone> {
     /// All nodes stored in a Vec for cache-friendly access
     nodes: Vec<Node<K, V>>,
@@ -427,9 +431,10 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
 
         let (node_idx, pos) = path.last().unwrap();
         if let Node::Leaf(leaf) = &self.nodes[node_idx]
-            && pos < leaf.len() {
-                return Some((leaf.keys[pos].clone(), leaf.values[pos].clone()));
-            }
+            && pos < leaf.len()
+        {
+            return Some((leaf.keys[pos].clone(), leaf.values[pos].clone()));
+        }
         None
     }
 
@@ -439,6 +444,66 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         self.root = None;
         self.count = 0;
         self.free_list.clear();
+    }
+
+    /// Get rank of a key (0-indexed)
+    pub fn rank(&self, key: &K) -> Option<usize> {
+        let root_idx = self.root?;
+
+        let mut node_idx = root_idx;
+        let mut rank = 0;
+
+        loop {
+            match &self.nodes[node_idx] {
+                Node::Leaf(leaf) => {
+                    let (pos, found) = leaf.search(key);
+                    return if found { Some(rank + pos) } else { None };
+                }
+                Node::Inner(inner) => {
+                    let (pos, found) = inner.search(key);
+                    let child_idx = if found { pos + 1 } else { pos };
+
+                    // Add counts of all left siblings
+                    for i in 0..child_idx {
+                        rank += inner.subtree_counts[i];
+                    }
+
+                    node_idx = inner.children[child_idx];
+                }
+            }
+        }
+    }
+
+    /// Get entry by rank (0-indexed)
+    pub fn select(&self, mut rank: usize) -> Option<(K, V)> {
+        let root_idx = self.root?;
+
+        if rank >= self.count {
+            return None;
+        }
+
+        let mut node_idx = root_idx;
+
+        loop {
+            match &self.nodes[node_idx] {
+                Node::Leaf(leaf) => {
+                    if rank < leaf.len() {
+                        return Some((leaf.keys[rank].clone(), leaf.values[rank].clone()));
+                    } else {
+                        return None; // Should not happen if self.count is correct
+                    }
+                }
+                Node::Inner(inner) => {
+                    for (i, &count) in inner.subtree_counts.iter().enumerate() {
+                        if rank < count {
+                            node_idx = inner.children[i];
+                            break;
+                        }
+                        rank -= count;
+                    }
+                }
+            }
+        }
     }
 
     // ==================== Internal Methods ====================
@@ -521,10 +586,18 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
             if !is_full {
                 let right_count = self.nodes[right_idx].tree_count();
 
+                // Get left child count (it changed due to split)
+                let left_idx = if let Node::Inner(inner) = &self.nodes[parent_idx] {
+                    inner.children[pos]
+                } else {
+                    unreachable!()
+                };
+                let left_count = self.nodes[left_idx].tree_count();
+
                 // Simple insert into parent
                 if let Node::Inner(inner) = &mut self.nodes[parent_idx] {
-                    inner.insert(pos, median, right_idx);
-                    inner.tree_count += right_count + 1;
+                    inner.insert(pos, median, right_idx, right_count);
+                    inner.subtree_counts[pos] = left_count;
                 }
                 return;
             }
@@ -533,8 +606,7 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
             let right_count = self.nodes[right_idx].tree_count();
             let (new_right_inner, new_median) =
                 if let Node::Inner(inner) = &mut self.nodes[parent_idx] {
-                    inner.insert(pos, median, right_idx);
-                    inner.tree_count += right_count + 1;
+                    inner.insert(pos, median, right_idx, right_count);
                     inner.split()
                 } else {
                     unreachable!()
@@ -550,42 +622,51 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         }
 
         // Need a new root
-        let mut new_root = InnerNode::new();
+        let mut new_root = InnerNode::<K>::new();
         new_root.keys.push(median);
         new_root.children.push(self.root.unwrap());
         new_root.children.push(right_idx);
 
+        // Root counts
         let left_count = self.nodes[self.root.unwrap()].tree_count();
         let right_count = self.nodes[right_idx].tree_count();
-        new_root.tree_count = left_count + right_count + 1;
+        new_root.subtree_counts.push(left_count);
+        new_root.subtree_counts.push(right_count);
 
         let new_root_idx = self.alloc_node(Node::Inner(new_root));
         self.root = Some(new_root_idx);
     }
 
-    /// Recalculate tree count for an inner node
+    /// Recalculate subtree counts for an inner node
     fn recalc_tree_count(&mut self, node_idx: usize) {
-        let (children, mut count) = if let Node::Inner(inner) = &self.nodes[node_idx] {
-            (inner.children.clone(), inner.keys.len() as u32)
+        let children = if let Node::Inner(inner) = &self.nodes[node_idx] {
+            inner.children.clone()
         } else {
             return;
         };
 
-        for child_idx in children {
-            count += self.nodes[child_idx].tree_count();
+        let mut counts = Vec::with_capacity(children.len());
+        for &child_idx in &children {
+            counts.push(self.nodes[child_idx].tree_count());
         }
 
         if let Node::Inner(inner) = &mut self.nodes[node_idx] {
-            inner.tree_count = count;
+            inner.subtree_counts = counts;
         }
     }
 
     /// Update tree counts along path
     fn update_tree_counts(&mut self, path: &BPTreePath, delta: i32) {
+        // Iterate path, find which child index we descended from, update that count
         for i in 0..path.depth.saturating_sub(1) {
             let node_idx = path.nodes[i];
-            if let Node::Inner(inner) = &mut self.nodes[node_idx] {
-                inner.tree_count = (inner.tree_count as i32 + delta) as u32;
+            let child_pos = path.positions[i]; // Position in parent (should be index in children/subtree_counts)
+
+            if let Node::Inner(inner) = &mut self.nodes[node_idx]
+                && child_pos < inner.subtree_counts.len()
+            {
+                let new_count = (inner.subtree_counts[child_pos] as i32 + delta) as usize;
+                inner.subtree_counts[child_pos] = new_count;
             }
         }
     }
@@ -690,6 +771,46 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
 
             if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
                 parent.keys[separator_pos] = new_separator;
+                // Update subtree counts
+                parent.subtree_counts[child_pos - 1] -= 1;
+                parent.subtree_counts[child_pos] += 1;
+            }
+        } else {
+            // Borrow from left inner node
+            let (key, child, count) = if let Node::Inner(left) = &mut self.nodes[left_idx] {
+                let k = left.keys.pop().unwrap();
+                let c = left.children.pop().unwrap();
+                let cnt = left.subtree_counts.pop().unwrap();
+                (k, c, cnt)
+            } else {
+                unreachable!()
+            };
+
+            // Separator from parent
+            let separator = if let Node::Inner(parent) = &self.nodes[parent_idx] {
+                parent.keys[separator_pos].clone()
+            } else {
+                unreachable!()
+            };
+
+            if let Node::Inner(node) = &mut self.nodes[node_idx] {
+                node.keys.insert(0, separator);
+                node.children.insert(0, child);
+                node.subtree_counts.insert(0, count);
+            }
+
+            if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
+                parent.keys[separator_pos] = key;
+                // Update subtree counts: `left` lost `count`, `node` gained `count`
+                // But wait, the key also moved? Inner keys don't count towards size?
+                // In B+Tree, only leaves contain data. Inner keys are separators.
+                // So total size of subtree depends on sum of children counts.
+                // `left` lost `child` (size `count`). `node` gained `child` (size `count`).
+                // So we just subtract `count` from left and add `count` to node in parent logic.
+                let left_cnt = &mut parent.subtree_counts[child_pos - 1];
+                *left_cnt -= count;
+                let node_cnt = &mut parent.subtree_counts[child_pos];
+                *node_cnt += count;
             }
         }
     }
@@ -730,6 +851,41 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
 
             if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
                 parent.keys[separator_pos] = new_separator;
+                // Update subtree counts
+                parent.subtree_counts[child_pos + 1] -= 1;
+                parent.subtree_counts[child_pos] += 1;
+            }
+        } else {
+            // Borrow from right inner node
+            let (key, child, count) = if let Node::Inner(right) = &mut self.nodes[right_idx] {
+                let k = right.keys.remove(0);
+                let c = right.children.remove(0);
+                let cnt = right.subtree_counts.remove(0);
+                (k, c, cnt)
+            } else {
+                unreachable!()
+            };
+
+            // Separator from parent
+            let separator = if let Node::Inner(parent) = &self.nodes[parent_idx] {
+                parent.keys[separator_pos].clone()
+            } else {
+                unreachable!()
+            };
+
+            if let Node::Inner(node) = &mut self.nodes[node_idx] {
+                node.keys.push(separator);
+                node.children.push(child);
+                node.subtree_counts.push(count);
+            }
+
+            if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
+                parent.keys[separator_pos] = key;
+                // Update subtree counts: `right` lost `count`, `node` gained `count`
+                let right_cnt = &mut parent.subtree_counts[child_pos + 1];
+                *right_cnt -= count;
+                let node_cnt = &mut parent.subtree_counts[child_pos];
+                *node_cnt += count;
             }
         }
     }
@@ -773,8 +929,12 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
             self.free_node(node_idx);
         } else {
             // Inner node merge
-            let (keys, children) = if let Node::Inner(node) = &self.nodes[node_idx] {
-                (node.keys.clone(), node.children.clone())
+            let (keys, children, counts) = if let Node::Inner(node) = &self.nodes[node_idx] {
+                (
+                    node.keys.clone(),
+                    node.children.clone(),
+                    node.subtree_counts.clone(),
+                )
             } else {
                 return;
             };
@@ -783,6 +943,7 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
                 left.keys.push(separator);
                 left.keys.extend(keys);
                 left.children.extend(children);
+                left.subtree_counts.extend(counts);
             }
 
             self.recalc_tree_count(left_idx);
@@ -790,8 +951,11 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         }
 
         // Update parent tree count
+        // Update parent's count for the merged child (left_idx)
+        let new_child_count = self.nodes[left_idx].tree_count();
         if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
-            parent.tree_count = parent.tree_count.saturating_sub(1);
+            // The merged node is at child_pos - 1
+            parent.subtree_counts[child_pos - 1] = new_child_count;
         }
     }
 
@@ -831,8 +995,12 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
             self.free_node(right_idx);
         } else {
             // Inner node merge
-            let (keys, children) = if let Node::Inner(right) = &self.nodes[right_idx] {
-                (right.keys.clone(), right.children.clone())
+            let (keys, children, counts) = if let Node::Inner(right) = &self.nodes[right_idx] {
+                (
+                    right.keys.clone(),
+                    right.children.clone(),
+                    right.subtree_counts.clone(),
+                )
             } else {
                 return;
             };
@@ -841,6 +1009,7 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
                 node.keys.push(separator);
                 node.keys.extend(keys);
                 node.children.extend(children);
+                node.subtree_counts.extend(counts);
             }
 
             self.recalc_tree_count(node_idx);
@@ -848,8 +1017,11 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         }
 
         // Update parent tree count
+        // Update parent's count for the merged child (node_idx)
+        let new_child_count = self.nodes[node_idx].tree_count();
         if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
-            parent.tree_count = parent.tree_count.saturating_sub(1);
+            // The merged node is at child_pos
+            parent.subtree_counts[child_pos] = new_child_count;
         }
     }
 
@@ -879,13 +1051,14 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
 
                     let (parent_idx, parent_pos) = path.last().unwrap();
                     if let Node::Inner(parent) = &self.nodes[parent_idx]
-                        && parent_pos < parent.children.len() - 1 {
-                            // Descend to leftmost leaf of next child
-                            path.set_last_pos(parent_pos + 1);
-                            let next_child = parent.children[parent_pos + 1];
-                            self.descend_left(path, next_child);
-                            return true;
-                        }
+                        && parent_pos < parent.children.len() - 1
+                    {
+                        // Descend to leftmost leaf of next child
+                        path.set_last_pos(parent_pos + 1);
+                        let next_child = parent.children[parent_pos + 1];
+                        self.descend_left(path, next_child);
+                        return true;
+                    }
                 }
             }
             Node::Inner(_) => false,
@@ -907,6 +1080,84 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
             }
         }
     }
+
+    /// Descend to rightmost leaf from a node
+    fn descend_right(&self, path: &mut BPTreePath, mut node_idx: usize) {
+        loop {
+            match &self.nodes[node_idx] {
+                Node::Leaf(_) => {
+                    let len = self.nodes[node_idx].len();
+                    let pos = if len > 0 { len - 1 } else { 0 };
+                    path.push(node_idx, pos);
+                    return;
+                }
+                Node::Inner(inner) => {
+                    let child_pos = inner.children.len() - 1;
+                    path.push(node_idx, child_pos);
+                    node_idx = inner.children[child_pos];
+                }
+            }
+        }
+    }
+
+    /// Advance path to previous entry
+    fn path_prev(&self, path: &mut BPTreePath) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+
+        let (node_idx, pos) = path.last().unwrap();
+
+        // Try to move left in current node
+        if pos > 0 {
+            path.set_last_pos(pos - 1);
+
+            if let Node::Leaf(_) = &self.nodes[node_idx] {
+                return true;
+            }
+            // Logic for inner node descent below
+        } else {
+            // Need to go up
+            loop {
+                path.pop();
+                if path.is_empty() {
+                    return false;
+                }
+                let (_, parent_pos) = path.last().unwrap();
+                if parent_pos > 0 {
+                    break;
+                }
+            }
+            // Now at parent where pos > 0. Decrement pos.
+            let (_, parent_pos) = path.last().unwrap();
+            path.set_last_pos(parent_pos - 1);
+        }
+
+        // Now we are at an inner node (or just moved in one).
+        // We need to descend to the rightmost leaf of the child we just moved to.
+        loop {
+            let (node_idx, pos) = path.last().unwrap();
+            match &self.nodes[node_idx] {
+                Node::Leaf(_) => return true,
+                Node::Inner(inner) => {
+                    let child_idx = inner.children[pos];
+                    // Descend to rightmost child of this child
+                    let child_node = &self.nodes[child_idx];
+                    match child_node {
+                        Node::Leaf(l) => {
+                            let p = if l.len() > 0 { l.len() - 1 } else { 0 };
+                            path.push(child_idx, p);
+                            return true;
+                        }
+                        Node::Inner(i) => {
+                            let p = i.children.len() - 1;
+                            path.push(child_idx, p);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -916,24 +1167,28 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
 /// Iterator over all entries
 pub struct Iter<'a, K: Clone + Ord, V: Clone> {
     tree: &'a BPTree<K, V>,
-    path: BPTreePath,
-    started: bool,
-    finished: bool,
+    start_path: BPTreePath,
+    end_path: BPTreePath,
+    yielded_count: usize,
+    total_count: usize,
 }
 
 impl<'a, K: Clone + Ord, V: Clone> Iter<'a, K, V> {
     fn new(tree: &'a BPTree<K, V>) -> Self {
-        let mut path = BPTreePath::new();
+        let mut start_path = BPTreePath::new();
+        let mut end_path = BPTreePath::new();
 
         if let Some(root_idx) = tree.root {
-            tree.descend_left(&mut path, root_idx);
+            tree.descend_left(&mut start_path, root_idx);
+            tree.descend_right(&mut end_path, root_idx);
         }
 
         Self {
             tree,
-            path,
-            started: false,
-            finished: tree.is_empty(),
+            start_path,
+            end_path,
+            yielded_count: 0,
+            total_count: tree.len(),
         }
     }
 }
@@ -942,27 +1197,55 @@ impl<'a, K: Clone + Ord, V: Clone> Iterator for Iter<'a, K, V> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
+        if self.yielded_count >= self.total_count {
             return None;
         }
 
-        if self.started {
-            if !self.tree.path_next(&mut self.path) {
-                self.finished = true;
-                return None;
-            }
+        let (node_idx, pos) = self.start_path.last()?;
+        let result = if let Node::Leaf(leaf) = &self.tree.nodes[node_idx]
+            && pos < leaf.len()
+        {
+            Some((leaf.keys[pos].clone(), leaf.values[pos].clone()))
         } else {
-            self.started = true;
+            None
+        };
+
+        if result.is_some() {
+            self.yielded_count += 1;
+            // Advance start path
+            if self.yielded_count < self.total_count {
+                self.tree.path_next(&mut self.start_path);
+            }
         }
 
-        let (node_idx, pos) = self.path.last()?;
-        if let Node::Leaf(leaf) = &self.tree.nodes[node_idx]
-            && pos < leaf.len() {
-                return Some((leaf.keys[pos].clone(), leaf.values[pos].clone()));
-            }
+        result
+    }
+}
 
-        self.finished = true;
-        None
+impl<'a, K: Clone + Ord, V: Clone> DoubleEndedIterator for Iter<'a, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.yielded_count >= self.total_count {
+            return None;
+        }
+
+        let (node_idx, pos) = self.end_path.last()?;
+        let result = if let Node::Leaf(leaf) = &self.tree.nodes[node_idx]
+            && pos < leaf.len()
+        {
+            Some((leaf.keys[pos].clone(), leaf.values[pos].clone()))
+        } else {
+            None
+        };
+
+        if result.is_some() {
+            self.yielded_count += 1;
+            // Retreat end path
+            if self.yielded_count < self.total_count {
+                self.tree.path_prev(&mut self.end_path);
+            }
+        }
+
+        result
     }
 }
 
@@ -1011,14 +1294,15 @@ impl<'a, K: Clone + Ord, V: Clone> Iterator for RangeIter<'a, K, V> {
 
         let (node_idx, pos) = self.path.last()?;
         if let Node::Leaf(leaf) = &self.tree.nodes[node_idx]
-            && pos < leaf.len() {
-                let key = &leaf.keys[pos];
-                if key > &self.to {
-                    self.finished = true;
-                    return None;
-                }
-                return Some((key.clone(), leaf.values[pos].clone()));
+            && pos < leaf.len()
+        {
+            let key = &leaf.keys[pos];
+            if key > &self.to {
+                self.finished = true;
+                return None;
             }
+            return Some((key.clone(), leaf.values[pos].clone()));
+        }
 
         self.finished = true;
         None
@@ -1080,6 +1364,38 @@ mod tests {
         for i in 0..1000 {
             assert_eq!(tree.get(&i), Some(i * 10));
         }
+    }
+
+    #[test]
+    fn test_rank_and_select() {
+        let mut tree: BPTree<i64, i64> = BPTree::new();
+        let count = 100;
+
+        for i in 0..count {
+            tree.insert(i * 2, i * 20); // 0, 2, 4, ...
+        }
+
+        assert_eq!(tree.len(), count as usize);
+
+        for i in 0..count {
+            // Rank of i*2 should be i
+            assert_eq!(
+                tree.rank(&(i * 2)),
+                Some(i as usize),
+                "Rank of key {}",
+                i * 2
+            );
+            // Select of rank i should be key i*2
+            let (k, v) = tree.select(i as usize).unwrap();
+            assert_eq!(k, i * 2);
+            assert_eq!(v, i * 20);
+        }
+
+        // Rank of non-existent key
+        assert_eq!(tree.rank(&1), None);
+
+        // Select out of bounds
+        assert_eq!(tree.select(count as usize), None);
     }
 
     #[test]

@@ -145,7 +145,7 @@ impl Store {
                             .iter()
                             .skip(start)
                             .take(stop - start)
-                            .map(|(score, member)| {
+                            .map(|((score, member), _)| {
                                 let score_opt = if with_scores { Some(score.0) } else { None };
                                 (member.clone(), score_opt)
                             })
@@ -248,7 +248,7 @@ impl Store {
                     Some(zset) => zset
                         .by_score
                         .iter()
-                        .filter(|(score, _)| score.0 >= min && score.0 <= max)
+                        .filter(|((score, _), _)| score.0 >= min && score.0 <= max)
                         .count(),
                     None => 0,
                 }
@@ -311,7 +311,7 @@ impl Store {
                             .rev()
                             .skip(start)
                             .take(stop - start)
-                            .map(|(score, member)| {
+                            .map(|((score, member), _)| {
                                 let score_opt = if with_scores { Some(score.0) } else { None };
                                 (member.clone(), score_opt)
                             })
@@ -345,7 +345,7 @@ impl Store {
                         let iter = zset
                             .by_score
                             .iter()
-                            .filter(|(score, _)| score.0 >= min && score.0 <= max)
+                            .filter(|((score, _), _)| score.0 >= min && score.0 <= max)
                             .skip(offset);
 
                         let iter: Box<dyn Iterator<Item = _>> = if count > 0 {
@@ -354,7 +354,7 @@ impl Store {
                             Box::new(iter)
                         };
 
-                        iter.map(|(score, member)| {
+                        iter.map(|((score, member), _)| {
                             let score_opt = if with_scores { Some(score.0) } else { None };
                             (member.clone(), score_opt)
                         })
@@ -389,7 +389,7 @@ impl Store {
                             .by_score
                             .iter()
                             .rev()
-                            .filter(|(score, _)| score.0 >= min && score.0 <= max)
+                            .filter(|((score, _), _)| score.0 >= min && score.0 <= max)
                             .skip(offset);
 
                         let iter: Box<dyn Iterator<Item = _>> = if count > 0 {
@@ -398,7 +398,7 @@ impl Store {
                             Box::new(iter)
                         };
 
-                        iter.map(|(score, member)| {
+                        iter.map(|((score, member), _)| {
                             let score_opt = if with_scores { Some(score.0) } else { None };
                             (member.clone(), score_opt)
                         })
@@ -434,7 +434,14 @@ impl Store {
             let mut result = Vec::with_capacity(count.min(zset.len()));
 
             for _ in 0..count {
-                if let Some((score, member)) = zset.by_score.iter().next().cloned() {
+                if let Some(((score, member), _)) = zset.by_score.iter().next() {
+                    // Need to clone member cause it's borrowed... wait, it is returned owned!
+                    // But zset.remove takes &Bytes.
+                    // And we need to return member.
+                    // So we take ownership. Remove from zset needs reference.
+                    // But we are removing it, so subsequent remove needs clone?
+                    // No, `remove` takes `&Bytes`. We have `Bytes`. `&member`.
+                    // But we put `member` in result.
                     zset.remove(&member);
                     result.push((member, score.0));
                 } else {
@@ -479,7 +486,7 @@ impl Store {
             let mut result = Vec::with_capacity(count.min(zset.len()));
 
             for _ in 0..count {
-                if let Some((score, member)) = zset.by_score.iter().next_back().cloned() {
+                if let Some(((score, member), _)) = zset.by_score.iter().next_back() {
                     zset.remove(&member);
                     result.push((member, score.0));
                 } else {
@@ -814,7 +821,7 @@ impl Store {
                         let to_remove: Vec<Bytes> = ss
                             .by_score
                             .iter()
-                            .map(|(_, member)| member.clone())
+                            .map(|((_, member), _)| member.clone())
                             .skip(start)
                             .take(stop.saturating_sub(start))
                             .collect();
@@ -1043,4 +1050,61 @@ fn glob_match(pattern: &[u8], member: &[u8]) -> bool {
 /// Normalize negative indices for sorted set operations
 fn normalize_index(idx: i64, len: i64) -> i64 {
     if idx < 0 { len + idx } else { idx }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sorted_set_core() {
+        let store = Store::new();
+        let key = Bytes::from("myzset");
+
+        // ZADD
+        store.zadd(key.clone(), vec![
+            (10.0, Bytes::from("a")),
+            (20.0, Bytes::from("b")),
+            (30.0, Bytes::from("c")),
+        ]).unwrap();
+
+        assert_eq!(store.zcard(&key), 3);
+        assert_eq!(store.zscore(&key, b"a"), Some(10.0));
+        assert_eq!(store.zscore(&key, b"b"), Some(20.0));
+
+        // ZRANK
+        assert_eq!(store.zrank(&key, b"a"), Some(0));
+        assert_eq!(store.zrank(&key, b"b"), Some(1));
+        assert_eq!(store.zrank(&key, b"c"), Some(2));
+        assert_eq!(store.zrank(&key, b"d"), None);
+
+        // ZREVRANK
+        assert_eq!(store.zrevrank(&key, b"a"), Some(2));
+        assert_eq!(store.zrevrank(&key, b"b"), Some(1));
+        assert_eq!(store.zrevrank(&key, b"c"), Some(0));
+
+        // ZRANGE
+        let range = store.zrange(&key, 0, -1, false);
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0].0, "a");
+        assert_eq!(range[1].0, "b");
+        assert_eq!(range[2].0, "c");
+
+        // ZREVRANGE
+        let range = store.zrevrange(&key, 0, -1, false);
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0].0, "c");
+        assert_eq!(range[1].0, "b");
+        assert_eq!(range[2].0, "a");
+        
+        // ZREM
+        store.zrem(&key, &[Bytes::from("b")]);
+        assert_eq!(store.zcard(&key), 2);
+        assert_eq!(store.zrank(&key, b"c"), Some(1)); // Shifted down
+        
+        // ZPOPMAX
+        let popped = store.zpopmax(&key, 1);
+        assert_eq!(popped.len(), 1);
+        assert_eq!(popped[0].0, "c");
+    }
 }

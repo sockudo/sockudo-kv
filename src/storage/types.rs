@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use sonic_rs::Value as JsonValue;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use super::value::now_ms;
@@ -207,7 +207,7 @@ pub struct SortedSetData {
     /// member -> score mapping for O(1) score lookup
     pub scores: std::collections::HashMap<Bytes, f64>,
     /// (score, member) for ordered iteration - BTreeSet for O(log n) range queries
-    pub by_score: BTreeSet<(OrderedFloat, Bytes)>,
+    pub by_score: super::BPTree<(OrderedFloat, Bytes), ()>,
 }
 
 impl SortedSetData {
@@ -222,13 +222,14 @@ impl SortedSetData {
             // Update existing
             self.by_score
                 .remove(&(OrderedFloat(old_score), member.clone()));
-            self.by_score.insert((OrderedFloat(score), member.clone()));
+            self.by_score
+                .insert((OrderedFloat(score), member.clone()), ());
             self.scores.insert(member, score);
             false
         } else {
             // New member
             self.scores.insert(member.clone(), score);
-            self.by_score.insert((OrderedFloat(score), member));
+            self.by_score.insert((OrderedFloat(score), member), ());
             true
         }
     }
@@ -264,7 +265,7 @@ impl SortedSetData {
         let score = self.scores.get(member)?;
         let member_bytes = Bytes::copy_from_slice(member);
         let target = (OrderedFloat(*score), member_bytes);
-        Some(self.by_score.iter().take_while(|e| *e < &target).count())
+        self.by_score.rank(&target)
     }
 
     /// Get reverse rank (0-indexed position by score descending)
