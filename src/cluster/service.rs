@@ -21,23 +21,62 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
+use tokio_rustls::rustls::ClientConfig;
+use tokio_rustls::{
+    TlsAcceptor, TlsConnector, client::TlsStream as ClientTlsStream,
+    server::TlsStream as ServerTlsStream,
+};
+
 use crate::cluster::message::{
     CLUSTERMSG_TYPE_MEET, CLUSTERMSG_TYPE_PING, CLUSTERMSG_TYPE_PONG, ClusterMsg,
 };
 use crate::cluster_state::{ClusterLink, LinkDirection};
 use crate::server_state::ServerState;
 
+/// Stream type for cluster connection
+enum ClusterStream {
+    Tcp(TcpStream),
+    ServerTls(ServerTlsStream<TcpStream>),
+    ClientTls(ClientTlsStream<TcpStream>),
+}
+
+impl ClusterStream {
+    async fn read_buf(&mut self, buf: &mut BytesMut) -> std::io::Result<usize> {
+        match self {
+            ClusterStream::Tcp(s) => s.read_buf(buf).await,
+            ClusterStream::ServerTls(s) => s.read_buf(buf).await,
+            ClusterStream::ClientTls(s) => s.read_buf(buf).await,
+        }
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            ClusterStream::Tcp(s) => s.write_all(buf).await,
+            ClusterStream::ServerTls(s) => s.write_all(buf).await,
+            ClusterStream::ClientTls(s) => s.write_all(buf).await,
+        }
+    }
+}
+
 /// Cluster Service
 pub struct ClusterService {
     server: Arc<ServerState>,
     shutdown: Arc<Notify>,
+    tls_acceptor: Option<TlsAcceptor>,
+    tls_client_config: Option<Arc<ClientConfig>>,
 }
 
 impl ClusterService {
-    pub fn new(server: Arc<ServerState>) -> Self {
+    pub fn new(
+        server: Arc<ServerState>,
+        tls_acceptor: Option<TlsAcceptor>,
+        tls_client_config: Option<Arc<ClientConfig>>,
+    ) -> Self {
         Self {
             server,
             shutdown: Arc::new(Notify::new()),
+            tls_acceptor,
+            tls_client_config,
         }
     }
 
@@ -45,6 +84,8 @@ impl ClusterService {
     pub async fn start(self: Arc<Self>) {
         let (enabled, port) = {
             let config = self.server.config.read();
+            // Check implicit TLS cluster requirement?
+            // Usually if tls-cluster yes, we expect configs.
             (config.cluster_enabled, config.port)
         };
 
@@ -99,12 +140,25 @@ impl ClusterService {
     }
 
     /// Handle incoming cluster bus connection
-    async fn handle_connection(&self, mut stream: TcpStream, addr: SocketAddr) {
+    async fn handle_connection(&self, stream: TcpStream, addr: SocketAddr) {
+        let mut stream = if let Some(acceptor) = &self.tls_acceptor {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => ClusterStream::ServerTls(tls_stream),
+                Err(e) => {
+                    warn!("Cluster TLS handshake failed from {}: {}", addr, e);
+                    return;
+                }
+            }
+        } else {
+            ClusterStream::Tcp(stream)
+        };
+
         // Pre-allocate buffer
         let mut buf = BytesMut::with_capacity(4096);
         let peer_ip = addr.ip().to_string();
 
-        // Track link
+        // Track link (use a distinct ID for temporary connection until identified?)
+        // Actually, we identify by IP:Port usually.
         let link_id = Bytes::from(format!("{}:{}", peer_ip, addr.port()));
         self.server.cluster.links.insert(
             link_id.clone(),
@@ -146,7 +200,7 @@ impl ClusterService {
         self.server.cluster.links.remove(&link_id);
     }
 
-    async fn process_packet(&self, buf: &mut BytesMut, stream: &mut TcpStream, peer_ip: &str) {
+    async fn process_packet(&self, buf: &mut BytesMut, stream: &mut ClusterStream, peer_ip: &str) {
         if buf.len() < 2128 {
             // Minimum: header + slots bitmap
             return;
@@ -332,68 +386,95 @@ impl ClusterService {
     ) {
         let addr = format!("{}:{}", target.ip, target.cport);
 
-        match TcpStream::connect(&addr).await {
-            Ok(mut stream) => {
-                // Build and send PING
-                ping_buf.clear();
-                let ping = self.build_ping();
-                ping.serialize(ping_buf);
-
-                if let Err(e) = stream.write_all(ping_buf).await {
-                    warn!("Failed to send PING to {}: {}", addr, e);
-                    return;
-                }
-
-                self.server
-                    .cluster
-                    .messages_sent
-                    .fetch_add(1, Ordering::Relaxed);
-
-                // Track outgoing link
-                let link_id = Bytes::from(format!("out:{}", addr));
-                self.server.cluster.links.insert(
-                    link_id.clone(),
-                    ClusterLink {
-                        direction: LinkDirection::To,
-                        node_id: target.id.clone(),
-                        create_time: crate::storage::now_ms() as u64,
-                        events: "w".to_string(),
-                        send_buffer_allocated: ping_buf.capacity() as u64,
-                        send_buffer_used: ping_buf.len() as u64,
-                    },
-                );
-
-                // Wait for PONG with timeout
-                resp_buf.clear();
-                match tokio::time::timeout(Duration::from_millis(500), stream.read_buf(resp_buf))
-                    .await
-                {
-                    Ok(Ok(n)) if n > 0 => {
-                        // Process PONG
-                        let peer_ip = target.ip.clone();
-                        self.process_packet(resp_buf, &mut stream, &peer_ip).await;
-                    }
-                    Ok(Ok(_)) => {
-                        // EOF
-                        debug!("Connection closed by {}", addr);
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Read error from {}: {}", addr, e);
-                    }
-                    Err(_) => {
-                        debug!("Timeout waiting for PONG from {}", addr);
-                    }
-                }
-
-                // Remove link
-                self.server.cluster.links.remove(&link_id);
-            }
+        let tcp_stream = match TcpStream::connect(&addr).await {
+            Ok(s) => s,
             Err(e) => {
                 debug!("Failed to connect to {}: {}", addr, e);
                 // Mark node as potentially failing
                 target.link_state.store(0, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        let mut stream = if let Some(config) = &self.tls_client_config {
+            let connector = TlsConnector::from(config.clone());
+            let domain = match rustls::pki_types::ServerName::try_from(target.ip.as_str()) {
+                Ok(n) => n.to_owned(),
+                Err(_) => {
+                    // Fallback/DNS issue? If IP is used as name it might fail depending on cert
+                    // For now assume valid or use a dummy if we don't verify hostname strictly?
+                    // Rustls usually requires valid DNS name.
+                    // If we are connecting by IP, we might need a workaround or expect cert to have IP SAN.
+                    // Let's assume valid.
+                    // If invalid, log and fail.
+                    warn!("Invalid DNS name for node {}", target.ip);
+                    return;
+                }
+            };
+
+            match connector.connect(domain, tcp_stream).await {
+                Ok(tls_stream) => ClusterStream::ClientTls(tls_stream),
+                Err(e) => {
+                    warn!("Cluster TLS handshake to {} failed: {}", addr, e);
+                    return;
+                }
+            }
+        } else {
+            ClusterStream::Tcp(tcp_stream)
+        };
+
+        // ... usage of stream ...
+        // Build and send PING
+        ping_buf.clear();
+        let ping = self.build_ping();
+        ping.serialize(ping_buf);
+
+        if let Err(e) = stream.write_all(ping_buf).await {
+            warn!("Failed to send PING to {}: {}", addr, e);
+            return;
+        }
+
+        self.server
+            .cluster
+            .messages_sent
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Track outgoing link
+        let link_id = Bytes::from(format!("out:{}", addr));
+        self.server.cluster.links.insert(
+            link_id.clone(),
+            ClusterLink {
+                direction: LinkDirection::To,
+                node_id: target.id.clone(),
+                create_time: crate::storage::now_ms() as u64,
+                events: "w".to_string(),
+                send_buffer_allocated: ping_buf.capacity() as u64,
+                send_buffer_used: ping_buf.len() as u64,
+            },
+        );
+
+        // Wait for PONG with timeout
+        resp_buf.clear();
+        match tokio::time::timeout(Duration::from_millis(500), stream.read_buf(resp_buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                // Process PONG
+                let peer_ip = target.ip.clone();
+                self.process_packet(resp_buf, &mut stream, &peer_ip).await;
+            }
+            Ok(Ok(_)) => {
+                // EOF
+                debug!("Connection closed by {}", addr);
+            }
+            Ok(Err(e)) => {
+                warn!("Read error from {}: {}", addr, e);
+            }
+            Err(_) => {
+                debug!("Timeout waiting for PONG from {}", addr);
             }
         }
+
+        // Remove link
+        self.server.cluster.links.remove(&link_id);
     }
 
     fn build_ping(&self) -> ClusterMsg {

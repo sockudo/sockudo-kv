@@ -260,6 +260,12 @@ pub struct ServerState {
 
     // === Cluster ===
     pub cluster: Arc<ClusterState>,
+
+    // === Client Side Caching ===
+    /// Map of key -> list of client IDs tracking it
+    pub tracking_table: DashMap<Bytes, Vec<u64>>,
+    /// Max keys in tracking table
+    pub tracking_table_max_keys: AtomicUsize,
 }
 
 impl ServerState {
@@ -304,6 +310,9 @@ impl ServerState {
             maxmemory_policy: RwLock::new("noeviction".to_string()),
             config: RwLock::new(ServerConfig::default()),
             cluster: Arc::new(ClusterState::new()),
+
+            tracking_table: DashMap::new(),
+            tracking_table_max_keys: AtomicUsize::new(1_000_000), // Default 1M
         };
 
         // Create default user
@@ -567,6 +576,43 @@ impl ServerState {
             let result = hasher.finalize();
             user.passwords.push(Bytes::copy_from_slice(&result));
         }
+    }
+
+    // === Tracking ===
+
+    /// Add a key to client tracking table
+    pub fn add_tracking_key(&self, key: Bytes, client_id: u64) {
+        // Optimistic check to avoid write lock if already tracking
+        if let Some(mut clients) = self.tracking_table.get_mut(&key) {
+            if !clients.contains(&client_id) {
+                clients.push(client_id);
+            }
+            return;
+        }
+
+        // New key - check limit
+        let max_keys = self.tracking_table_max_keys.load(Ordering::Relaxed);
+        let current_len = self.tracking_table.len();
+
+        if current_len >= max_keys && max_keys > 0 {
+            // Evict a random key (DashMap doesn't support random efficiently, use first from iteration)
+            // This is efficient enough for now.
+            if let Some(entry) = self.tracking_table.iter().next() {
+                // We need to clone the key to remove it after releasing the iterator lock
+                // Or just remove current entry? DashMap iterators are tricky with concurrent remove.
+                // Safest is to pick key and remove.
+                let key_to_evict = entry.key().clone();
+                drop(entry);
+                self.tracking_table.remove(&key_to_evict);
+                // Also notify clients? Redis sends invalidation on eviction.
+                // We don't have reference to clients here easily to find the evicted key's trackers.
+                // For this task (config implementation), basic eviction suffices.
+                // In full implementation, we'd iterate the clients in evicted entry and send invalidation.
+            }
+        }
+
+        // Insert new key
+        self.tracking_table.entry(key).or_default().push(client_id);
     }
 }
 

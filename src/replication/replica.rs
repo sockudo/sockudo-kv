@@ -1,17 +1,44 @@
-//! Replica-side replication handling
-//!
-//! Handles connecting to master and receiving replication stream.
-
 use bytes::BytesMut;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::rustls::ClientConfig;
+use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use super::ReplicationManager;
 use super::rdb::load_rdb;
 use crate::protocol::{Parser, RespValue};
 use crate::storage::MultiStore;
+
+/// Stream type for replication connection
+enum ReplStream {
+    Tcp(TcpStream),
+    Tls(TlsStream<TcpStream>),
+}
+
+impl ReplStream {
+    async fn read_buf(&mut self, buf: &mut BytesMut) -> std::io::Result<usize> {
+        match self {
+            ReplStream::Tcp(s) => s.read_buf(buf).await,
+            ReplStream::Tls(s) => s.read_buf(buf).await,
+        }
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            ReplStream::Tcp(s) => s.write_all(buf).await,
+            ReplStream::Tls(s) => s.write_all(buf).await,
+        }
+    }
+
+    async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ReplStream::Tcp(s) => s.read_exact(buf).await,
+            ReplStream::Tls(s) => s.read_exact(buf).await,
+        }
+    }
+}
 
 /// Connect to master and start replication
 pub async fn connect_to_master(
@@ -19,12 +46,27 @@ pub async fn connect_to_master(
     multi_store: Arc<MultiStore>,
     host: &str,
     port: u16,
+    tls_config: Option<Arc<ClientConfig>>,
 ) -> Result<(), String> {
     let addr = format!("{}:{}", host, port);
 
-    let mut stream = TcpStream::connect(&addr)
+    let tcp_stream = TcpStream::connect(&addr)
         .await
         .map_err(|e| format!("Failed to connect to master: {}", e))?;
+
+    let mut stream = if let Some(config) = tls_config {
+        let connector = TlsConnector::from(config);
+        let domain = rustls::pki_types::ServerName::try_from(host)
+            .map_err(|_| "Invalid DNS name".to_string())?
+            .to_owned();
+        let tls_stream = connector
+            .connect(domain, tcp_stream)
+            .await
+            .map_err(|e| format!("TLS handshake failed: {}", e))?;
+        ReplStream::Tls(tls_stream)
+    } else {
+        ReplStream::Tcp(tcp_stream)
+    };
 
     // Step 1: PING
     send_command(&mut stream, &["PING"]).await?;
@@ -163,7 +205,7 @@ pub async fn connect_to_master(
 }
 
 /// Send RESP command to stream
-async fn send_command(stream: &mut TcpStream, parts: &[&str]) -> Result<(), String> {
+async fn send_command(stream: &mut ReplStream, parts: &[&str]) -> Result<(), String> {
     let mut buf = Vec::with_capacity(256);
     buf.push(b'*');
     buf.extend_from_slice(itoa::Buffer::new().format(parts.len()).as_bytes());
@@ -181,7 +223,7 @@ async fn send_command(stream: &mut TcpStream, parts: &[&str]) -> Result<(), Stri
 }
 
 /// Read RESP response from stream
-async fn read_response(stream: &mut TcpStream) -> Result<RespValue, String> {
+async fn read_response(stream: &mut ReplStream) -> Result<RespValue, String> {
     let mut buf = BytesMut::with_capacity(4096);
 
     loop {
@@ -199,7 +241,7 @@ async fn read_response(stream: &mut TcpStream) -> Result<RespValue, String> {
 }
 
 /// Read RDB data from stream (bulk string format: $<length>\r\n<data>)
-async fn read_rdb_data(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+async fn read_rdb_data(stream: &mut ReplStream) -> Result<Vec<u8>, String> {
     let mut header = Vec::new();
     let mut byte = [0u8; 1];
 

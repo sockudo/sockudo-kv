@@ -154,6 +154,8 @@ pub struct ClientState {
     pub db: AtomicU64,
     /// Authentication status
     pub authenticated: AtomicBool,
+    /// Authenticated user
+    pub user: parking_lot::RwLock<Bytes>,
     /// Library name (CLIENT SETINFO LIB-NAME)
     pub lib_name: parking_lot::RwLock<Option<Bytes>>,
     /// Library version (CLIENT SETINFO LIB-VER)
@@ -199,6 +201,7 @@ impl ClientState {
             name: parking_lot::RwLock::new(None),
             db: AtomicU64::new(0),
             authenticated: AtomicBool::new(!require_auth), // If no auth required, authenticated by default
+            user: parking_lot::RwLock::new(Bytes::from_static(b"default")),
             lib_name: parking_lot::RwLock::new(None),
             lib_ver: parking_lot::RwLock::new(None),
             flags: ClientFlags::new(),
@@ -356,6 +359,7 @@ impl ClientState {
         *self.name.write() = None;
         self.db.store(0, Ordering::Relaxed);
         self.authenticated.store(true, Ordering::Relaxed); // Default to authenticated after reset
+        *self.user.write() = Bytes::from_static(b"default");
         *self.lib_name.write() = None;
         *self.lib_ver.write() = None;
         self.flags.no_evict.store(false, Ordering::Relaxed);
@@ -392,15 +396,18 @@ impl ClientState {
             .map(|b| String::from_utf8_lossy(b))
             .unwrap_or_default();
         let _client_type = self.client_type.read();
+        let user = self.user.read();
+        let user_str = String::from_utf8_lossy(&user);
 
         format!(
-            "id={} addr={} fd=0 name={} age={} idle={} flags=N db={} sub=0 psub=0 ssub=0 multi=-1 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd=NULL user=default redir={} resp=2 lib-name={} lib-ver={}\n",
+            "id={} addr={} fd=0 name={} age={} idle={} flags=N db={} sub=0 psub=0 ssub=0 multi=-1 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd=NULL user={} redir={} resp=2 lib-name={} lib-ver={}\n",
             self.id,
             self.addr,
             name_str,
             self.age_secs(),
             self.idle_secs(),
             self.db(),
+            user_str,
             self.tracking.redirect_id.load(Ordering::Relaxed),
             lib_name_str,
             lib_ver_str,

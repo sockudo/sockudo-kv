@@ -261,6 +261,32 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
                 .store(c.latency_monitor_threshold, Ordering::Relaxed);
         }),
     },
+    ConfigEntry {
+        name: "latency-tracking-info-percentiles",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String, // It's a list but we treat input as string
+        default_value: "50 99 99.9",
+        getter: |c| {
+            c.latency_tracking_info_percentiles
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        },
+        setter: |c, v| {
+            let percentiles: Result<Vec<f64>, _> =
+                v.split_whitespace().map(|s| s.parse::<f64>()).collect();
+            match percentiles {
+                Ok(p) => {
+                    c.latency_tracking_info_percentiles = p;
+                    Ok(())
+                }
+                Err(_) => Err("Invalid float in percentiles".into()),
+            }
+        },
+        applier: None,
+    },
     // === ACL ===
     ConfigEntry {
         name: "acllog-max-len",
@@ -878,7 +904,10 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "1000000",
         getter: int_getter!(tracking_table_max_keys),
         setter: int_setter!(tracking_table_max_keys, u64),
-        applier: None,
+        applier: Some(|s, c| {
+            s.tracking_table_max_keys
+                .store(c.tracking_table_max_keys as usize, Ordering::Relaxed);
+        }),
     },
     // === Memory ===
     ConfigEntry {

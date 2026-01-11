@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use crate::pubsub::PubSub;
+use crate::server_state::AclUser;
 
 /// Execute PUBSUB subcommands (CHANNELS, NUMSUB, NUMPAT)
 pub fn execute(pubsub: &Arc<PubSub>, cmd: &[u8], args: &[Bytes]) -> Result<RespValue> {
@@ -29,14 +30,15 @@ pub fn execute_subscribe(
     sub_id: u64,
     cmd: &[u8],
     args: &[Bytes],
+    user: Option<&AclUser>,
 ) -> Result<Vec<RespValue>> {
     match cmd {
-        b"SUBSCRIBE" => cmd_subscribe(pubsub, sub_id, args),
+        b"SUBSCRIBE" => cmd_subscribe(pubsub, sub_id, args, user),
         b"UNSUBSCRIBE" => cmd_unsubscribe(pubsub, sub_id, args),
-        b"PSUBSCRIBE" => cmd_psubscribe(pubsub, sub_id, args),
+        b"PSUBSCRIBE" => cmd_psubscribe(pubsub, sub_id, args, user),
         b"PUNSUBSCRIBE" => cmd_punsubscribe(pubsub, sub_id, args),
         // Sharded pub/sub (cluster-aware channels, scoped to hash slot)
-        b"SSUBSCRIBE" => cmd_ssubscribe(pubsub, sub_id, args),
+        b"SSUBSCRIBE" => cmd_ssubscribe(pubsub, sub_id, args, user),
         b"SUNSUBSCRIBE" => cmd_sunsubscribe(pubsub, sub_id, args),
         _ => Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd).into_owned(),
@@ -105,9 +107,24 @@ fn cmd_pubsub(pubsub: &Arc<PubSub>, args: &[Bytes]) -> Result<RespValue> {
 }
 
 /// SUBSCRIBE channel [channel ...]
-fn cmd_subscribe(pubsub: &Arc<PubSub>, sub_id: u64, args: &[Bytes]) -> Result<Vec<RespValue>> {
+fn cmd_subscribe(
+    pubsub: &Arc<PubSub>,
+    sub_id: u64,
+    args: &[Bytes],
+    user: Option<&AclUser>,
+) -> Result<Vec<RespValue>> {
     if args.is_empty() {
         return Err(Error::WrongArity("SUBSCRIBE"));
+    }
+
+    // Check ACLs
+    for channel in args {
+        if !check_channel_acl(user, channel) {
+            return Err(Error::Custom(format!(
+                "NOPERM this user has no permissions to access the '{}' channel",
+                String::from_utf8_lossy(channel)
+            )));
+        }
     }
 
     let counts = pubsub.subscribe(sub_id, args);
@@ -154,9 +171,24 @@ fn cmd_unsubscribe(pubsub: &Arc<PubSub>, sub_id: u64, args: &[Bytes]) -> Result<
 }
 
 /// PSUBSCRIBE pattern [pattern ...]
-fn cmd_psubscribe(pubsub: &Arc<PubSub>, sub_id: u64, args: &[Bytes]) -> Result<Vec<RespValue>> {
+fn cmd_psubscribe(
+    pubsub: &Arc<PubSub>,
+    sub_id: u64,
+    args: &[Bytes],
+    user: Option<&AclUser>,
+) -> Result<Vec<RespValue>> {
     if args.is_empty() {
         return Err(Error::WrongArity("PSUBSCRIBE"));
+    }
+
+    // Check ACLs
+    for pattern in args {
+        if !check_channel_acl(user, pattern) {
+            return Err(Error::Custom(format!(
+                "NOPERM this user has no permissions to access the '{}' channel",
+                String::from_utf8_lossy(pattern)
+            )));
+        }
     }
 
     let counts = pubsub.psubscribe(sub_id, args);
@@ -202,9 +234,24 @@ fn cmd_punsubscribe(pubsub: &Arc<PubSub>, sub_id: u64, args: &[Bytes]) -> Result
 }
 
 /// SSUBSCRIBE shardchannel [shardchannel ...] - Sharded subscribe (cluster-aware)
-fn cmd_ssubscribe(pubsub: &Arc<PubSub>, sub_id: u64, args: &[Bytes]) -> Result<Vec<RespValue>> {
+fn cmd_ssubscribe(
+    pubsub: &Arc<PubSub>,
+    sub_id: u64,
+    args: &[Bytes],
+    user: Option<&AclUser>,
+) -> Result<Vec<RespValue>> {
     if args.is_empty() {
         return Err(Error::WrongArity("SSUBSCRIBE"));
+    }
+
+    // Check ACLs
+    for channel in args {
+        if !check_channel_acl(user, channel) {
+            return Err(Error::Custom(format!(
+                "NOPERM this user has no permissions to access the '{}' channel",
+                String::from_utf8_lossy(channel)
+            )));
+        }
     }
 
     // Uses ssubscribe for proper sharded channel tracking
@@ -279,4 +326,23 @@ pub fn is_allowed_in_pubsub_mode(cmd: &[u8]) -> bool {
             | b"PING"
             | b"QUIT"
     )
+}
+
+/// Check if user has permission for channel
+fn check_channel_acl(user: Option<&AclUser>, channel: &[u8]) -> bool {
+    // If no user context (should not happen in normal flow), assume allow?
+    match user {
+        Some(u) => {
+            // Check if any user rule matches the channel
+            for pattern in &u.channels {
+                // "allchannels" is usually represented by "*"
+                // Pattern is first argument, text (channel) is second
+                if crate::pattern::matches_glob(pattern, channel) {
+                    return true;
+                }
+            }
+            false
+        }
+        None => true, // No user = unrestricted
+    }
 }

@@ -155,6 +155,11 @@ pub fn matches_pattern(pattern: &str, text: &str) -> bool {
     stringmatch(pattern, text, true)
 }
 
+/// Glob matching for binary data (case sensitive)
+pub fn matches_glob(pattern: &[u8], text: &[u8]) -> bool {
+    stringmatch_impl(pattern, text, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

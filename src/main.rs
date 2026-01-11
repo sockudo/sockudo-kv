@@ -154,6 +154,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     key_file,
                     config.tls_key_file_pass.as_deref(),
                     config.tls_ca_cert_file.as_deref(),
+                    &config.tls_auth_clients,
+                    if config.tls_session_caching {
+                        config.tls_session_cache_size
+                    } else {
+                        0
+                    },
+                    config.tls_session_cache_timeout,
+                    config.tls_prefer_server_ciphers,
                 ) {
                     Ok(tls_config) => {
                         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -261,7 +269,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     clients.set_maxclients(config.maxclients);
 
     // Initialize and start Cluster Service
-    let cluster_service = Arc::new(ClusterService::new(server_state.clone()));
+    let (cluster_tls_acceptor, cluster_tls_client_config) = if config.tls_cluster {
+        let acceptor = match (&config.tls_cert_file, &config.tls_key_file) {
+            (Some(cert), Some(key)) => {
+                match sockudo_kv::tls::load_tls_config(
+                    cert,
+                    key,
+                    config.tls_key_file_pass.as_deref(),
+                    config.tls_ca_cert_file.as_deref(),
+                    &config.tls_auth_clients, // Use same auth policy? Or strict?
+                    if config.tls_session_caching {
+                        config.tls_session_cache_size
+                    } else {
+                        0
+                    },
+                    config.tls_session_cache_timeout,
+                    config.tls_prefer_server_ciphers,
+                ) {
+                    Ok(cfg) => Some(tokio_rustls::TlsAcceptor::from(cfg)),
+                    Err(e) => {
+                        eprintln!("Failed to load TLS server config for cluster: {}", e);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let client_config = match sockudo_kv::tls::load_client_tls_config(
+            config.tls_ca_cert_file.as_deref(),
+            config.tls_cert_file.as_deref(),
+            config.tls_key_file.as_deref(),
+        ) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                eprintln!("Failed to load TLS client config for cluster: {}", e);
+                None
+            }
+        };
+
+        (acceptor, client_config)
+    } else {
+        (None, None)
+    };
+
+    let cluster_service = Arc::new(ClusterService::new(
+        server_state.clone(),
+        cluster_tls_acceptor,
+        cluster_tls_client_config,
+    ));
     let cs = cluster_service.clone();
     tokio::spawn(async move {
         cs.start().await;
@@ -290,6 +346,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let host = master_host.clone();
         let port = *master_port;
 
+        let tls_config = if config.tls_replication {
+            match sockudo_kv::tls::load_client_tls_config(
+                config.tls_ca_cert_file.as_deref(),
+                config.tls_cert_file.as_deref(),
+                config.tls_key_file.as_deref(),
+            ) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("Failed to load TLS client config for replication: {}", e);
+                    None // Fallback to TCP or fail? Fail usually.
+                }
+            }
+        } else {
+            None
+        };
+
         tokio::spawn(async move {
             loop {
                 println!("Connecting to master {}:{}", host, port);
@@ -298,6 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     store_clone.clone(),
                     &host,
                     port,
+                    tls_config.clone(),
                 )
                 .await
                 {
@@ -368,6 +441,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // TLS Listener
+    if let Some((acceptor, listener)) = tls_acceptor {
+        let acceptor = Arc::new(acceptor);
+        let multi_store = Arc::clone(&multi_store);
+        let pubsub = Arc::clone(&pubsub);
+        let clients = Arc::clone(&clients);
+        let server_state = Arc::clone(&server_state);
+        let replication = Arc::clone(&replication);
+        let config = Arc::clone(&config);
+
+        tasks.spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        let acceptor = acceptor.clone();
+                        let multi_store = Arc::clone(&multi_store);
+                        let pubsub = Arc::clone(&pubsub);
+                        let clients = Arc::clone(&clients);
+                        let server_state = Arc::clone(&server_state);
+                        let cluster_state = Arc::clone(&server_state.cluster);
+                        let replication = Arc::clone(&replication);
+                        let config = Arc::clone(&config);
+
+                        tokio::spawn(async move {
+                            match acceptor.accept(stream).await {
+                                Ok(tls_stream) => {
+                                    let _ = handle_tls_client(
+                                        tls_stream,
+                                        addr,
+                                        multi_store,
+                                        pubsub,
+                                        clients,
+                                        server_state,
+                                        cluster_state,
+                                        replication,
+                                        config,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => eprintln!("TLS accept error: {}", e),
+                            }
+                        });
+                    }
+                    Err(e) => eprintln!("TLS accept error: {}", e),
+                }
+            }
+        });
+    }
+
     // Wait for all listeners (they shouldn't exit)
     // Also handle shutdown signal?
     tokio::select! {
@@ -430,8 +552,8 @@ async fn handle_client(
     result
 }
 
-async fn handle_client_inner(
-    socket: &mut TcpStream,
+async fn handle_client_inner<S>(
+    socket: &mut S,
     multi_store: &Arc<sockudo_kv::storage::MultiStore>,
     pubsub: &Arc<PubSub>,
     clients: &Arc<ClientManager>,
@@ -442,7 +564,10 @@ async fn handle_client_inner(
     config: &Arc<ServerConfig>,
     sub_id: u64,
     mut rx: broadcast::Receiver<PubSubMessage>,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
     let mut buf = BytesMut::with_capacity(READ_BUF_SIZE);
     let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
     let mut in_pubsub_mode = false;
@@ -451,8 +576,20 @@ async fn handle_client_inner(
         tokio::select! {
             biased;
 
-            // Handle incoming commands
-            read_result = socket.read_buf(&mut buf) => {
+            // Handle incoming commands with optional timeout
+            read_result = async {
+                if config.timeout > 0 {
+                    match tokio::time::timeout(Duration::from_secs(config.timeout), socket.read_buf(&mut buf)).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            // Timeout -> treat as 0 bytes read (EOF-like) to trigger close
+                            Ok(0)
+                        }
+                    }
+                } else {
+                    socket.read_buf(&mut buf).await
+                }
+            } => {
                 if read_result? == 0 {
                     return Ok(());
                 }
@@ -467,6 +604,28 @@ async fn handle_client_inner(
 
                                 let cmd_name = cmd.name();
 
+                                // Protected Mode Check
+                                let is_loopback = match client.addr.ip() {
+                                    std::net::IpAddr::V4(ip) => ip.is_loopback(),
+                                    std::net::IpAddr::V6(ip) => ip.is_loopback(),
+                                };
+
+                                if config.protected_mode && !is_loopback && config.requirepass.is_none() {
+                                    // Allowed commands in protected mode
+                                    let is_allowed = cmd.is_command(b"PING")
+                                        || cmd.is_command(b"QUIT")
+                                        || cmd.is_command(b"COMMAND")
+                                        || cmd.is_command(b"AUTH")
+                                        || cmd.is_command(b"HELLO");
+
+                                    if !is_allowed {
+                                        write_buf.extend_from_slice(b"-DENIED Redis is running in protected mode because protected mode is enabled and no password is set for the default user. In this mode connections are only accepted from the loopback interface. If you want to connect from external computers to Redis you may adopt one of the following solutions: 1) Just disable protected mode sending the command 'CONFIG SET protected-mode no' from the loopback interface by connecting to the 127.0.0.1 interface. 2) Alternatively you can just disable the protected mode by editing the Redis configuration file, and setting the protected mode option to 'no'. 3) To allow access from other hosts you can set a password in the configuration file setting the 'requirepass' option. 4) If you trust the network to be safe, you can bind Redis to all the interfaces by setting the 'bind' option to '*'.\r\n");
+                                        // Skip processing this command but continue loop for next commands in buffer?
+                                        // Redis closes connection usually? No, it sends error.
+                                        continue;
+                                    }
+                                }
+
                                 // Check authentication
                                 if clients.requires_auth() && !client.is_authenticated() {
                                     let is_allowed = cmd.is_command(b"AUTH")
@@ -475,8 +634,6 @@ async fn handle_client_inner(
 
                                     if !is_allowed {
                                         write_buf.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
-                                        // continue to next command in buffer (but we are in a match, so we need to just stop processing this cmd)
-                                        // Since we write invalid response, we must skip the rest of logic for this command.
                                         continue;
                                     }
                                 }
@@ -484,7 +641,11 @@ async fn handle_client_inner(
                                 // Check if we need to handle Pub/Sub commands
                                 if is_subscribe_command(cmd_name) {
                                     // Handle subscription commands
-                                    match execute_subscribe(pubsub, sub_id, cmd_name, &cmd.args) {
+                                    let user_name = client.user.read();
+                                    let acl_user = server_state.get_acl_user(&user_name);
+                                    drop(user_name);
+
+                                    match execute_subscribe(pubsub, sub_id, cmd_name, &cmd.args, acl_user.as_ref()) {
                                         Ok(responses) => {
                                             for response in responses {
                                                 response.write_to(&mut write_buf);
@@ -702,6 +863,50 @@ fn is_cluster_command(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"ASKING")
         || cmd.eq_ignore_ascii_case(b"READONLY")
         || cmd.eq_ignore_ascii_case(b"READWRITE")
+}
+
+async fn handle_tls_client(
+    mut socket: tokio_rustls::server::TlsStream<TcpStream>,
+    addr: std::net::SocketAddr,
+    multi_store: Arc<sockudo_kv::storage::MultiStore>,
+    pubsub: Arc<PubSub>,
+    clients: Arc<ClientManager>,
+    server_state: Arc<ServerState>,
+    cluster_state: Arc<ClusterState>,
+    replication: Arc<sockudo_kv::ReplicationManager>,
+    config: Arc<ServerConfig>,
+) -> std::io::Result<()> {
+    let (stream, _conn) = socket.get_ref();
+    stream.set_nodelay(true)?;
+    if config.tcp_keepalive > 0 {
+        let _ = apply_tcp_keepalive(stream, config.tcp_keepalive);
+    }
+
+    let (sub_id, rx) = pubsub.register();
+    let require_auth = config.requirepass.is_some();
+
+    // TODO: Implement tls_auth_clients_user mapping here if x509 parsing supported
+
+    let client = clients.register_with_auth(addr, sub_id, require_auth);
+
+    let result = handle_client_inner(
+        &mut socket,
+        &multi_store,
+        &pubsub,
+        &clients,
+        &client,
+        &server_state,
+        &cluster_state,
+        &replication,
+        &config,
+        sub_id,
+        rx,
+    )
+    .await;
+
+    pubsub.unregister(sub_id);
+    clients.unregister(client.id);
+    result
 }
 
 /// Convert PubSubMessage to RESP format
