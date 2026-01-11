@@ -32,7 +32,7 @@ mimalloc = { version = "*", features = ["v3"] }
 wide = "1"
 rart = "0.2"
 rayon = "1.10"
-lru = "0.14"
+lru = "0.16"
 
 # TLS Support
 tokio-rustls = "0.26"

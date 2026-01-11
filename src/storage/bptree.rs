@@ -446,6 +446,59 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         self.free_list.clear();
     }
 
+    /// Get the first (smallest) key-value pair
+    pub fn first(&self) -> Option<(K, V)> {
+        let root_idx = self.root?;
+        let mut node_idx = root_idx;
+
+        loop {
+            match &self.nodes[node_idx] {
+                Node::Leaf(leaf) => {
+                    if leaf.len() > 0 {
+                        return Some((leaf.keys[0].clone(), leaf.values[0].clone()));
+                    }
+                    return None;
+                }
+                Node::Inner(inner) => {
+                    node_idx = inner.children[0];
+                }
+            }
+        }
+    }
+
+    /// Get the last (largest) key-value pair
+    pub fn last(&self) -> Option<(K, V)> {
+        let root_idx = self.root?;
+        let mut node_idx = root_idx;
+
+        loop {
+            match &self.nodes[node_idx] {
+                Node::Leaf(leaf) => {
+                    let len = leaf.len();
+                    if len > 0 {
+                        return Some((leaf.keys[len - 1].clone(), leaf.values[len - 1].clone()));
+                    }
+                    return None;
+                }
+                Node::Inner(inner) => {
+                    node_idx = inner.children[inner.children.len() - 1];
+                }
+            }
+        }
+    }
+
+    /// Get the first (smallest) key
+    #[inline]
+    pub fn first_key(&self) -> Option<K> {
+        self.first().map(|(k, _)| k)
+    }
+
+    /// Get the last (largest) key
+    #[inline]
+    pub fn last_key(&self) -> Option<K> {
+        self.last().map(|(k, _)| k)
+    }
+
     /// Get rank of a key (0-indexed)
     pub fn rank(&self, key: &K) -> Option<usize> {
         let root_idx = self.root?;
@@ -1459,6 +1512,30 @@ mod tests {
     }
 
     #[test]
+    fn test_first_last() {
+        let mut tree: BPTree<i64, i64> = BPTree::new();
+
+        assert_eq!(tree.first(), None);
+        assert_eq!(tree.last(), None);
+
+        tree.insert(5, 50);
+        assert_eq!(tree.first(), Some((5, 50)));
+        assert_eq!(tree.last(), Some((5, 50)));
+
+        tree.insert(3, 30);
+        tree.insert(7, 70);
+        assert_eq!(tree.first(), Some((3, 30)));
+        assert_eq!(tree.last(), Some((7, 70)));
+
+        tree.insert(1, 10);
+        tree.insert(9, 90);
+        assert_eq!(tree.first(), Some((1, 10)));
+        assert_eq!(tree.last(), Some((9, 90)));
+        assert_eq!(tree.first_key(), Some(1));
+        assert_eq!(tree.last_key(), Some(9));
+    }
+
+    #[test]
     fn test_bounds() {
         let mut tree: BPTree<i64, i64> = BPTree::new();
 
@@ -1471,6 +1548,426 @@ mod tests {
 
         // lower_bound for non-existing key
         assert_eq!(tree.lower_bound(&35), Some((40, 40)));
+    }
+
+    #[test]
+    fn bench_bptree_vs_btreemap_streams() {
+        use std::collections::BTreeMap;
+        use std::time::Instant;
+
+        // Simulate Stream IDs: (ms, seq) as u128
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+        struct StreamId {
+            ms: u64,
+            seq: u64,
+        }
+
+        let count = 100_000u64;
+
+        // ========== INSERT BENCHMARK ==========
+        let mut bptree: BPTree<StreamId, u32> = BPTree::new();
+        let start = Instant::now();
+        for i in 0..count {
+            let id = StreamId { ms: i, seq: 0 };
+            bptree.insert(id, i as u32);
+        }
+        let bptree_insert = start.elapsed();
+
+        let mut btree: BTreeMap<StreamId, u32> = BTreeMap::new();
+        let start = Instant::now();
+        for i in 0..count {
+            let id = StreamId { ms: i, seq: 0 };
+            btree.insert(id, i as u32);
+        }
+        let btree_insert = start.elapsed();
+
+        // ========== POINT LOOKUP BENCHMARK ==========
+        let iterations = 100_000;
+
+        let start = Instant::now();
+        for i in 0..iterations {
+            let id = StreamId {
+                ms: i % count,
+                seq: 0,
+            };
+            let _ = bptree.get(&id);
+        }
+        let bptree_get = start.elapsed();
+
+        let start = Instant::now();
+        for i in 0..iterations {
+            let id = StreamId {
+                ms: i % count,
+                seq: 0,
+            };
+            let _ = btree.get(&id);
+        }
+        let btree_get = start.elapsed();
+
+        // ========== FIRST/LAST BENCHMARK (Stream needs this) ==========
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = bptree.first();
+            let _ = bptree.last();
+        }
+        let bptree_first_last = start.elapsed();
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = btree.first_key_value();
+            let _ = btree.last_key_value();
+        }
+        let btree_first_last = start.elapsed();
+
+        // ========== RANGE QUERY BENCHMARK (proper range, not from MIN) ==========
+        let range_iterations = 10_000;
+        let range_size = 100u64;
+
+        let start = Instant::now();
+        for i in 0..range_iterations {
+            let from = StreamId {
+                ms: (i * 10) % (count - range_size),
+                seq: 0,
+            };
+            let to = StreamId {
+                ms: from.ms + range_size,
+                seq: u64::MAX,
+            };
+            let cnt: usize = bptree.range(&from, &to).count();
+            std::hint::black_box(cnt);
+        }
+        let bptree_range = start.elapsed();
+
+        let start = Instant::now();
+        for i in 0..range_iterations {
+            let from = StreamId {
+                ms: (i * 10) % (count - range_size),
+                seq: 0,
+            };
+            let to = StreamId {
+                ms: from.ms + range_size,
+                seq: u64::MAX,
+            };
+            let cnt: usize = btree.range(from..=to).count();
+            std::hint::black_box(cnt);
+        }
+        let btree_range = start.elapsed();
+
+        // ========== SEQUENTIAL REMOVE (XDEL from front) ==========
+        let mut bptree_del: BPTree<StreamId, u32> = BPTree::new();
+        let mut btree_del: BTreeMap<StreamId, u32> = BTreeMap::new();
+        for i in 0..10_000u64 {
+            let id = StreamId { ms: i, seq: 0 };
+            bptree_del.insert(id, i as u32);
+            btree_del.insert(id, i as u32);
+        }
+
+        let start = Instant::now();
+        for i in 0..5_000u64 {
+            let id = StreamId { ms: i, seq: 0 };
+            bptree_del.remove(&id);
+        }
+        let bptree_remove = start.elapsed();
+
+        let start = Instant::now();
+        for i in 0..5_000u64 {
+            let id = StreamId { ms: i, seq: 0 };
+            btree_del.remove(&id);
+        }
+        let btree_remove = start.elapsed();
+
+        println!("\n=== BPTree vs BTreeMap for Stream Operations ===");
+        println!("Items: {}", count);
+        println!();
+        println!("Insert ({} items):", count);
+        println!("  BPTree:   {:?}", bptree_insert);
+        println!("  BTreeMap: {:?}", btree_insert);
+        println!(
+            "  Ratio:    {:.2}x",
+            bptree_insert.as_secs_f64() / btree_insert.as_secs_f64()
+        );
+        println!();
+        println!("Point Lookup ({} ops):", iterations);
+        println!("  BPTree:   {:?}", bptree_get);
+        println!("  BTreeMap: {:?}", btree_get);
+        println!(
+            "  Ratio:    {:.2}x",
+            bptree_get.as_secs_f64() / btree_get.as_secs_f64()
+        );
+        println!();
+        println!("First/Last ({} ops each):", iterations);
+        println!("  BPTree:   {:?}", bptree_first_last);
+        println!("  BTreeMap: {:?}", btree_first_last);
+        println!(
+            "  Ratio:    {:.2}x",
+            bptree_first_last.as_secs_f64() / btree_first_last.as_secs_f64()
+        );
+        println!();
+        println!(
+            "Range Query ({} ops, {} items each):",
+            range_iterations, range_size
+        );
+        println!("  BPTree:   {:?}", bptree_range);
+        println!("  BTreeMap: {:?}", btree_range);
+        println!(
+            "  Ratio:    {:.2}x",
+            bptree_range.as_secs_f64() / btree_range.as_secs_f64()
+        );
+        println!();
+        println!("Remove from front (5000 ops):");
+        println!("  BPTree:   {:?}", bptree_remove);
+        println!("  BTreeMap: {:?}", btree_remove);
+        println!(
+            "  Ratio:    {:.2}x",
+            bptree_remove.as_secs_f64() / btree_remove.as_secs_f64()
+        );
+        println!();
+
+        // Summary
+        let dominated = [
+            bptree_insert < btree_insert,
+            bptree_get < btree_get,
+            bptree_first_last < btree_first_last,
+            bptree_range < btree_range,
+            bptree_remove < btree_remove,
+        ];
+        let wins = dominated.iter().filter(|&&x| x).count();
+        println!("BPTree wins: {}/5 benchmarks", wins);
+        if wins >= 3 {
+            println!(">>> BPTree is RECOMMENDED for Streams");
+        } else {
+            println!(">>> BTreeMap is RECOMMENDED for Streams");
+        }
+    }
+
+    #[test]
+    fn bench_bptree_vs_btreeset_sorted_sets() {
+        use std::collections::BTreeSet;
+        use std::time::Instant;
+
+        // Simulate SortedSet: (score, member) pairs
+        // This is exactly how Dragonfly uses BPTree for ZSET
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+        struct ScoreMember {
+            score: i64, // Using i64 to represent OrderedFloat
+            member: u64,
+        }
+
+        let count = 100_000u64;
+
+        // ========== INSERT BENCHMARK (ZADD) ==========
+        let mut bptree: BPTree<ScoreMember, ()> = BPTree::new();
+        let start = Instant::now();
+        for i in 0..count {
+            let sm = ScoreMember {
+                score: (i % 1000) as i64,
+                member: i,
+            };
+            bptree.insert(sm, ());
+        }
+        let bptree_insert = start.elapsed();
+
+        let mut btreeset: BTreeSet<ScoreMember> = BTreeSet::new();
+        let start = Instant::now();
+        for i in 0..count {
+            let sm = ScoreMember {
+                score: (i % 1000) as i64,
+                member: i,
+            };
+            btreeset.insert(sm);
+        }
+        let btreeset_insert = start.elapsed();
+
+        // ========== RANK QUERY (ZRANK) - BPTree's key advantage ==========
+        let rank_iterations = 50_000;
+
+        let start = Instant::now();
+        for i in 0..rank_iterations {
+            let sm = ScoreMember {
+                score: (i % 1000) as i64,
+                member: i % count,
+            };
+            let _ = bptree.rank(&sm);
+        }
+        let bptree_rank = start.elapsed();
+
+        // BTreeSet doesn't have rank, must iterate to count
+        let start = Instant::now();
+        for i in 0..rank_iterations {
+            let sm = ScoreMember {
+                score: (i % 1000) as i64,
+                member: i % count,
+            };
+            // Simulate rank by counting elements less than target
+            let _rank: usize = btreeset.range(..&sm).count();
+        }
+        let btreeset_rank = start.elapsed();
+
+        // ========== SELECT BY RANK (ZRANGE by index) - BPTree advantage ==========
+        let select_iterations = 50_000;
+
+        let start = Instant::now();
+        for i in 0..select_iterations {
+            let rank = (i as usize) % bptree.len();
+            let _ = bptree.select(rank);
+        }
+        let bptree_select = start.elapsed();
+
+        // BTreeSet must iterate to find nth element
+        let start = Instant::now();
+        for i in 0..select_iterations {
+            let rank = (i as usize) % btreeset.len();
+            let _ = btreeset.iter().nth(rank);
+        }
+        let btreeset_select = start.elapsed();
+
+        // ========== RANGE BY SCORE (ZRANGEBYSCORE) ==========
+        let range_iterations = 10_000;
+
+        let start = Instant::now();
+        for i in 0..range_iterations {
+            let from = ScoreMember {
+                score: (i % 900) as i64,
+                member: 0,
+            };
+            let to = ScoreMember {
+                score: (i % 900) as i64 + 100,
+                member: u64::MAX,
+            };
+            let cnt: usize = bptree.range(&from, &to).count();
+            std::hint::black_box(cnt);
+        }
+        let bptree_range = start.elapsed();
+
+        let start = Instant::now();
+        for i in 0..range_iterations {
+            let from = ScoreMember {
+                score: (i % 900) as i64,
+                member: 0,
+            };
+            let to = ScoreMember {
+                score: (i % 900) as i64 + 100,
+                member: u64::MAX,
+            };
+            let cnt: usize = btreeset.range(from..=to).count();
+            std::hint::black_box(cnt);
+        }
+        let btreeset_range = start.elapsed();
+
+        // ========== REMOVE (ZREM) ==========
+        let mut bptree_del: BPTree<ScoreMember, ()> = BPTree::new();
+        let mut btreeset_del: BTreeSet<ScoreMember> = BTreeSet::new();
+        for i in 0..10_000u64 {
+            let sm = ScoreMember {
+                score: i as i64,
+                member: i,
+            };
+            bptree_del.insert(sm.clone(), ());
+            btreeset_del.insert(sm);
+        }
+
+        let start = Instant::now();
+        for i in 0..5_000u64 {
+            let sm = ScoreMember {
+                score: i as i64,
+                member: i,
+            };
+            bptree_del.remove(&sm);
+        }
+        let bptree_remove = start.elapsed();
+
+        let start = Instant::now();
+        for i in 0..5_000u64 {
+            let sm = ScoreMember {
+                score: i as i64,
+                member: i,
+            };
+            btreeset_del.remove(&sm);
+        }
+        let btreeset_remove = start.elapsed();
+
+        println!("\n=== BPTree vs BTreeSet for SortedSet (ZSET) Operations ===");
+        println!("Items: {}", count);
+        println!();
+        println!("ZADD - Insert ({} items):", count);
+        println!("  BPTree:   {:?}", bptree_insert);
+        println!("  BTreeSet: {:?}", btreeset_insert);
+        println!(
+            "  Ratio:    {:.2}x",
+            bptree_insert.as_secs_f64() / btreeset_insert.as_secs_f64()
+        );
+        println!();
+        println!("ZRANK - Get rank ({} ops):", rank_iterations);
+        println!("  BPTree:   {:?}", bptree_rank);
+        println!("  BTreeSet: {:?}", btreeset_rank);
+        println!(
+            "  Ratio:    {:.2}x",
+            bptree_rank.as_secs_f64() / btreeset_rank.as_secs_f64()
+        );
+        println!();
+        println!(
+            "ZRANGE by index - Select by rank ({} ops):",
+            select_iterations
+        );
+        println!("  BPTree:   {:?}", bptree_select);
+        println!("  BTreeSet: {:?}", btreeset_select);
+        println!(
+            "  Ratio:    {:.2}x",
+            bptree_select.as_secs_f64() / btreeset_select.as_secs_f64()
+        );
+        println!();
+        println!("ZRANGEBYSCORE - Range by score ({} ops):", range_iterations);
+        println!("  BPTree:   {:?}", bptree_range);
+        println!("  BTreeSet: {:?}", btreeset_range);
+        println!(
+            "  Ratio:    {:.2}x",
+            bptree_range.as_secs_f64() / btreeset_range.as_secs_f64()
+        );
+        println!();
+        println!("ZREM - Remove (5000 ops):");
+        println!("  BPTree:   {:?}", bptree_remove);
+        println!("  BTreeSet: {:?}", btreeset_remove);
+        println!(
+            "  Ratio:    {:.2}x",
+            bptree_remove.as_secs_f64() / btreeset_remove.as_secs_f64()
+        );
+        println!();
+
+        // Summary - for ZSET, rank and select are critical operations
+        let bptree_rank_wins = bptree_rank < btreeset_rank;
+        let bptree_select_wins = bptree_select < btreeset_select;
+
+        println!("=== CRITICAL ZSET OPERATIONS ===");
+        println!(
+            "ZRANK:  BPTree is {:.1}x {}",
+            if bptree_rank_wins {
+                btreeset_rank.as_secs_f64() / bptree_rank.as_secs_f64()
+            } else {
+                bptree_rank.as_secs_f64() / btreeset_rank.as_secs_f64()
+            },
+            if bptree_rank_wins { "FASTER" } else { "SLOWER" }
+        );
+        println!(
+            "ZRANGE: BPTree is {:.1}x {}",
+            if bptree_select_wins {
+                btreeset_select.as_secs_f64() / bptree_select.as_secs_f64()
+            } else {
+                bptree_select.as_secs_f64() / btreeset_select.as_secs_f64()
+            },
+            if bptree_select_wins {
+                "FASTER"
+            } else {
+                "SLOWER"
+            }
+        );
+
+        if bptree_rank_wins && bptree_select_wins {
+            println!(">>> BPTree is RECOMMENDED for SortedSets (rank/select operations)");
+        } else if bptree_rank_wins || bptree_select_wins {
+            println!(">>> BPTree has MIXED results - consider workload");
+        } else {
+            println!(">>> BTreeSet is RECOMMENDED for SortedSets");
+        }
     }
 
     #[test]

@@ -4,9 +4,9 @@
 //! - Gorilla compression (Facebook's algorithm): 12x size reduction
 //!   - Delta-of-delta timestamp encoding (96% compress to 1 bit)
 //!   - XOR float compression (51% compress to 1 bit)
-//! - **B+Tree** for O(log n) chunk lookups with native range query support
-//!   - Inspired by Dragonfly's B+Tree implementation
-//!   - 256-byte cache-line friendly nodes
+//! - **BTreeMap** for O(log n) chunk lookups with native range query support
+//!   - Rust's highly optimized B-Tree implementation
+//!   - Excellent cache locality and performance
 //!   - Direct range iteration without filtering
 //! - **LRU chunk cache** for hot decompressed data
 //! - **Parallel chunk decoding** with rayon
@@ -15,15 +15,15 @@
 //!
 //! Performance characteristics:
 //! - Chunk lookup: O(log n) with excellent cache locality
-//! - Range queries: O(log n) seek + O(k) iteration (vs O(n) filter with ART)
+//! - Range queries: O(log n) seek + O(k) iteration
 //! - Hot queries: Zero decompression (LRU cache hit)
 //! - Parallel range queries: Decompression across chunks
 //! - Compression: 10-12x for regular metrics
 
-use crate::storage::bptree::BPTree;
 use crate::storage::types::{Aggregation, CompactionRule, DuplicatePolicy, TimeSeriesInfo};
 use parking_lot::Mutex;
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -693,24 +693,25 @@ impl ChunkBuilder {
 // B+Tree Chunk Index (Dragonfly-inspired)
 // ============================================================================
 
-/// High-performance B+Tree-based chunk storage
+/// High-performance BTreeMap-based chunk storage
 ///
-/// Advantages over ART:
+/// Advantages:
 /// - Native range query support: O(log n) seek + O(k) iteration
-/// - Cache-friendly 256-byte nodes
+/// - Rust's highly optimized B-Tree implementation
+/// - Excellent cache locality
 /// - No need to iterate all entries for range queries
 ///
 /// Uses i64 timestamps as keys for chunk start times
 pub struct ChunkIndex {
-    /// B+Tree mapping start_time -> CompressedChunk
-    tree: BPTree<i64, ChunkEntry>,
+    /// BTreeMap mapping start_time -> chunk index
+    tree: BTreeMap<i64, ChunkEntry>,
     /// Store chunks separately for stable references
     chunks: Vec<CompressedChunk>,
     /// Free list for reusing chunk slots
     free_slots: Vec<usize>,
 }
 
-/// Entry stored in B+Tree (index into chunks vector)
+/// Entry stored in BTreeMap (index into chunks vector)
 #[derive(Debug, Clone, Copy)]
 struct ChunkEntry {
     /// Index into the chunks vector
@@ -747,7 +748,7 @@ impl Clone for ChunkIndex {
 impl ChunkIndex {
     pub fn new() -> Self {
         Self {
-            tree: BPTree::new(),
+            tree: BTreeMap::new(),
             chunks: Vec::new(),
             free_slots: Vec::new(),
         }
@@ -800,7 +801,7 @@ impl ChunkIndex {
 
     /// Get all chunks in a time range (inclusive)
     ///
-    /// This is the key advantage over ART: O(log n) seek + O(k) iteration
+    /// This is the key advantage over linear scan: O(log n) seek + O(k) iteration
     /// instead of O(n) full scan with filtering
     pub fn range(&self, from: i64, to: i64) -> Vec<(&i64, &CompressedChunk)> {
         // Find first chunk that might contain data in range
@@ -808,11 +809,11 @@ impl ChunkIndex {
 
         let mut result = Vec::new();
 
-        // Use B+Tree range query - this is the big performance win!
+        // Use BTreeMap range query - this is the big performance win!
         // We iterate only the relevant portion of the tree
-        for (start_time, entry) in self.tree.range(&i64::MIN, &to) {
+        for (start_time, entry) in self.tree.range(..=to) {
             // Include chunks that overlap with the range
-            if entry.end_time >= from && start_time <= to {
+            if entry.end_time >= from && *start_time <= to {
                 let chunk = &self.chunks[entry.index as usize];
                 result.push((&chunk.start_time, chunk));
             }
@@ -825,7 +826,7 @@ impl ChunkIndex {
     pub fn iter(&self) -> impl Iterator<Item = (i64, &CompressedChunk)> {
         self.tree
             .iter()
-            .map(|(start_time, entry)| (start_time, &self.chunks[entry.index as usize]))
+            .map(|(&start_time, entry)| (start_time, &self.chunks[entry.index as usize]))
     }
 
     /// Get chunk count
@@ -844,8 +845,8 @@ impl ChunkIndex {
     pub fn keys_before(&self, cutoff: i64) -> Vec<i64> {
         // Use efficient range query from MIN to cutoff
         self.tree
-            .range(&i64::MIN, &cutoff)
-            .filter_map(|(start_time, entry)| {
+            .range(..cutoff)
+            .filter_map(|(&start_time, entry)| {
                 if entry.end_time < cutoff {
                     Some(start_time)
                 } else {
@@ -853,6 +854,22 @@ impl ChunkIndex {
                 }
             })
             .collect()
+    }
+
+    /// Get the first (oldest) chunk
+    #[inline]
+    pub fn first(&self) -> Option<(i64, &CompressedChunk)> {
+        self.tree
+            .first_key_value()
+            .map(|(&start_time, entry)| (start_time, &self.chunks[entry.index as usize]))
+    }
+
+    /// Get the last (newest) chunk
+    #[inline]
+    pub fn last(&self) -> Option<(i64, &CompressedChunk)> {
+        self.tree
+            .last_key_value()
+            .map(|(&start_time, entry)| (start_time, &self.chunks[entry.index as usize]))
     }
 }
 
@@ -1036,9 +1053,10 @@ impl TimeSeries {
     pub fn get_latest(&self) -> Option<(i64, f64)> {
         // Check current chunk first
         if let Some(builder) = &self.current_chunk
-            && builder.count() > 0 {
-                return Some((self.last_timestamp, self.last_value));
-            }
+            && builder.count() > 0
+        {
+            return Some((self.last_timestamp, self.last_value));
+        }
 
         // Check last finalized chunk
         let mut latest: Option<(i64, &CompressedChunk)> = None;
@@ -1083,9 +1101,11 @@ impl TimeSeries {
 
         // Query current chunk (not cached)
         if let Some(builder) = &self.current_chunk
-            && builder.chunk.end_time >= from && builder.chunk.start_time <= to {
-                result.extend(builder.chunk.decode_range(from, to));
-            }
+            && builder.chunk.end_time >= from
+            && builder.chunk.start_time <= to
+        {
+            result.extend(builder.chunk.decode_range(from, to));
+        }
 
         result.sort_by_key(|(ts, _)| *ts);
         result
@@ -1148,9 +1168,11 @@ impl TimeSeries {
 
         // Query current chunk
         if let Some(builder) = &self.current_chunk
-            && builder.chunk.end_time >= from && builder.chunk.start_time <= to {
-                result.extend(builder.chunk.decode_range(from, to));
-            }
+            && builder.chunk.end_time >= from
+            && builder.chunk.start_time <= to
+        {
+            result.extend(builder.chunk.decode_range(from, to));
+        }
 
         result.sort_by_key(|(ts, _)| *ts);
         result.dedup_by_key(|(ts, _)| *ts);
@@ -1969,90 +1991,60 @@ mod benchmarks {
     }
 
     #[test]
-    fn bench_bptree_vs_btreemap() {
-        use std::collections::BTreeMap;
+    fn bench_chunkindex_performance() {
+        let count = 100_000i64;
 
-        let count = 100_000;
-
-        // Benchmark our custom B+Tree (ChunkIndex)
-        let mut bptree_index = ChunkIndex::new();
-        let start_bptree_insert = Instant::now();
+        // Benchmark ChunkIndex (now using BTreeMap)
+        let mut index = ChunkIndex::new();
+        let start_insert = Instant::now();
         for i in 0..count {
             let mut chunk = CompressedChunk::new(i * 1000);
             chunk.count = 1;
             chunk.end_time = i * 1000 + 999;
-            bptree_index.insert(i * 1000, chunk);
+            index.insert(i * 1000, chunk);
         }
-        let elapsed_bptree_insert = start_bptree_insert.elapsed();
-
-        // Benchmark std BTreeMap
-        let mut btree: BTreeMap<i64, CompressedChunk> = BTreeMap::new();
-        let start_btree_insert = Instant::now();
-        for i in 0..count {
-            let mut chunk = CompressedChunk::new(i * 1000);
-            chunk.count = 1;
-            btree.insert(i * 1000, chunk);
-        }
-        let elapsed_btree_insert = start_btree_insert.elapsed();
+        let elapsed_insert = start_insert.elapsed();
 
         // Benchmark point lookups
-        let iterations = 100_000;
+        let iterations = 100_000i64;
 
-        let start_bptree_get = Instant::now();
+        let start_get = Instant::now();
         for i in 0..iterations {
-            let _ = bptree_index.get((i % count) * 1000);
+            let _ = index.get((i % count) * 1000);
         }
-        let elapsed_bptree_get = start_bptree_get.elapsed();
+        let elapsed_get = start_get.elapsed();
 
-        let start_btree_get = Instant::now();
-        for i in 0..iterations {
-            let _ = btree.get(&(((i % count) * 1000) as i64));
-        }
-        let elapsed_btree_get = start_btree_get.elapsed();
+        // Benchmark range queries
+        let range_iterations = 1000i64;
 
-        // Benchmark range queries (the key improvement!)
-        let range_iterations = 1000;
-
-        let start_bptree_range = Instant::now();
+        let start_range = Instant::now();
         for i in 0..range_iterations {
             let from = (i * 100) * 1000;
             let to = from + 10000 * 1000;
-            let _ = bptree_index.range(from, to);
+            let _ = index.range(from, to);
         }
-        let elapsed_bptree_range = start_bptree_range.elapsed();
+        let elapsed_range = start_range.elapsed();
 
-        let start_btree_range = Instant::now();
-        for i in 0..range_iterations {
-            let from = (i * 100) * 1000;
-            let to = from + 10000 * 1000;
-            let _: Vec<_> = btree.range(from..=to).collect();
+        // Benchmark first/last
+        let start_first_last = Instant::now();
+        for _ in 0..iterations {
+            let _ = index.first();
+            let _ = index.last();
         }
-        let elapsed_btree_range = start_btree_range.elapsed();
+        let elapsed_first_last = start_first_last.elapsed();
 
-        println!("\n=== Custom B+Tree vs std::BTreeMap Benchmark ===");
+        println!("\n=== ChunkIndex (BTreeMap) Performance ===");
         println!("Items: {}", count);
-        println!("");
-        println!("Insert:");
-        println!("  B+Tree (Dragonfly-style): {:?}", elapsed_bptree_insert);
-        println!("  std::BTreeMap:            {:?}", elapsed_btree_insert);
-        println!("");
-        println!("Point Lookup ({} iterations):", iterations);
-        println!("  B+Tree: {:?}", elapsed_bptree_get);
-        println!("  std:    {:?}", elapsed_btree_get);
+        println!();
+        println!("Insert: {:?}", elapsed_insert);
+        println!("Point Lookup ({} ops): {:?}", iterations, elapsed_get);
         println!(
-            "  Ratio:  {:.2}x",
-            elapsed_bptree_get.as_secs_f64() / elapsed_btree_get.as_secs_f64()
+            "Range Query ({} ops, 10K items each): {:?}",
+            range_iterations, elapsed_range
         );
-        println!("");
         println!(
-            "Range Query ({} iterations, 10K items each):",
-            range_iterations
-        );
-        println!("  B+Tree: {:?}", elapsed_bptree_range);
-        println!("  std:    {:?}", elapsed_btree_range);
-        println!(
-            "  Ratio:  {:.2}x",
-            elapsed_bptree_range.as_secs_f64() / elapsed_btree_range.as_secs_f64()
+            "First/Last ({} ops each): {:?}",
+            iterations, elapsed_first_last
         );
     }
 }
