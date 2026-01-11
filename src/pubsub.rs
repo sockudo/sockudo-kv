@@ -8,8 +8,11 @@
 
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
+
+use crate::glob_trie::GlobTrie;
 
 /// Message types for Pub/Sub
 #[derive(Clone, Debug)]
@@ -74,7 +77,7 @@ pub struct PubSub {
     /// sharded channel -> set of subscriber IDs
     sharded_channels: DashMap<Bytes, DashSet<u64>>,
     /// pattern -> set of subscriber IDs
-    patterns: DashMap<Bytes, DashSet<u64>>,
+    patterns: RwLock<GlobTrie<DashSet<u64>>>,
     /// subscriber ID -> Subscriber
     subscribers: DashMap<u64, Subscriber>,
     /// Next subscriber ID
@@ -86,7 +89,7 @@ impl PubSub {
         Self {
             channels: DashMap::new(),
             sharded_channels: DashMap::new(),
-            patterns: DashMap::new(),
+            patterns: RwLock::new(GlobTrie::new()),
             subscribers: DashMap::new(),
             next_id: AtomicU64::new(1),
         }
@@ -116,11 +119,11 @@ impl PubSub {
             }
             // Remove from all patterns
             for pattern in sub.patterns.iter() {
-                if let Some(subs) = self.patterns.get(&*pattern) {
+                let mut patterns = self.patterns.write();
+                if let Some(subs) = patterns.get_mut(&*pattern) {
                     subs.remove(&id);
                     if subs.is_empty() {
-                        drop(subs);
-                        self.patterns.remove(&*pattern);
+                        patterns.remove(&*pattern);
                     }
                 }
             }
@@ -189,7 +192,10 @@ impl PubSub {
                 sub.patterns.insert(pattern.clone());
 
                 // Add subscriber to pattern's set
-                self.patterns.entry(pattern.clone()).or_default().insert(id);
+                self.patterns
+                    .write()
+                    .insert(pattern.clone(), DashSet::new)
+                    .insert(id);
 
                 counts.push(sub.subscription_count());
             }
@@ -214,11 +220,11 @@ impl PubSub {
                 sub.patterns.remove(&pattern);
 
                 // Remove subscriber from pattern's set
-                if let Some(subs) = self.patterns.get(&pattern) {
+                let mut patterns = self.patterns.write();
+                if let Some(subs) = patterns.get_mut(&pattern) {
                     subs.remove(&id);
                     if subs.is_empty() {
-                        drop(subs);
-                        self.patterns.remove(&pattern);
+                        patterns.remove(&pattern);
                     }
                 }
 
@@ -253,22 +259,22 @@ impl PubSub {
         }
 
         // Deliver to pattern subscribers
-        for entry in self.patterns.iter() {
-            let pattern = entry.key();
-            if pattern_matches(pattern, channel) {
-                for sub_id in entry.value().iter() {
-                    if let Some(sub) = self.subscribers.get(&*sub_id)
-                        && sub
-                            .tx
-                            .send(PubSubMessage::PMessage {
-                                pattern: pattern.clone(),
-                                channel: channel_bytes.clone(),
-                                message: message.clone(),
-                            })
-                            .is_ok()
-                    {
-                        count += 1;
-                    }
+        let patterns = self.patterns.read();
+        let matches = patterns.matches(channel);
+
+        for (pat, subs) in matches {
+            for sub_id in subs.iter() {
+                if let Some(sub) = self.subscribers.get(&*sub_id)
+                    && sub
+                        .tx
+                        .send(PubSubMessage::PMessage {
+                            pattern: pat.clone(),
+                            channel: channel_bytes.clone(),
+                            message: message.clone(),
+                        })
+                        .is_ok()
+                {
+                    count += 1;
                 }
             }
         }
@@ -388,7 +394,7 @@ impl PubSub {
 
     /// Get number of unique patterns
     pub fn numpat(&self) -> usize {
-        self.patterns.len()
+        self.patterns.read().len()
     }
 
     /// Check if subscriber is in pubsub mode

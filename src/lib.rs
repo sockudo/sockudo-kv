@@ -12,6 +12,7 @@ pub mod commands;
 pub mod config;
 pub mod config_table;
 pub mod error;
+pub mod glob_trie;
 pub mod keyspace_notify;
 pub mod lua_engine;
 pub mod pattern;
