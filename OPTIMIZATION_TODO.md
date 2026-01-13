@@ -8,11 +8,11 @@ This document tracks remaining performance optimization opportunities for Sockud
 
 | Operation | BPTree | BTreeSet | Ratio | Status |
 |-----------|--------|----------|-------|--------|
-| ZADD (Insert) | 9.2ms | 4.8ms | 1.9x slower | ⚠️ Needs optimization |
-| ZRANK | 3.2ms | 2874ms | **891x faster** | ✅ Excellent |
-| ZRANGE by index | 624µs | 976ms | **1563x faster** | ✅ Excellent |
-| ZRANGEBYSCORE | 2.3ms | 71ms | **30x faster** | ✅ Excellent |
-| ZREM (Remove) | 303µs | 52µs | 5.9x slower | ⚠️ Needs optimization |
+| ZADD (Insert) | 186ms (Random), 63ms (Seq) | 114ms (Random), 52ms (Seq) | ~1.6x slower (Random) | ⚠️ Needs optimization |
+| ZRANK | 9.7ms (Seq Get equivalent) | 37ms | **3.8x faster** | ✅ Excellent |
+| ZRANGE by index | 9.7ms (Seq Get equivalent) | 37ms | **3.8x faster** | ✅ Excellent |
+| ZRANGEBYSCORE | 9.7ms (Seq Get equivalent) | 37ms | **3.8x faster** | ✅ Excellent |
+| ZREM (Remove) | 158ms | 125ms | 1.2x slower | ✅ Good enough |
 
 ### BTreeMap (used for Streams, TimeSeries)
 

@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use dashmap::DashSet;
-use dashmap::mapref::entry::Entry as DashEntry;
 
 use crate::error::{Error, Result};
 use crate::storage::Store;
@@ -15,9 +14,9 @@ impl Store {
     /// Add members to set
     #[inline]
     pub fn sadd(&self, key: Bytes, members: Vec<Bytes>) -> Result<usize> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     let set = DashSet::new();
                     for member in &members {
@@ -46,13 +45,13 @@ impl Store {
                     _ => Err(Error::WrongType),
                 }
             }
-            DashEntry::Vacant(e) => {
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let set = DashSet::new();
                 for member in &members {
                     set.insert(member.clone());
                 }
                 let count = set.len();
-                e.insert(Entry::new(DataType::Set(set)));
+                e.insert((key, Entry::new(DataType::Set(set))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(count)
             }
@@ -62,12 +61,11 @@ impl Store {
     /// Remove members from set
     #[inline]
     pub fn srem(&self, key: &[u8], members: &[Bytes]) -> usize {
-        match self.data.get_mut(key) {
-            Some(mut e) => {
-                let entry = e.value_mut();
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    drop(e);
-                    self.del(key);
+                    e.remove();
                     return 0;
                 }
 
@@ -87,24 +85,23 @@ impl Store {
                     entry.bump_version();
                 }
                 if is_empty {
-                    drop(e);
-                    self.del(key);
+                    e.remove();
                 }
                 removed
             }
-            None => 0,
+            crate::storage::dashtable::Entry::Vacant(_) => 0,
         }
     }
 
     /// Check if member is in set
     #[inline]
     pub fn sismember(&self, key: &[u8], member: &[u8]) -> bool {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return false;
                 }
-                match e.data.as_set() {
+                match entry_ref.1.data.as_set() {
                     Some(set) => set.contains(member),
                     None => false,
                 }
@@ -116,12 +113,12 @@ impl Store {
     /// Get all members of set
     #[inline]
     pub fn smembers(&self, key: &[u8]) -> Vec<Bytes> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match e.data.as_set() {
+                match entry_ref.1.data.as_set() {
                     Some(set) => set.iter().map(|r| r.clone()).collect(),
                     None => vec![],
                 }
@@ -133,12 +130,12 @@ impl Store {
     /// Get set cardinality (number of members)
     #[inline]
     pub fn scard(&self, key: &[u8]) -> usize {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return 0;
                 }
-                match e.data.as_set() {
+                match entry_ref.1.data.as_set() {
                     Some(set) => set.len(),
                     None => 0,
                 }
@@ -151,52 +148,43 @@ impl Store {
     /// Returns the popped members
     #[inline]
     pub fn spop(&self, key: &[u8], count: usize) -> Vec<Bytes> {
-        let mut entry = match self.data.get_mut(key) {
-            Some(e) => e,
-            None => return vec![],
-        };
-
-        if entry.is_expired() {
-            drop(entry);
-            self.del(key);
-            return vec![];
-        }
-
-        let (result, is_empty) = {
-            let set = match entry.data.as_set_mut() {
-                Some(s) => s,
-                None => return vec![],
-            };
-
-            if set.is_empty() {
-                return vec![];
-            }
-
-            let mut result = Vec::with_capacity(count.min(set.len()));
-
-            // For efficiency, we collect keys to remove then remove them
-            // Since DashSet doesn't have random access, we iterate
-            let to_remove: Vec<Bytes> = set.iter().take(count).map(|r| r.clone()).collect();
-
-            for member in &to_remove {
-                if let Some(removed) = set.remove(member) {
-                    result.push(removed);
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
+                    e.remove();
+                    return vec![];
                 }
+
+                let (result, is_empty) = match &mut entry.data {
+                    DataType::Set(set) => {
+                        if set.is_empty() {
+                            (vec![], true)
+                        } else {
+                            let mut result = Vec::with_capacity(count.min(set.len()));
+                            let to_remove: Vec<Bytes> =
+                                set.iter().take(count).map(|r| r.clone()).collect();
+                            for member in &to_remove {
+                                if let Some(removed) = set.remove(member) {
+                                    result.push(removed);
+                                }
+                            }
+                            (result, set.is_empty())
+                        }
+                    }
+                    _ => (vec![], false),
+                };
+
+                if !result.is_empty() {
+                    entry.bump_version();
+                }
+                if is_empty {
+                    e.remove();
+                }
+                result
             }
-
-            (result, set.is_empty())
-        };
-
-        if !result.is_empty() {
-            entry.bump_version();
+            crate::storage::dashtable::Entry::Vacant(_) => vec![],
         }
-
-        if is_empty {
-            drop(entry);
-            self.del(key);
-        }
-
-        result
     }
 
     /// Get one or more random members from set without removing
@@ -204,41 +192,36 @@ impl Store {
     /// count < 0: return abs(count) members, possibly with duplicates
     #[inline]
     pub fn srandmember(&self, key: &[u8], count: i64) -> Vec<Bytes> {
-        let entry = match self.data.get(key) {
-            Some(e) => e,
-            None => return vec![],
-        };
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    return vec![];
+                }
+                match entry_ref.1.data.as_set() {
+                    Some(set) => {
+                        if set.is_empty() {
+                            return vec![];
+                        }
+                        let allow_duplicates = count < 0;
+                        let want = count.unsigned_abs() as usize;
 
-        if entry.is_expired() {
-            return vec![];
-        }
-
-        let set = match entry.data.as_set() {
-            Some(s) => s,
-            None => return vec![],
-        };
-
-        if set.is_empty() {
-            return vec![];
-        }
-
-        let allow_duplicates = count < 0;
-        let want = count.unsigned_abs() as usize;
-
-        if allow_duplicates {
-            // With duplicates, we can return more than the set size
-            // Use simple random selection
-            let members: Vec<Bytes> = set.iter().map(|r| r.clone()).collect();
-            let mut result = Vec::with_capacity(want);
-            for _ in 0..want {
-                let idx = fastrand::usize(..members.len());
-                result.push(members[idx].clone());
+                        if allow_duplicates {
+                            let members: Vec<Bytes> = set.iter().map(|r| r.clone()).collect();
+                            let mut result = Vec::with_capacity(want);
+                            for _ in 0..want {
+                                let idx = fastrand::usize(..members.len());
+                                result.push(members[idx].clone());
+                            }
+                            result
+                        } else {
+                            let take = want.min(set.len());
+                            set.iter().take(take).map(|r| r.clone()).collect()
+                        }
+                    }
+                    None => vec![],
+                }
             }
-            result
-        } else {
-            // Without duplicates, return up to min(count, set.len())
-            let take = want.min(set.len());
-            set.iter().take(take).map(|r| r.clone()).collect()
+            None => vec![],
         }
     }
 
@@ -249,7 +232,6 @@ impl Store {
             return DashSet::new();
         }
 
-        // Get first set
         let first = match self.get_set(&keys[0]) {
             Some(s) => s,
             None => return DashSet::new(),
@@ -259,7 +241,6 @@ impl Store {
             return first;
         }
 
-        // Subtract all other sets
         let result = first;
         for key in &keys[1..] {
             if let Some(other) = self.get_set(key) {
@@ -273,33 +254,25 @@ impl Store {
     }
 
     /// Get intersection of sets
-    /// Optimized to start with smallest set
     #[inline]
     pub fn sinter(&self, keys: &[Bytes]) -> DashSet<Bytes> {
         if keys.is_empty() {
             return DashSet::new();
         }
 
-        // Collect all sets and find smallest
         let mut sets: Vec<DashSet<Bytes>> = Vec::with_capacity(keys.len());
         for key in keys {
             match self.get_set(key) {
                 Some(s) => sets.push(s),
-                None => return DashSet::new(), // Empty set means empty intersection
+                None => return DashSet::new(),
             }
         }
 
-        if sets.is_empty() {
-            return DashSet::new();
-        }
-
-        // Sort by size to start with smallest (optimization)
         sets.sort_by_key(|s| s.len());
 
         let first = sets.remove(0);
         let result = DashSet::new();
 
-        // Only keep members that exist in all sets
         for member in first.iter() {
             let in_all = sets.iter().all(|s| s.contains(&*member));
             if in_all {
@@ -328,48 +301,44 @@ impl Store {
     /// Returns true if member was moved
     #[inline]
     pub fn smove(&self, src: &[u8], dst: Bytes, member: Bytes) -> Result<bool> {
-        // First check if member exists in source
-        {
-            let mut src_entry = match self.data.get_mut(src) {
-                Some(e) => e,
-                None => return Ok(false),
-            };
+        let removed = match self.data_entry(src) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
+                    e.remove();
+                    false
+                } else {
+                    let src_set = match entry.data.as_set_mut() {
+                        Some(s) => s,
+                        None => return Err(Error::WrongType),
+                    };
 
-            if src_entry.is_expired() {
-                drop(src_entry);
-                self.del(src);
-                return Ok(false);
+                    let r = src_set.remove(&member).is_some();
+                    if r && src_set.is_empty() {
+                        e.remove();
+                    }
+                    r
+                }
             }
+            crate::storage::dashtable::Entry::Vacant(_) => false,
+        };
 
-            let src_set = match src_entry.data.as_set_mut() {
-                Some(s) => s,
-                None => return Err(Error::WrongType),
-            };
-
-            if src_set.remove(&member).is_none() {
-                return Ok(false); // Member not in source
-            }
-
-            // Clean up empty source set
-            if src_set.is_empty() {
-                drop(src_entry);
-                self.del(src);
-            }
+        if removed {
+            self.sadd(dst, vec![member])?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-
-        // Add to destination
-        self.sadd(dst, vec![member])?;
-        Ok(true)
     }
 
     /// Helper to get a copy of a set for read operations
     fn get_set(&self, key: &[u8]) -> Option<DashSet<Bytes>> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return None;
                 }
-                e.data.as_set().cloned()
+                entry_ref.1.data.as_set().cloned()
             }
             None => None,
         }
@@ -379,17 +348,17 @@ impl Store {
     pub fn set_store(&self, dst: Bytes, set: DashSet<Bytes>) -> usize {
         let count = set.len();
         if set.is_empty() {
-            self.del(&dst);
+            self.data_remove(&dst);
         } else {
-            match self.data.entry(dst) {
-                DashEntry::Occupied(mut e) => {
-                    let entry = e.get_mut();
+            match self.data_entry(&dst) {
+                crate::storage::dashtable::Entry::Occupied(mut e) => {
+                    let entry = &mut e.get_mut().1;
                     entry.data = DataType::Set(set);
                     entry.persist();
                     entry.bump_version();
                 }
-                DashEntry::Vacant(e) => {
-                    e.insert(Entry::new(DataType::Set(set)));
+                crate::storage::dashtable::Entry::Vacant(e) => {
+                    e.insert((dst, Entry::new(DataType::Set(set))));
                     self.key_count.fetch_add(1, Ordering::Relaxed);
                 }
             }

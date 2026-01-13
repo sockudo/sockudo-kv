@@ -117,7 +117,7 @@ fn cmd_restore(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 
     match store.restore_key(key, ttl, data, replace, absttl) {
         Ok(()) => Ok(RespValue::ok()),
-        Err(msg) => Ok(RespValue::error(msg)),
+        Err(msg) => Ok(RespValue::error(&msg)),
     }
 }
 
@@ -485,8 +485,8 @@ fn sort_impl(store: &Store, args: &[Bytes], read_only: bool) -> Result<RespValue
     }
 
     // Get elements to sort
-    let elements: Vec<Bytes> = match store.data.get(key.as_ref()) {
-        Some(entry) if !entry.is_expired() => match &entry.data {
+    let elements: Vec<Bytes> = match store.data_get(key) {
+        Some(entry_ref) if !entry_ref.1.is_expired() => match &entry_ref.1.data {
             DataType::List(l) => l.iter().cloned().collect(),
             DataType::Set(s) => s.iter().map(|x| x.clone()).collect(),
             DataType::SortedSet(zs) => {
@@ -505,9 +505,9 @@ fn sort_impl(store: &Store, args: &[Bytes], read_only: bool) -> Result<RespValue
             if let Some(pattern) = by_pattern {
                 // BY pattern - look up external key
                 let lookup_key = substitute_pattern(pattern, &e);
-                if let Some(entry) = store.data.get(lookup_key.as_ref())
-                    && !entry.is_expired()
-                    && let Some(s) = entry.data.as_string()
+                if let Some(entry_ref) = store.data_get(&lookup_key)
+                    && !entry_ref.1.is_expired()
+                    && let Some(s) = entry_ref.1.data.as_string()
                 {
                     return (e, parse_sort_key(s, alpha), Some(s.clone()));
                 }
@@ -546,9 +546,9 @@ fn sort_impl(store: &Store, args: &[Bytes], read_only: bool) -> Result<RespValue
                     res.push(e.clone());
                 } else {
                     let lookup_key = substitute_pattern(pattern, e);
-                    if let Some(entry) = store.data.get(lookup_key.as_ref())
-                        && !entry.is_expired()
-                        && let Some(s) = entry.data.as_string()
+                    if let Some(entry_ref) = store.data_get(&lookup_key)
+                        && !entry_ref.1.is_expired()
+                        && let Some(s) = entry_ref.1.data.as_string()
                     {
                         res.push(s.clone());
                         continue;
@@ -564,10 +564,8 @@ fn sort_impl(store: &Store, args: &[Bytes], read_only: bool) -> Result<RespValue
     if let Some(dest) = store_dest {
         use std::collections::VecDeque;
         let list: VecDeque<Bytes> = result.iter().cloned().collect();
-        store.del(dest);
-        store
-            .data
-            .insert(dest.clone(), Entry::new(DataType::List(list)));
+        store.data_remove(dest);
+        store.data_insert(dest.clone(), Entry::new(DataType::List(list)));
         store
             .key_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

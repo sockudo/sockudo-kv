@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use dashmap::mapref::entry::Entry as DashEntry;
 
 use crate::error::{Error, Result};
 use crate::storage::Store;
@@ -15,11 +14,11 @@ impl Store {
     /// Get string value
     #[inline]
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
-        self.data.get(key).and_then(|e| {
-            if e.is_expired() {
+        self.data_get(key).and_then(|e| {
+            if e.1.is_expired() {
                 None
             } else {
-                e.data.as_string().cloned()
+                e.1.data.as_string().cloned()
             }
         })
     }
@@ -27,11 +26,11 @@ impl Store {
     /// Get string value with TTL
     #[inline]
     pub fn get_with_ttl(&self, key: &[u8]) -> Option<(Bytes, Option<i64>)> {
-        self.data.get(key).and_then(|e| {
-            if e.is_expired() {
+        self.data_get(key).and_then(|e| {
+            if e.1.is_expired() {
                 None
             } else {
-                e.data.as_string().cloned().map(|v| (v, e.ttl_ms()))
+                e.1.data.as_string().cloned().map(|v| (v, e.1.ttl_ms()))
             }
         })
     }
@@ -39,15 +38,13 @@ impl Store {
     /// Set string value
     #[inline]
     pub fn set(&self, key: Bytes, value: Bytes) {
-        // Use entry API to avoid returning the old value (just to drop it)
-        match self.data.entry(key) {
-            DashEntry::Vacant(e) => {
-                e.insert(Entry::new(DataType::String(value)));
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                e.insert((key, Entry::new(DataType::String(value))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
             }
-            DashEntry::Occupied(mut e) => {
-                // Fast path: if it's already a string, just replace the value
-                let entry = e.get_mut();
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 match &mut entry.data {
                     DataType::String(s) => {
                         *s = value;
@@ -56,7 +53,6 @@ impl Store {
                         entry.data = DataType::String(value);
                     }
                 }
-                // Reset expiration for standard SET
                 entry.persist();
                 entry.bump_version();
             }
@@ -67,13 +63,13 @@ impl Store {
     #[inline]
     pub fn set_ex(&self, key: Bytes, value: Bytes, expire_ms: i64) {
         let expire_at = now_ms() + expire_ms;
-        match self.data.entry(key) {
-            DashEntry::Vacant(e) => {
-                e.insert(Entry::with_expire(DataType::String(value), expire_at));
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                e.insert((key, Entry::with_expire(DataType::String(value), expire_at)));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
             }
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 match &mut entry.data {
                     DataType::String(s) => {
                         *s = value;
@@ -91,13 +87,16 @@ impl Store {
     /// Set with expiration at timestamp (milliseconds)
     #[inline]
     pub fn set_exat(&self, key: Bytes, value: Bytes, expire_at_ms: i64) {
-        match self.data.entry(key) {
-            DashEntry::Vacant(e) => {
-                e.insert(Entry::with_expire(DataType::String(value), expire_at_ms));
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                e.insert((
+                    key,
+                    Entry::with_expire(DataType::String(value), expire_at_ms),
+                ));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
             }
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 match &mut entry.data {
                     DataType::String(s) => {
                         *s = value;
@@ -115,21 +114,20 @@ impl Store {
     /// Set if not exists
     #[inline]
     pub fn setnx(&self, key: Bytes, value: Bytes) -> bool {
-        let key_clone = key.clone();
-        match self.data.entry(key) {
-            DashEntry::Occupied(e) => {
-                // Key exists - check if expired
-                if e.get().is_expired() {
-                    drop(e);
-                    self.del(&key_clone);
-                    self.set(key_clone, value);
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                if e.get().1.is_expired() {
+                    let entry = &mut e.get_mut().1;
+                    entry.data = DataType::String(value);
+                    entry.persist();
+                    entry.bump_version();
                     true
                 } else {
                     false
                 }
             }
-            DashEntry::Vacant(e) => {
-                e.insert(Entry::new(DataType::String(value)));
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                e.insert((key, Entry::new(DataType::String(value))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 true
             }
@@ -139,7 +137,7 @@ impl Store {
     /// Get and delete
     #[inline]
     pub fn getdel(&self, key: &[u8]) -> Option<Bytes> {
-        self.data.remove(key).and_then(|(_, e)| {
+        self.data_remove(key).and_then(|(_, e)| {
             self.key_count.fetch_sub(1, Ordering::Relaxed);
             if e.is_expired() {
                 None
@@ -152,9 +150,9 @@ impl Store {
     /// Append to string
     #[inline]
     pub fn append(&self, key: Bytes, value: &[u8]) -> Result<usize> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     entry.data = DataType::String(Bytes::copy_from_slice(value));
                     entry.persist();
@@ -177,9 +175,12 @@ impl Store {
                 }
                 result
             }
-            DashEntry::Vacant(e) => {
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let len = value.len();
-                e.insert(Entry::new(DataType::String(Bytes::copy_from_slice(value))));
+                e.insert((
+                    key,
+                    Entry::new(DataType::String(Bytes::copy_from_slice(value))),
+                ));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(len)
             }
@@ -189,13 +190,12 @@ impl Store {
     /// Get string length
     #[inline]
     pub fn strlen(&self, key: &[u8]) -> usize {
-        self.data
-            .get(key)
+        self.data_get(key)
             .and_then(|e| {
-                if e.is_expired() {
+                if e.1.is_expired() {
                     None
                 } else {
-                    e.data.as_string().map(|s| s.len())
+                    e.1.data.as_string().map(|s| s.len())
                 }
             })
             .unwrap_or(0)
@@ -204,9 +204,9 @@ impl Store {
     /// Increment integer value
     #[inline]
     pub fn incr(&self, key: Bytes, delta: i64) -> Result<i64> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     entry.data = DataType::String(Bytes::from(delta.to_string()));
                     entry.persist();
@@ -228,8 +228,11 @@ impl Store {
                     _ => Err(Error::WrongType),
                 }
             }
-            DashEntry::Vacant(e) => {
-                e.insert(Entry::new(DataType::String(Bytes::from(delta.to_string()))));
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                e.insert((
+                    key,
+                    Entry::new(DataType::String(Bytes::from(delta.to_string()))),
+                ));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(delta)
             }
@@ -239,9 +242,9 @@ impl Store {
     /// Increment float value
     #[inline]
     pub fn incr_float(&self, key: Bytes, delta: f64) -> Result<f64> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     let result = format_float(delta);
                     entry.data = DataType::String(Bytes::from(result.clone()));
@@ -268,9 +271,9 @@ impl Store {
                     _ => Err(Error::WrongType),
                 }
             }
-            DashEntry::Vacant(e) => {
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let result = format_float(delta);
-                e.insert(Entry::new(DataType::String(Bytes::from(result))));
+                e.insert((key, Entry::new(DataType::String(Bytes::from(result)))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(delta)
             }
@@ -280,13 +283,12 @@ impl Store {
     /// Get substring
     #[inline]
     pub fn getrange(&self, key: &[u8], start: i64, end: i64) -> Bytes {
-        self.data
-            .get(key)
+        self.data_get(key)
             .and_then(|e| {
-                if e.is_expired() {
+                if e.1.is_expired() {
                     return None;
                 }
-                e.data.as_string().map(|s| {
+                e.1.data.as_string().map(|s| {
                     let len = s.len() as i64;
                     let start = normalize_index(start, len);
                     let end = normalize_index(end, len);
@@ -306,14 +308,16 @@ impl Store {
     /// Set substring
     #[inline]
     pub fn setrange(&self, key: Bytes, offset: usize, value: &[u8]) -> Result<usize> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    entry.data = DataType::String(Bytes::copy_from_slice(value));
+                    let mut bytes = vec![0u8; offset + value.len()];
+                    bytes[offset..offset + value.len()].copy_from_slice(value);
+                    entry.data = DataType::String(Bytes::from(bytes));
                     entry.persist();
                     entry.bump_version();
-                    return Ok(value.len());
+                    return Ok(entry.data.as_string().unwrap().len());
                 }
 
                 let result = match &mut entry.data {
@@ -334,11 +338,11 @@ impl Store {
                 }
                 result
             }
-            DashEntry::Vacant(e) => {
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let mut bytes = vec![0u8; offset + value.len()];
                 bytes[offset..offset + value.len()].copy_from_slice(value);
                 let len = bytes.len();
-                e.insert(Entry::new(DataType::String(Bytes::from(bytes))));
+                e.insert((key, Entry::new(DataType::String(Bytes::from(bytes)))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(len)
             }
@@ -381,13 +385,13 @@ impl Store {
         // Set all keys with expiration
         let expire_at = now_ms() + expire_ms;
         for (key, value) in pairs {
-            match self.data.entry(key) {
-                DashEntry::Vacant(e) => {
-                    e.insert(Entry::with_expire(DataType::String(value), expire_at));
+            match self.data_entry(&key) {
+                crate::storage::dashtable::Entry::Vacant(e) => {
+                    e.insert((key, Entry::with_expire(DataType::String(value), expire_at)));
                     self.key_count.fetch_add(1, Ordering::Relaxed);
                 }
-                DashEntry::Occupied(mut e) => {
-                    let entry = e.get_mut();
+                crate::storage::dashtable::Entry::Occupied(mut e) => {
+                    let entry = &mut e.get_mut().1;
                     match &mut entry.data {
                         DataType::String(s) => {
                             *s = value;
@@ -428,13 +432,16 @@ impl Store {
 
         // Set all keys with expiration at
         for (key, value) in pairs {
-            match self.data.entry(key) {
-                DashEntry::Vacant(e) => {
-                    e.insert(Entry::with_expire(DataType::String(value), expire_at_ms));
+            match self.data_entry(&key) {
+                crate::storage::dashtable::Entry::Vacant(e) => {
+                    e.insert((
+                        key,
+                        Entry::with_expire(DataType::String(value), expire_at_ms),
+                    ));
                     self.key_count.fetch_add(1, Ordering::Relaxed);
                 }
-                DashEntry::Occupied(mut e) => {
-                    let entry = e.get_mut();
+                crate::storage::dashtable::Entry::Occupied(mut e) => {
+                    let entry = &mut e.get_mut().1;
                     match &mut entry.data {
                         DataType::String(s) => {
                             *s = value;

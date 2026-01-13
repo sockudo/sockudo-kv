@@ -210,9 +210,9 @@ fn sample_volatile_keys(store: &Arc<Store>, samples: usize) -> Vec<(Bytes, i64)>
     for _ in 0..samples {
         let skip = fastrand::usize(0..len.max(1));
         if let Some(entry) = store.data.iter().nth(skip) {
-            let e = entry.value();
+            let e = &entry.1;
             if !e.is_expired() && e.has_expire() {
-                result.push((entry.key().clone(), e.idle_time()));
+                result.push((entry.0.clone(), e.idle_time()));
             }
         }
         if result.len() >= samples {
@@ -234,9 +234,9 @@ fn sample_all_keys(store: &Arc<Store>, samples: usize) -> Vec<(Bytes, i64)> {
     for _ in 0..samples {
         let skip = fastrand::usize(0..len.max(1));
         if let Some(entry) = store.data.iter().nth(skip) {
-            let e = entry.value();
+            let e = &entry.1;
             if !e.is_expired() {
-                result.push((entry.key().clone(), e.idle_time()));
+                result.push((entry.0.clone(), e.idle_time()));
             }
         }
         if result.len() >= samples {
@@ -258,9 +258,9 @@ fn sample_volatile_keys_lfu(store: &Arc<Store>, samples: usize) -> Vec<(Bytes, u
     for _ in 0..samples {
         let skip = fastrand::usize(0..len.max(1));
         if let Some(entry) = store.data.iter().nth(skip) {
-            let e = entry.value();
+            let e = &entry.1;
             if !e.is_expired() && e.has_expire() {
-                result.push((entry.key().clone(), e.lfu_counter()));
+                result.push((entry.0.clone(), e.lfu_counter()));
             }
         }
         if result.len() >= samples {
@@ -282,9 +282,9 @@ fn sample_all_keys_lfu(store: &Arc<Store>, samples: usize) -> Vec<(Bytes, u8)> {
     for _ in 0..samples {
         let skip = fastrand::usize(0..len.max(1));
         if let Some(entry) = store.data.iter().nth(skip) {
-            let e = entry.value();
+            let e = &entry.1;
             if !e.is_expired() {
-                result.push((entry.key().clone(), e.lfu_counter()));
+                result.push((entry.0.clone(), e.lfu_counter()));
             }
         }
         if result.len() >= samples {
@@ -306,11 +306,11 @@ fn sample_volatile_keys_ttl(store: &Arc<Store>, samples: usize) -> Vec<(Bytes, i
     for _ in 0..samples {
         let skip = fastrand::usize(0..len.max(1));
         if let Some(entry) = store.data.iter().nth(skip) {
-            let e = entry.value();
+            let e = &entry.1;
             if !e.is_expired()
                 && let Some(ttl) = e.ttl_ms()
             {
-                result.push((entry.key().clone(), ttl));
+                result.push((entry.0.clone(), ttl));
             }
         }
         if result.len() >= samples {

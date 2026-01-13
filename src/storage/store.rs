@@ -1,23 +1,23 @@
 use bytes::Bytes;
-use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::dashtable::{DashTable, calculate_hash};
 use super::ops::search_ops::SearchIndex;
 use super::types::Entry;
 
-/// Lock-free key-value store backed by DashMap.
+/// Lock-free key-value store backed by DashTable.
 /// Provides O(1) concurrent access with minimal contention.
 ///
 /// Type-specific operations are implemented in separate modules under `ops/`
 pub struct Store {
-    /// The main data store - sharded concurrent hashmap
-    pub(crate) data: DashMap<Bytes, Entry>,
+    /// The main data store - sharded concurrent hash table
+    pub(crate) data: DashTable<(Bytes, Entry)>,
     /// Track approximate key count for INFO command
     pub(crate) key_count: AtomicU64,
     /// Search indexes: index_name -> SearchIndex
-    pub(crate) search_indexes: DashMap<Bytes, SearchIndex>,
+    pub(crate) search_indexes: DashTable<(Bytes, SearchIndex)>,
     /// Search aliases: alias -> index_name
-    pub(crate) search_aliases: DashMap<Bytes, Bytes>,
+    pub(crate) search_aliases: DashTable<(Bytes, Bytes)>,
 }
 
 impl Store {
@@ -37,15 +37,15 @@ impl Store {
             .map(|p| p.get())
             .unwrap_or(4);
         // Clamp to reasonable range: min 4, max 64 shards
-        let shard_count = num_cpus.clamp(4, 64);
+        let shard_count = num_cpus.clamp(4, 64).next_power_of_two();
 
         Self {
             // Dynamic shards based on CPU count for optimal concurrency
-            data: DashMap::with_capacity_and_shard_amount(capacity, shard_count),
+            data: DashTable::with_capacity_and_shard_amount(capacity, shard_count),
             key_count: AtomicU64::new(0),
             // Metadata maps rarely used, minimal 2 shards
-            search_indexes: DashMap::with_capacity_and_shard_amount(0, 2),
-            search_aliases: DashMap::with_capacity_and_shard_amount(0, 2),
+            search_indexes: DashTable::with_shard_amount(2),
+            search_aliases: DashTable::with_shard_amount(2),
         }
     }
 
@@ -54,24 +54,27 @@ impl Store {
     /// Check if key exists (and not expired)
     #[inline]
     pub fn exists(&self, key: &[u8]) -> bool {
-        match self.data.get(key) {
-            Some(entry) => {
-                if entry.is_expired() {
-                    drop(entry);
-                    self.del(key);
+        let h = calculate_hash(key);
+        match self
+            .data
+            .entry(h, |kv| kv.0 == key, |kv| calculate_hash(&kv.0))
+        {
+            crate::storage::dashtable::Entry::Occupied(e) => {
+                if e.get().1.is_expired() {
+                    e.remove();
                     false
                 } else {
                     true
                 }
             }
-            None => false,
+            crate::storage::dashtable::Entry::Vacant(_) => false,
         }
     }
 
     /// Delete a key
     #[inline]
     pub fn del(&self, key: &[u8]) -> bool {
-        if self.data.remove(key).is_some() {
+        if self.data_remove(key).is_some() {
             self.key_count.fetch_sub(1, Ordering::Relaxed);
             true
         } else {
@@ -79,23 +82,16 @@ impl Store {
         }
     }
 
-    /// Get key type
-    #[inline]
-    pub fn key_type(&self, key: &[u8]) -> Option<&'static str> {
-        self.data.get(key).and_then(|e| {
-            if e.is_expired() {
-                None
-            } else {
-                Some(e.data.type_name())
-            }
-        })
-    }
-
     /// Set expiration (milliseconds from now)
     #[inline]
     pub fn expire(&self, key: &[u8], ms: i64) -> bool {
-        match self.data.get(key) {
-            Some(entry) => {
+        let h = calculate_hash(key);
+        match self
+            .data
+            .entry(h, |kv| kv.0 == key, |kv| calculate_hash(&kv.0))
+        {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     false
                 } else {
@@ -103,38 +99,26 @@ impl Store {
                     true
                 }
             }
-            None => false,
-        }
-    }
-
-    /// Remove expiration
-    #[inline]
-    pub fn persist(&self, key: &[u8]) -> bool {
-        match self.data.get(key) {
-            Some(entry) => {
-                if entry.is_expired() {
-                    false
-                } else {
-                    entry.persist();
-                    true
-                }
-            }
-            None => false,
+            crate::storage::dashtable::Entry::Vacant(_) => false,
         }
     }
 
     /// Get TTL in milliseconds (-2 if not exists, -1 if no expiration)
     #[inline]
     pub fn pttl(&self, key: &[u8]) -> i64 {
-        match self.data.get(key) {
-            Some(entry) => {
-                if entry.is_expired() {
+        let h = calculate_hash(key);
+        match self
+            .data
+            .entry(h, |kv| kv.0 == key, |kv| calculate_hash(&kv.0))
+        {
+            crate::storage::dashtable::Entry::Occupied(e) => {
+                if e.get().1.is_expired() {
                     -2
                 } else {
-                    entry.ttl_ms().unwrap_or(-1)
+                    e.get().1.ttl_ms().unwrap_or(-1)
                 }
             }
-            None => -2,
+            crate::storage::dashtable::Entry::Vacant(_) => -2,
         }
     }
 
@@ -150,22 +134,23 @@ impl Store {
         self.len() == 0
     }
 
-    /// Clear all keys
-    pub fn flush(&self) {
-        self.data.clear();
-        self.key_count.store(0, Ordering::Relaxed);
-    }
-
     /// Get key version for WATCH (returns 0 if key doesn't exist)
     #[inline]
     pub fn get_version(&self, key: &[u8]) -> Option<u64> {
-        self.data.get(key).and_then(|entry| {
-            if entry.is_expired() {
-                None
-            } else {
-                Some(entry.version())
+        let h = calculate_hash(key);
+        match self
+            .data
+            .entry(h, |kv| kv.0 == key, |kv| calculate_hash(&kv.0))
+        {
+            crate::storage::dashtable::Entry::Occupied(e) => {
+                if e.get().1.is_expired() {
+                    None
+                } else {
+                    Some(e.get().1.version())
+                }
             }
-        })
+            crate::storage::dashtable::Entry::Vacant(_) => None,
+        }
     }
 
     /// Iterate over all keys (for cluster slot operations)
@@ -175,11 +160,49 @@ impl Store {
     where
         F: FnMut(&[u8]),
     {
-        for entry in self.data.iter() {
-            if !entry.value().is_expired() {
-                f(entry.key());
+        for kv in self.data.iter() {
+            if !kv.1.is_expired() {
+                f(&kv.0);
             }
         }
+    }
+
+    // ==================== DashTable Helpers ====================
+
+    #[inline]
+    pub(crate) fn data_get(
+        &self,
+        key: &[u8],
+    ) -> Option<super::dashtable::ReadOnlyRef<'_, (Bytes, Entry)>> {
+        let h = calculate_hash(key);
+        self.data.get(h, |kv| kv.0 == key)
+    }
+
+    #[inline]
+    pub(crate) fn data_entry<'a>(
+        &'a self,
+        key: &[u8],
+    ) -> super::dashtable::Entry<'a, (Bytes, Entry)> {
+        let h = calculate_hash(key);
+        self.data
+            .entry(h, |kv| kv.0 == key, |kv| calculate_hash(&kv.0))
+    }
+
+    #[inline]
+    pub(crate) fn data_remove(&self, key: &[u8]) -> Option<(Bytes, Entry)> {
+        let h = calculate_hash(key);
+        self.data.remove(h, |kv| kv.0 == key)
+    }
+
+    #[inline]
+    pub(crate) fn data_insert(&self, key: Bytes, entry: Entry) -> Option<(Bytes, Entry)> {
+        let h = calculate_hash(&key);
+        self.data.insert(
+            h,
+            (key.clone(), entry),
+            |kv| kv.0 == key,
+            |kv| calculate_hash(&kv.0),
+        )
     }
 }
 

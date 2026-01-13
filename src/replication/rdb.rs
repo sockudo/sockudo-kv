@@ -4,8 +4,8 @@
 
 use bytes::Bytes;
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
 
+use crate::storage::dashtable::{DashTable, calculate_hash};
 use crate::storage::{DataType, Entry, SortedSetData, now_ms};
 
 /// RDB opcodes
@@ -63,9 +63,9 @@ pub fn generate_rdb(multi_store: &crate::storage::MultiStore) -> Bytes {
         let mut key_count = 0usize;
         let mut expire_count = 0usize;
         for entry in store.data.iter() {
-            if !entry.value().is_expired() {
+            if !entry.1.is_expired() {
                 key_count += 1;
-                if entry.value().ttl_ms().is_some() {
+                if entry.1.ttl_ms().is_some() {
                     expire_count += 1;
                 }
             }
@@ -78,8 +78,8 @@ pub fn generate_rdb(multi_store: &crate::storage::MultiStore) -> Bytes {
 
         // Write all keys
         for entry in store.data.iter() {
-            let key = entry.key();
-            let value = entry.value();
+            let key = &entry.0;
+            let value = &entry.1;
 
             // Skip expired
             if value.is_expired() {
@@ -138,9 +138,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType) {
             rdb.push(RDB_TYPE_HASH);
             write_string(rdb, key);
             write_length(rdb, hash.len());
-            for entry in hash.iter() {
-                write_string(rdb, entry.key());
-                write_string(rdb, entry.value());
+            for item in hash.iter() {
+                write_string(rdb, &item.0);
+                write_string(rdb, &item.1);
             }
         }
         DataType::SortedSet(zset) => {
@@ -324,10 +324,10 @@ pub fn load_rdb(data: &[u8], multi_store: &crate::storage::MultiStore) -> Result
                     list.push_back(item);
                 }
 
+                store.data_insert(key.clone(), Entry::new(DataType::List(list)));
                 store
-                    .data
-                    .insert(key.clone(), Entry::new(DataType::List(list)));
-                store.key_count.fetch_add(1, Ordering::Relaxed);
+                    .key_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             RDB_TYPE_SET => {
                 let (key, klen) = read_string(&data[cursor..])?;
@@ -342,10 +342,10 @@ pub fn load_rdb(data: &[u8], multi_store: &crate::storage::MultiStore) -> Result
                     set.insert(member);
                 }
 
+                store.data_insert(key.clone(), Entry::new(DataType::Set(set)));
                 store
-                    .data
-                    .insert(key.clone(), Entry::new(DataType::Set(set)));
-                store.key_count.fetch_add(1, Ordering::Relaxed);
+                    .key_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             RDB_TYPE_HASH => {
                 let (key, klen) = read_string(&data[cursor..])?;
@@ -353,19 +353,20 @@ pub fn load_rdb(data: &[u8], multi_store: &crate::storage::MultiStore) -> Result
                 let (hash_len, hlen) = read_length(&data[cursor..])?;
                 cursor += hlen;
 
-                let hash = dashmap::DashMap::new();
+                let hash = DashTable::new();
                 for _ in 0..hash_len {
                     let (field, flen) = read_string(&data[cursor..])?;
                     cursor += flen;
                     let (value, vlen) = read_string(&data[cursor..])?;
                     cursor += vlen;
-                    hash.insert(field, value);
+                    let h = calculate_hash(&field);
+                    hash.insert_unique(h, (field, value), |kv| calculate_hash(&kv.0));
                 }
 
+                store.data_insert(key.clone(), Entry::new(DataType::Hash(hash)));
                 store
-                    .data
-                    .insert(key.clone(), Entry::new(DataType::Hash(hash)));
-                store.key_count.fetch_add(1, Ordering::Relaxed);
+                    .key_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             RDB_TYPE_ZSET => {
                 let (key, klen) = read_string(&data[cursor..])?;
@@ -382,10 +383,10 @@ pub fn load_rdb(data: &[u8], multi_store: &crate::storage::MultiStore) -> Result
                     zset.insert(member, score);
                 }
 
+                store.data_insert(key.clone(), Entry::new(DataType::SortedSet(zset)));
                 store
-                    .data
-                    .insert(key.clone(), Entry::new(DataType::SortedSet(zset)));
-                store.key_count.fetch_add(1, Ordering::Relaxed);
+                    .key_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             _ => {
                 // Skip unknown type

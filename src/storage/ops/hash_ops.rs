@@ -1,6 +1,5 @@
+use crate::storage::dashtable::{DashTable, calculate_hash};
 use bytes::Bytes;
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry as DashEntry;
 
 use crate::error::{Error, Result};
 use crate::storage::Store;
@@ -15,13 +14,16 @@ impl Store {
     /// Set field in hash
     #[inline]
     pub fn hset(&self, key: Bytes, fields: Vec<(Bytes, Bytes)>) -> Result<usize> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    let hash = DashMap::new();
+                    let hash = DashTable::new();
                     for (field, value) in &fields {
-                        hash.insert(field.clone(), value.clone());
+                        let h = calculate_hash(field);
+                        hash.insert_unique(h, (field.clone(), value.clone()), |kv| {
+                            calculate_hash(&kv.0)
+                        });
                     }
                     let count = hash.len();
                     entry.data = DataType::Hash(hash);
@@ -30,12 +32,19 @@ impl Store {
                     return Ok(count);
                 }
 
-                match &entry.data {
+                match &mut entry.data {
                     DataType::Hash(hash) => {
                         let mut new_fields = 0;
                         for (field, value) in &fields {
-                            if hash.insert(field.clone(), value.clone()).is_none() {
-                                new_fields += 1;
+                            let h = calculate_hash(field);
+                            match hash.entry(h, |kv| kv.0 == *field, |kv| calculate_hash(&kv.0)) {
+                                crate::storage::dashtable::Entry::Occupied(mut e) => {
+                                    e.get_mut().1 = value.clone();
+                                }
+                                crate::storage::dashtable::Entry::Vacant(e) => {
+                                    e.insert((field.clone(), value.clone()));
+                                    new_fields += 1;
+                                }
                             }
                         }
                         entry.bump_version();
@@ -44,13 +53,16 @@ impl Store {
                     _ => Err(Error::WrongType),
                 }
             }
-            DashEntry::Vacant(e) => {
-                let hash = DashMap::new();
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                let hash = DashTable::new();
                 for (field, value) in &fields {
-                    hash.insert(field.clone(), value.clone());
+                    let h = calculate_hash(field);
+                    hash.insert_unique(h, (field.clone(), value.clone()), |kv| {
+                        calculate_hash(&kv.0)
+                    });
                 }
                 let count = hash.len();
-                e.insert(Entry::new(DataType::Hash(hash)));
+                e.insert((key, Entry::new(DataType::Hash(hash))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(count)
             }
@@ -60,13 +72,17 @@ impl Store {
     /// Get field from hash
     #[inline]
     pub fn hget(&self, key: &[u8], field: &[u8]) -> Option<Bytes> {
-        self.data.get(key).and_then(|e| {
-            if e.is_expired() {
+        self.data_get(key).and_then(|e| {
+            if e.1.is_expired() {
                 None
             } else {
-                e.data
-                    .as_hash()
-                    .and_then(|h| h.get(field).map(|v| v.clone()))
+                e.1.data.as_hash().and_then(|h| {
+                    let h_val = calculate_hash(field);
+                    match h.get(h_val, |kv| kv.0 == field) {
+                        Some(kv) => Some(kv.1.clone()),
+                        None => None,
+                    }
+                })
             }
         })
     }
@@ -74,52 +90,53 @@ impl Store {
     /// Delete fields from hash
     #[inline]
     pub fn hdel(&self, key: &[u8], fields: &[Bytes]) -> usize {
-        match self.data.get_mut(key) {
-            Some(mut e) => {
-                let entry = e.value_mut();
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    drop(e);
-                    self.del(key);
+                    e.remove();
                     return 0;
                 }
 
-                match &entry.data {
+                let (count, is_empty) = match &mut entry.data {
                     DataType::Hash(hash) => {
                         let mut count = 0;
                         for field in fields {
-                            if hash.remove(field).is_some() {
+                            let h = calculate_hash(field);
+                            if let crate::storage::dashtable::Entry::Occupied(e) =
+                                hash.entry(h, |kv| kv.0 == *field, |kv| calculate_hash(&kv.0))
+                            {
+                                e.remove();
                                 count += 1;
                             }
                         }
-                        if count > 0 {
-                            entry.bump_version();
-                        }
-                        if hash.is_empty() {
-                            drop(e);
-                            self.del(key);
-                        }
-                        count
+                        (count, hash.is_empty())
                     }
-                    _ => 0,
+                    _ => (0, false),
+                };
+
+                if count > 0 {
+                    entry.bump_version();
                 }
+                if is_empty {
+                    e.remove();
+                }
+                count
             }
-            None => 0,
+            crate::storage::dashtable::Entry::Vacant(_) => 0,
         }
     }
 
     /// Get all fields and values from hash
     #[inline]
     pub fn hgetall(&self, key: &[u8]) -> Vec<(Bytes, Bytes)> {
-        match self.data.get(key) {
+        match self.data_get(key) {
             Some(e) => {
-                if e.is_expired() {
+                if e.1.is_expired() {
                     return vec![];
                 }
-                match e.data.as_hash() {
-                    Some(hash) => hash
-                        .iter()
-                        .map(|kv| (kv.key().clone(), kv.value().clone()))
-                        .collect(),
+                match e.1.data.as_hash() {
+                    Some(hash) => hash.iter().map(|kv| (kv.0.clone(), kv.1.clone())).collect(),
                     None => vec![],
                 }
             }
@@ -130,12 +147,12 @@ impl Store {
     /// Get hash length
     #[inline]
     pub fn hlen(&self, key: &[u8]) -> usize {
-        match self.data.get(key) {
+        match self.data_get(key) {
             Some(e) => {
-                if e.is_expired() {
+                if e.1.is_expired() {
                     return 0;
                 }
-                match e.data.as_hash() {
+                match e.1.data.as_hash() {
                     Some(hash) => hash.len(),
                     None => 0,
                 }
@@ -147,13 +164,16 @@ impl Store {
     /// Check if hash field exists
     #[inline]
     pub fn hexists(&self, key: &[u8], field: &[u8]) -> bool {
-        match self.data.get(key) {
+        match self.data_get(key) {
             Some(e) => {
-                if e.is_expired() {
+                if e.1.is_expired() {
                     return false;
                 }
-                match e.data.as_hash() {
-                    Some(hash) => hash.contains_key(field),
+                match e.1.data.as_hash() {
+                    Some(hash) => {
+                        let h = calculate_hash(field);
+                        hash.get(h, |kv| kv.0 == field).is_some()
+                    }
                     None => false,
                 }
             }
@@ -161,93 +181,119 @@ impl Store {
         }
     }
 
-    /// Increment hash field by integer
     #[inline]
     pub fn hincrby(&self, key: Bytes, field: Bytes, delta: i64) -> Result<i64> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    let hash = DashMap::new();
-                    hash.insert(field, Bytes::from(delta.to_string()));
+                    let hash = DashTable::new();
+                    let h = calculate_hash(&field);
+                    hash.insert_unique(h, (field, Bytes::from(delta.to_string())), |kv| {
+                        calculate_hash(&kv.0)
+                    });
                     entry.data = DataType::Hash(hash);
                     entry.persist();
                     entry.bump_version();
                     return Ok(delta);
                 }
 
-                match &entry.data {
-                    DataType::Hash(hash) => match hash.get(&field) {
-                        Some(val) => {
-                            let current: i64 = std::str::from_utf8(&val)
-                                .map_err(|_| Error::NotInteger)?
-                                .parse()
-                                .map_err(|_| Error::NotInteger)?;
-                            let new_val = current.checked_add(delta).ok_or(Error::Overflow)?;
-                            drop(val);
-                            hash.insert(field, Bytes::from(new_val.to_string()));
-                            entry.bump_version();
-                            Ok(new_val)
+                let result = match &mut entry.data {
+                    DataType::Hash(hash) => {
+                        let h = calculate_hash(&field);
+                        match hash.entry(h, |kv| kv.0 == field, |kv| calculate_hash(&kv.0)) {
+                            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                                let kv = e.get_mut();
+                                let current: i64 = std::str::from_utf8(&kv.1)
+                                    .map_err(|_| Error::NotInteger)?
+                                    .parse()
+                                    .map_err(|_| Error::NotInteger)?;
+                                let new_val = current.checked_add(delta).ok_or(Error::Overflow)?;
+                                kv.1 = Bytes::from(new_val.to_string());
+                                Ok(new_val)
+                            }
+                            crate::storage::dashtable::Entry::Vacant(e) => {
+                                e.insert((field, Bytes::from(delta.to_string())));
+                                Ok(delta)
+                            }
                         }
-                        None => {
-                            hash.insert(field, Bytes::from(delta.to_string()));
-                            entry.bump_version();
-                            Ok(delta)
-                        }
-                    },
+                    }
                     _ => Err(Error::WrongType),
+                };
+
+                if result.is_ok() {
+                    entry.bump_version();
                 }
+                result
             }
-            DashEntry::Vacant(e) => {
-                let hash = DashMap::new();
-                hash.insert(field, Bytes::from(delta.to_string()));
-                e.insert(Entry::new(DataType::Hash(hash)));
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                let hash = DashTable::new();
+                let h = calculate_hash(&field);
+                hash.insert_unique(h, (field, Bytes::from(delta.to_string())), |kv| {
+                    calculate_hash(&kv.0)
+                });
+                e.insert((key, Entry::new(DataType::Hash(hash))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(delta)
             }
         }
     }
+
     #[inline]
     pub fn hincrbyfloat(&self, key: Bytes, field: Bytes, delta: f64) -> Result<f64> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    let hash = DashMap::new();
-                    hash.insert(field, Bytes::from(delta.to_string()));
+                    let hash = DashTable::new();
+                    let h = calculate_hash(&field);
+                    hash.insert_unique(h, (field, Bytes::from(delta.to_string())), |kv| {
+                        calculate_hash(&kv.0)
+                    });
                     entry.data = DataType::Hash(hash);
                     entry.persist();
                     entry.bump_version();
                     return Ok(delta);
                 }
 
-                match &entry.data {
+                let result = match &mut entry.data {
                     DataType::Hash(hash) => {
-                        let new_val = if let Some(val) = hash.get(&field) {
-                            let current: f64 = std::str::from_utf8(&val)
-                                .map_err(|_| Error::NotFloat)?
-                                .parse()
-                                .map_err(|_| Error::NotFloat)?;
-                            let result = current + delta;
-                            // Check for overflow (infinity) or NaN
-                            if result.is_infinite() || result.is_nan() {
-                                return Err(Error::Overflow);
+                        let h = calculate_hash(&field);
+                        match hash.entry(h, |kv| kv.0 == field, |kv| calculate_hash(&kv.0)) {
+                            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                                let kv = e.get_mut();
+                                let current: f64 = std::str::from_utf8(&kv.1)
+                                    .map_err(|_| Error::NotFloat)?
+                                    .parse()
+                                    .map_err(|_| Error::NotFloat)?;
+                                let result = current + delta;
+                                if result.is_infinite() || result.is_nan() {
+                                    return Err(Error::Overflow);
+                                }
+                                kv.1 = Bytes::from(result.to_string());
+                                Ok(result)
                             }
-                            result
-                        } else {
-                            delta
-                        };
-                        hash.insert(field, Bytes::from(new_val.to_string()));
-                        entry.bump_version();
-                        Ok(new_val)
+                            crate::storage::dashtable::Entry::Vacant(e) => {
+                                e.insert((field, Bytes::from(delta.to_string())));
+                                Ok(delta)
+                            }
+                        }
                     }
                     _ => Err(Error::WrongType),
+                };
+
+                if result.is_ok() {
+                    entry.bump_version();
                 }
+                result
             }
-            DashEntry::Vacant(e) => {
-                let hash = DashMap::new();
-                hash.insert(field, Bytes::from(delta.to_string()));
-                e.insert(Entry::new(DataType::Hash(hash)));
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                let hash = DashTable::new();
+                let h = calculate_hash(&field);
+                hash.insert_unique(h, (field, Bytes::from(delta.to_string())), |kv| {
+                    calculate_hash(&kv.0)
+                });
+                e.insert((key, Entry::new(DataType::Hash(hash))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(delta)
             }

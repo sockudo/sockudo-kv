@@ -25,7 +25,7 @@ itoa = "1"
 socket2 = { version = "0.6", features = ["all"] }
 sonic-rs = "0.5"
 fastrand = "2"
-mlua = { version = "0.11", features = ["luajit", "serialize"] }
+mlua = { version = "0.11", features = ["luajit", "serialize", "vendored"] }
 parking_lot = "0.12"
 roaring = "0.11"
 mimalloc = { version = "*", features = ["v3"] }
@@ -44,6 +44,9 @@ rustls-pemfile = "2"
 log = "0.4.29"
 rand = "0.9.2"
 env_logger = "0.11.8"
+hashbrown = "0.16.1"
+crossbeam-utils = "0.8.21"
+ahash = "0.8.12"
 
 
 [profile.release]
@@ -54,3 +57,6 @@ opt-level = 3
 
 [profile.dev]
 opt-level = 1
+
+[dev-dependencies]
+sweep-bptree = "0.4.0"

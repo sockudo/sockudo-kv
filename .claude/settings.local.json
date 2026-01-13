@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Bash(grep:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(git -C /home/radud/Desktop/Code/Rust/sockudo-kv add CLAUDE.md)",
+      "Bash(git -C /home/radud/Desktop/Code/Rust/sockudo-kv commit -m \"$\\(cat <<''EOF''\nAdd CLAUDE.md for Claude Code guidance\n\nProvides build commands, architecture overview, and development\npatterns for AI-assisted development.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git -C /home/radud/Desktop/Code/Rust/sockudo-kv status:*)"
+    ]
+  }
+}

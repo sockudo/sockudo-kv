@@ -1,5 +1,6 @@
+use super::dashtable::DashTable;
 use bytes::Bytes;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashSet;
 use sonic_rs::Value as JsonValue;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -7,7 +8,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use super::value::now_ms;
 
 /// All Redis data types
-#[derive(Debug)]
+/// All Redis data types
 pub enum DataType {
     /// String - raw bytes
     String(Bytes),
@@ -16,7 +17,7 @@ pub enum DataType {
     /// Set - unordered unique strings
     Set(DashSet<Bytes>),
     /// Hash - field-value pairs
-    Hash(DashMap<Bytes, Bytes>),
+    Hash(DashTable<(Bytes, Bytes)>),
     /// Sorted Set - unique strings ordered by score
     SortedSet(SortedSetData),
     /// Stream - append-only log
@@ -29,6 +30,23 @@ pub enum DataType {
     TimeSeries(Box<super::timeseries::TimeSeries>),
     /// VectorSet - HNSW-based vector similarity search
     VectorSet(Box<VectorSetData>),
+}
+
+impl std::fmt::Debug for DataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataType::String(s) => f.debug_tuple("String").field(s).finish(),
+            DataType::List(l) => f.debug_tuple("List").field(l).finish(),
+            DataType::Set(s) => f.debug_tuple("Set").field(s).finish(),
+            DataType::Hash(_) => f.debug_struct("Hash").finish(), // DashTable doesn't impl Debug
+            DataType::SortedSet(z) => f.debug_tuple("SortedSet").field(z).finish(),
+            DataType::Stream(s) => f.debug_tuple("Stream").field(s).finish(),
+            DataType::HyperLogLog(h) => f.debug_tuple("HyperLogLog").field(h).finish(),
+            DataType::Json(j) => f.debug_tuple("Json").field(j).finish(),
+            DataType::TimeSeries(ts) => f.debug_tuple("TimeSeries").field(ts).finish(),
+            DataType::VectorSet(v) => f.debug_tuple("VectorSet").field(v).finish(),
+        }
+    }
 }
 
 impl DataType {
@@ -97,7 +115,7 @@ impl DataType {
     }
 
     #[inline]
-    pub fn as_hash(&self) -> Option<&DashMap<Bytes, Bytes>> {
+    pub fn as_hash(&self) -> Option<&DashTable<(Bytes, Bytes)>> {
         match self {
             DataType::Hash(h) => Some(h),
             _ => None,
@@ -791,8 +809,9 @@ impl Entry {
     }
 
     #[inline]
-    pub fn persist(&self) {
-        self.expire_at.store(Self::NO_EXPIRE, Ordering::Relaxed);
+    pub fn persist(&self) -> bool {
+        let old = self.expire_at.swap(Self::NO_EXPIRE, Ordering::Relaxed);
+        old != Self::NO_EXPIRE
     }
 
     #[inline]

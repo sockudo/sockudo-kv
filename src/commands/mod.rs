@@ -351,9 +351,9 @@ fn cmd_type(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.len() != 1 {
         return Err(Error::WrongArity("TYPE"));
     }
-    let type_str = store.key_type(&args[0]).unwrap_or("none");
+    let type_name = store.key_type(&args[0]).unwrap_or("none");
     Ok(RespValue::SimpleString(Bytes::copy_from_slice(
-        type_str.as_bytes(),
+        type_name.as_bytes(),
     )))
 }
 

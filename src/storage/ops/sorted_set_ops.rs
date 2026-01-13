@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use dashmap::mapref::entry::Entry as DashEntry;
 
 use crate::error::{Error, Result};
 use crate::storage::Store;
@@ -14,9 +13,9 @@ impl Store {
     /// Add members with scores to sorted set
     #[inline]
     pub fn zadd(&self, key: Bytes, members: Vec<(f64, Bytes)>) -> Result<usize> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     let mut zset = SortedSetData::new();
                     for (score, member) in &members {
@@ -46,13 +45,13 @@ impl Store {
                 }
                 result
             }
-            DashEntry::Vacant(e) => {
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let mut zset = SortedSetData::new();
                 for (score, member) in &members {
                     zset.insert(member.clone(), *score);
                 }
                 let count = zset.len();
-                e.insert(Entry::new(DataType::SortedSet(zset)));
+                e.insert((key, Entry::new(DataType::SortedSet(zset))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(count)
             }
@@ -62,12 +61,12 @@ impl Store {
     /// Get score of member in sorted set
     #[inline]
     pub fn zscore(&self, key: &[u8], member: &[u8]) -> Option<f64> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return None;
                 }
-                match e.data.as_sorted_set() {
+                match entry_ref.1.data.as_sorted_set() {
                     Some(zset) => zset.score(member),
                     None => None,
                 }
@@ -79,12 +78,12 @@ impl Store {
     /// Get sorted set cardinality (number of members)
     #[inline]
     pub fn zcard(&self, key: &[u8]) -> usize {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return 0;
                 }
-                match e.data.as_sorted_set() {
+                match entry_ref.1.data.as_sorted_set() {
                     Some(zset) => zset.len(),
                     None => 0,
                 }
@@ -96,12 +95,12 @@ impl Store {
     /// Get rank of member in sorted set (0-indexed, ascending order)
     #[inline]
     pub fn zrank(&self, key: &[u8], member: &[u8]) -> Option<usize> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return None;
                 }
-                match e.data.as_sorted_set() {
+                match entry_ref.1.data.as_sorted_set() {
                     Some(zset) => zset.rank(member),
                     None => None,
                 }
@@ -119,32 +118,32 @@ impl Store {
         stop: i64,
         with_scores: bool,
     ) -> Vec<(Bytes, Option<f64>)> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match e.data.as_sorted_set() {
+                match entry_ref.1.data.as_sorted_set() {
                     Some(zset) => {
                         let len = zset.len() as i64;
                         if len == 0 {
                             return vec![];
                         }
 
-                        let start = normalize_index(start, len);
-                        let stop = normalize_index(stop, len);
+                        let start_idx = normalize_index(start, len);
+                        let stop_idx = normalize_index(stop, len);
 
-                        if start > stop || start >= len {
+                        if start_idx > stop_idx || start_idx >= len {
                             return vec![];
                         }
 
-                        let start = start.max(0) as usize;
-                        let stop = (stop + 1).min(len) as usize;
+                        let start_idx = start_idx.max(0) as usize;
+                        let stop_idx = (stop_idx + 1).min(len) as usize;
 
                         zset.by_score
                             .iter()
-                            .skip(start)
-                            .take(stop - start)
+                            .skip(start_idx)
+                            .take(stop_idx - start_idx)
                             .map(|((score, member), _)| {
                                 let score_opt = if with_scores { Some(score.0) } else { None };
                                 (member.clone(), score_opt)
@@ -161,50 +160,47 @@ impl Store {
     /// Remove members from sorted set. Returns number removed.
     #[inline]
     pub fn zrem(&self, key: &[u8], members: &[Bytes]) -> usize {
-        let mut entry = match self.data.get_mut(key) {
-            Some(e) => e,
-            None => return 0,
-        };
-
-        if entry.is_expired() {
-            drop(entry);
-            self.del(key);
-            return 0;
-        }
-
-        let (removed, is_empty) = {
-            let zset = match entry.data.as_sorted_set_mut() {
-                Some(z) => z,
-                None => return 0,
-            };
-
-            let mut removed = 0;
-            for member in members {
-                if zset.remove(member) {
-                    removed += 1;
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
+                    e.remove();
+                    return 0;
                 }
+
+                let (removed, is_empty) = {
+                    let zset = match entry.data.as_sorted_set_mut() {
+                        Some(z) => z,
+                        None => return 0,
+                    };
+
+                    let mut removed = 0;
+                    for member in members {
+                        if zset.remove(member) {
+                            removed += 1;
+                        }
+                    }
+                    (removed, zset.is_empty())
+                };
+
+                if removed > 0 {
+                    entry.bump_version();
+                }
+                if is_empty {
+                    e.remove();
+                }
+                removed
             }
-            (removed, zset.is_empty())
-        };
-
-        if removed > 0 {
-            entry.bump_version();
+            crate::storage::dashtable::Entry::Vacant(_) => 0,
         }
-
-        if is_empty {
-            drop(entry);
-            self.del(key);
-        }
-
-        removed
     }
 
     /// Increment score of member by delta. Returns new score.
     #[inline]
     pub fn zincrby(&self, key: Bytes, member: Bytes, delta: f64) -> Result<f64> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     entry.data = DataType::SortedSet(SortedSetData::new());
                     entry.persist();
@@ -226,10 +222,10 @@ impl Store {
                 }
                 result
             }
-            DashEntry::Vacant(e) => {
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let mut zset = SortedSetData::new();
                 zset.insert(member, delta);
-                e.insert(Entry::new(DataType::SortedSet(zset)));
+                e.insert((key, Entry::new(DataType::SortedSet(zset))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(delta)
             }
@@ -239,12 +235,12 @@ impl Store {
     /// Count members with scores in [min, max]
     #[inline]
     pub fn zcount(&self, key: &[u8], min: f64, max: f64) -> usize {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return 0;
                 }
-                match e.data.as_sorted_set() {
+                match entry_ref.1.data.as_sorted_set() {
                     Some(zset) => zset
                         .by_score
                         .iter()
@@ -260,12 +256,12 @@ impl Store {
     /// Get reverse rank (0-indexed position by score descending)
     #[inline]
     pub fn zrevrank(&self, key: &[u8], member: &[u8]) -> Option<usize> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return None;
                 }
-                match e.data.as_sorted_set() {
+                match entry_ref.1.data.as_sorted_set() {
                     Some(zset) => zset.rev_rank(member),
                     None => None,
                 }
@@ -283,34 +279,33 @@ impl Store {
         stop: i64,
         with_scores: bool,
     ) -> Vec<(Bytes, Option<f64>)> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match e.data.as_sorted_set() {
+                match entry_ref.1.data.as_sorted_set() {
                     Some(zset) => {
                         let len = zset.len() as i64;
                         if len == 0 {
                             return vec![];
                         }
 
-                        let start = normalize_index(start, len);
-                        let stop = normalize_index(stop, len);
+                        let start_idx = normalize_index(start, len);
+                        let stop_idx = normalize_index(stop, len);
 
-                        if start > stop || start >= len {
+                        if start_idx > stop_idx || start_idx >= len {
                             return vec![];
                         }
 
-                        let start = start.max(0) as usize;
-                        let stop = (stop + 1).min(len) as usize;
+                        let start_idx = start_idx.max(0) as usize;
+                        let stop_idx = (stop_idx + 1).min(len) as usize;
 
-                        // Collect in reverse order
                         zset.by_score
                             .iter()
                             .rev()
-                            .skip(start)
-                            .take(stop - start)
+                            .skip(start_idx)
+                            .take(stop_idx - start_idx)
                             .map(|((score, member), _)| {
                                 let score_opt = if with_scores { Some(score.0) } else { None };
                                 (member.clone(), score_opt)
@@ -335,12 +330,12 @@ impl Store {
         offset: usize,
         count: usize,
     ) -> Vec<(Bytes, Option<f64>)> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match e.data.as_sorted_set() {
+                match entry_ref.1.data.as_sorted_set() {
                     Some(zset) => {
                         let iter = zset
                             .by_score
@@ -378,12 +373,12 @@ impl Store {
         offset: usize,
         count: usize,
     ) -> Vec<(Bytes, Option<f64>)> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match e.data.as_sorted_set() {
+                match entry_ref.1.data.as_sorted_set() {
                     Some(zset) => {
                         let iter = zset
                             .by_score
@@ -414,109 +409,100 @@ impl Store {
     /// Pop members with lowest scores
     #[inline]
     pub fn zpopmin(&self, key: &[u8], count: usize) -> Vec<(Bytes, f64)> {
-        let mut entry = match self.data.get_mut(key) {
-            Some(e) => e,
-            None => return vec![],
-        };
-
-        if entry.is_expired() {
-            drop(entry);
-            self.del(key);
-            return vec![];
-        }
-
-        let (result, is_empty) = {
-            let zset = match entry.data.as_sorted_set_mut() {
-                Some(z) => z,
-                None => return vec![],
-            };
-
-            let mut result = Vec::with_capacity(count.min(zset.len()));
-
-            for _ in 0..count {
-                if let Some(((score, member), _)) = zset.by_score.iter().next() {
-                    // Need to clone member cause it's borrowed... wait, it is returned owned!
-                    // But zset.remove takes &Bytes.
-                    // And we need to return member.
-                    // So we take ownership. Remove from zset needs reference.
-                    // But we are removing it, so subsequent remove needs clone?
-                    // No, `remove` takes `&Bytes`. We have `Bytes`. `&member`.
-                    // But we put `member` in result.
-                    zset.remove(&member);
-                    result.push((member, score.0));
-                } else {
-                    break;
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
+                    e.remove();
+                    return vec![];
                 }
+
+                let (result, is_empty) = {
+                    let zset = match entry.data.as_sorted_set_mut() {
+                        Some(z) => z,
+                        None => return vec![],
+                    };
+
+                    let mut result = Vec::with_capacity(count.min(zset.len()));
+
+                    for _ in 0..count {
+                        if let Some(((score, member), _)) = zset.by_score.iter().next() {
+                            let member_clone = member.clone();
+                            let score_val = score.0;
+                            zset.remove(&member_clone);
+                            result.push((member_clone, score_val));
+                        } else {
+                            break;
+                        }
+                    }
+                    (result, zset.is_empty())
+                };
+
+                if !result.is_empty() {
+                    entry.bump_version();
+                }
+                if is_empty {
+                    e.remove();
+                }
+                result
             }
-            (result, zset.is_empty())
-        };
-
-        if !result.is_empty() {
-            entry.bump_version();
+            crate::storage::dashtable::Entry::Vacant(_) => vec![],
         }
-
-        if is_empty {
-            drop(entry);
-            self.del(key);
-        }
-
-        result
     }
 
     /// Pop members with highest scores
     #[inline]
     pub fn zpopmax(&self, key: &[u8], count: usize) -> Vec<(Bytes, f64)> {
-        let mut entry = match self.data.get_mut(key) {
-            Some(e) => e,
-            None => return vec![],
-        };
-
-        if entry.is_expired() {
-            drop(entry);
-            self.del(key);
-            return vec![];
-        }
-
-        let (result, is_empty) = {
-            let zset = match entry.data.as_sorted_set_mut() {
-                Some(z) => z,
-                None => return vec![],
-            };
-
-            let mut result = Vec::with_capacity(count.min(zset.len()));
-
-            for _ in 0..count {
-                if let Some(((score, member), _)) = zset.by_score.iter().next_back() {
-                    zset.remove(&member);
-                    result.push((member, score.0));
-                } else {
-                    break;
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
+                    e.remove();
+                    return vec![];
                 }
+
+                let (result, is_empty) = {
+                    let zset = match entry.data.as_sorted_set_mut() {
+                        Some(z) => z,
+                        None => return vec![],
+                    };
+
+                    let mut result = Vec::with_capacity(count.min(zset.len()));
+
+                    for _ in 0..count {
+                        if let Some(((score, member), _)) = zset.by_score.iter().next_back() {
+                            let member_clone = member.clone();
+                            let score_val = score.0;
+                            zset.remove(&member_clone);
+                            result.push((member_clone, score_val));
+                        } else {
+                            break;
+                        }
+                    }
+                    (result, zset.is_empty())
+                };
+
+                if !result.is_empty() {
+                    entry.bump_version();
+                }
+                if is_empty {
+                    e.remove();
+                }
+                result
             }
-            (result, zset.is_empty())
-        };
-
-        if !result.is_empty() {
-            entry.bump_version();
+            crate::storage::dashtable::Entry::Vacant(_) => vec![],
         }
-
-        if is_empty {
-            drop(entry);
-            self.del(key);
-        }
-
-        result
     }
 
     /// Get scores for multiple members
     #[inline]
     pub fn zmscore(&self, key: &[u8], members: &[Bytes]) -> Vec<Option<f64>> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return members.iter().map(|_| None).collect();
                 }
-                match e.data.as_sorted_set() {
+                match entry_ref.1.data.as_sorted_set() {
                     Some(zset) => members.iter().map(|m| zset.score(m)).collect(),
                     None => members.iter().map(|_| None).collect(),
                 }
@@ -533,10 +519,9 @@ impl Store {
             return vec![];
         }
 
-        // Get first set as base
-        let first = match self.data.get(&keys[0]) {
-            Some(e) if !e.is_expired() => {
-                if let Some(ss) = e.data.as_sorted_set() {
+        let first = match self.data_get(&keys[0]) {
+            Some(entry_ref) if !entry_ref.1.is_expired() => {
+                if let Some(ss) = entry_ref.1.data.as_sorted_set() {
                     ss.scores.clone()
                 } else {
                     return vec![];
@@ -545,12 +530,11 @@ impl Store {
             _ => return vec![],
         };
 
-        // Remove members that exist in other sets
         let mut result = first;
         for key in &keys[1..] {
-            if let Some(e) = self.data.get(key)
-                && !e.is_expired()
-                && let Some(ss) = e.data.as_sorted_set()
+            if let Some(entry_ref) = self.data_get(key.as_ref())
+                && !entry_ref.1.is_expired()
+                && let Some(ss) = entry_ref.1.data.as_sorted_set()
             {
                 for member in ss.scores.keys() {
                     result.remove(member);
@@ -576,10 +560,9 @@ impl Store {
             return vec![];
         }
 
-        // Get first set
-        let first = match self.data.get(&keys[0]) {
-            Some(e) if !e.is_expired() => {
-                if let Some(ss) = e.data.as_sorted_set() {
+        let first = match self.data_get(&keys[0]) {
+            Some(entry_ref) if !entry_ref.1.is_expired() => {
+                if let Some(ss) = entry_ref.1.data.as_sorted_set() {
                     ss.scores.clone()
                 } else {
                     return vec![];
@@ -592,15 +575,14 @@ impl Store {
             .map(|w| w.first().copied().unwrap_or(1.0))
             .unwrap_or(1.0);
 
-        // For each member in first set, check if exists in all others
         let mut result: Vec<(Bytes, f64)> = vec![];
         'outer: for (member, score) in first {
             let mut final_score = score * w0;
 
             for (i, key) in keys[1..].iter().enumerate() {
-                if let Some(e) = self.data.get(key) {
-                    if !e.is_expired() {
-                        if let Some(ss) = e.data.as_sorted_set() {
+                if let Some(entry_ref) = self.data_get(key.as_ref()) {
+                    if !entry_ref.1.is_expired() {
+                        if let Some(ss) = entry_ref.1.data.as_sorted_set() {
                             if let Some(&s) = ss.scores.get(&member) {
                                 let w = weights
                                     .map(|ws| ws.get(i + 1).copied().unwrap_or(1.0))
@@ -612,7 +594,7 @@ impl Store {
                                     _ => final_score + weighted, // SUM
                                 };
                             } else {
-                                continue 'outer; // Not in this set
+                                continue 'outer;
                             }
                         } else {
                             continue 'outer;
@@ -640,9 +622,9 @@ impl Store {
             return 0;
         }
 
-        let first = match self.data.get(&keys[0]) {
-            Some(e) if !e.is_expired() => {
-                if let Some(ss) = e.data.as_sorted_set() {
+        let first = match self.data_get(&keys[0]) {
+            Some(entry_ref) if !entry_ref.1.is_expired() => {
+                if let Some(ss) = entry_ref.1.data.as_sorted_set() {
                     ss.scores.keys().cloned().collect::<Vec<_>>()
                 } else {
                     return 0;
@@ -652,13 +634,13 @@ impl Store {
         };
 
         let mut count = 0usize;
-        let limit = limit.unwrap_or(usize::MAX);
+        let limit_val = limit.unwrap_or(usize::MAX);
 
         'outer: for member in first {
             for key in &keys[1..] {
-                if let Some(e) = self.data.get(key) {
-                    if !e.is_expired() {
-                        if let Some(ss) = e.data.as_sorted_set() {
+                if let Some(entry_ref) = self.data_get(key.as_ref()) {
+                    if !entry_ref.1.is_expired() {
+                        if let Some(ss) = entry_ref.1.data.as_sorted_set() {
                             if !ss.scores.contains_key(&member) {
                                 continue 'outer;
                             }
@@ -673,7 +655,7 @@ impl Store {
                 }
             }
             count += 1;
-            if count >= limit {
+            if count >= limit_val {
                 break;
             }
         }
@@ -693,9 +675,9 @@ impl Store {
         let mut result: HashMap<Bytes, f64> = HashMap::new();
 
         for (i, key) in keys.iter().enumerate() {
-            if let Some(e) = self.data.get(key)
-                && !e.is_expired()
-                && let Some(ss) = e.data.as_sorted_set()
+            if let Some(entry_ref) = self.data_get(key.as_ref())
+                && !entry_ref.1.is_expired()
+                && let Some(ss) = entry_ref.1.data.as_sorted_set()
             {
                 let w = weights
                     .map(|ws| ws.get(i).copied().unwrap_or(1.0))
@@ -726,20 +708,22 @@ impl Store {
 
     /// ZLEXCOUNT - Count members in lexicographic range
     pub fn zlexcount(&self, key: &[u8], min: &[u8], max: &[u8]) -> usize {
-        self.data
-            .get(key)
-            .and_then(|e| {
-                if e.is_expired() {
-                    return None;
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    return 0;
                 }
-                e.data.as_sorted_set().map(|ss| {
-                    ss.scores
+                match entry_ref.1.data.as_sorted_set() {
+                    Some(ss) => ss
+                        .scores
                         .keys()
                         .filter(|m| lex_in_range(m, min, max))
-                        .count()
-                })
-            })
-            .unwrap_or(0)
+                        .count(),
+                    None => 0,
+                }
+            }
+            None => 0,
+        }
     }
 
     /// ZRANGEBYLEX - Get members in lexicographic range
@@ -751,24 +735,27 @@ impl Store {
         offset: usize,
         count: usize,
     ) -> Vec<Bytes> {
-        self.data
-            .get(key)
-            .and_then(|e| {
-                if e.is_expired() {
-                    return None;
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    return vec![];
                 }
-                e.data.as_sorted_set().map(|ss| {
-                    let mut members: Vec<_> = ss
-                        .scores
-                        .keys()
-                        .filter(|m| lex_in_range(m, min, max))
-                        .cloned()
-                        .collect();
-                    members.sort();
-                    members.into_iter().skip(offset).take(count).collect()
-                })
-            })
-            .unwrap_or_default()
+                match entry_ref.1.data.as_sorted_set() {
+                    Some(ss) => {
+                        let mut members: Vec<_> = ss
+                            .scores
+                            .keys()
+                            .filter(|m| lex_in_range(m, min, max))
+                            .cloned()
+                            .collect();
+                        members.sort();
+                        members.into_iter().skip(offset).take(count).collect()
+                    }
+                    None => vec![],
+                }
+            }
+            None => vec![],
+        }
     }
 
     /// ZREVRANGEBYLEX - Get members in reverse lexicographic range  
@@ -780,114 +767,43 @@ impl Store {
         offset: usize,
         count: usize,
     ) -> Vec<Bytes> {
-        self.data
-            .get(key)
-            .and_then(|e| {
-                if e.is_expired() {
-                    return None;
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    return vec![];
                 }
-                e.data.as_sorted_set().map(|ss| {
-                    let mut members: Vec<_> = ss
-                        .scores
-                        .keys()
-                        .filter(|m| lex_in_range(m, min, max))
-                        .cloned()
-                        .collect();
-                    members.sort();
-                    members.reverse();
-                    members.into_iter().skip(offset).take(count).collect()
-                })
-            })
-            .unwrap_or_default()
-    }
-
-    // ==================== Remove Range Operations ====================
-
-    /// ZREMRANGEBYRANK - Remove members by rank range
-    pub fn zremrangebyrank(&self, key: &[u8], start: i64, stop: i64) -> usize {
-        match self.data.get_mut(key) {
-            Some(mut e) => {
-                if e.is_expired() {
-                    return 0;
-                }
-                let entry = e.value_mut();
-                let count = match &mut entry.data {
-                    DataType::SortedSet(ss) => {
-                        let len = ss.len() as i64;
-                        let start = normalize_index(start, len).max(0) as usize;
-                        let stop = (normalize_index(stop, len) + 1).min(len).max(0) as usize;
-
-                        // Collect members to remove by rank
-                        let to_remove: Vec<Bytes> = ss
-                            .by_score
-                            .iter()
-                            .map(|((_, member), _)| member.clone())
-                            .skip(start)
-                            .take(stop.saturating_sub(start))
-                            .collect();
-
-                        let count = to_remove.len();
-                        for member in to_remove {
-                            ss.remove(&member);
-                        }
-                        count
-                    }
-                    _ => 0,
-                };
-                if count > 0 {
-                    entry.bump_version();
-                }
-                count
-            }
-            None => 0,
-        }
-    }
-
-    /// ZREMRANGEBYSCORE - Remove members by score range
-    pub fn zremrangebyscore(&self, key: &[u8], min: f64, max: f64) -> usize {
-        match self.data.get_mut(key) {
-            Some(mut e) => {
-                if e.is_expired() {
-                    return 0;
-                }
-                let entry = e.value_mut();
-                let count = match &mut entry.data {
-                    DataType::SortedSet(ss) => {
-                        let to_remove: Vec<Bytes> = ss
+                match entry_ref.1.data.as_sorted_set() {
+                    Some(ss) => {
+                        let mut members: Vec<_> = ss
                             .scores
-                            .iter()
-                            .filter(|(_, score)| **score >= min && **score <= max)
-                            .map(|(m, _)| m.clone())
+                            .keys()
+                            .filter(|m| lex_in_range(m, min, max))
+                            .cloned()
                             .collect();
-
-                        let count = to_remove.len();
-                        for member in to_remove {
-                            ss.remove(&member);
-                        }
-                        count
+                        members.sort();
+                        members.reverse();
+                        members.into_iter().skip(offset).take(count).collect()
                     }
-                    _ => 0,
-                };
-                if count > 0 {
-                    entry.bump_version();
+                    None => vec![],
                 }
-                count
             }
-            None => 0,
+            None => vec![],
         }
     }
 
-    /// ZREMRANGEBYLEX - Remove members by lexicographic range
+    /// ZREMRANGEBYLEX - Remove members in lexicographic range
     pub fn zremrangebylex(&self, key: &[u8], min: &[u8], max: &[u8]) -> usize {
-        match self.data.get_mut(key) {
-            Some(mut e) => {
-                if e.is_expired() {
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
+                    e.remove();
                     return 0;
                 }
-                let entry = e.value_mut();
-                let count = match &mut entry.data {
-                    DataType::SortedSet(ss) => {
-                        let to_remove: Vec<Bytes> = ss
+
+                let (removed, is_empty) = match entry.data.as_sorted_set_mut() {
+                    Some(ss) => {
+                        let to_remove: Vec<_> = ss
                             .scores
                             .keys()
                             .filter(|m| lex_in_range(m, min, max))
@@ -895,216 +811,151 @@ impl Store {
                             .collect();
 
                         let count = to_remove.len();
-                        for member in to_remove {
-                            ss.remove(&member);
+                        for m in to_remove {
+                            ss.remove(&m);
                         }
-                        count
+                        (count, ss.is_empty())
                     }
-                    _ => 0,
+                    None => (0, false),
                 };
-                if count > 0 {
+
+                if removed > 0 {
                     entry.bump_version();
                 }
-                count
+                if is_empty {
+                    e.remove();
+                }
+                removed
             }
-            None => 0,
+            crate::storage::dashtable::Entry::Vacant(_) => 0,
         }
     }
 
-    /// ZRANDMEMBER - Get random members
-    pub fn zrandmember(
-        &self,
-        key: &[u8],
-        count: i64,
-        with_scores: bool,
-    ) -> Vec<(Bytes, Option<f64>)> {
-        self.data
-            .get(key)
-            .and_then(|e| {
-                if e.is_expired() {
-                    return None;
+    /// ZREMRANGEBYRANK - Remove members in rank range
+    pub fn zremrangebyrank(&self, key: &[u8], start: i64, stop: i64) -> usize {
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
+                    e.remove();
+                    return 0;
                 }
-                e.data.as_sorted_set().map(|ss| {
-                    let members: Vec<_> = ss.scores.iter().map(|(m, &s)| (m.clone(), s)).collect();
-                    if members.is_empty() {
-                        return vec![];
-                    }
 
-                    let abs_count = count.unsigned_abs() as usize;
-                    let allow_duplicates = count < 0;
+                let (removed, is_empty) = match entry.data.as_sorted_set_mut() {
+                    Some(ss) => {
+                        let len = ss.len() as i64;
+                        let start_idx = normalize_index(start, len);
+                        let stop_idx = normalize_index(stop, len);
 
-                    let mut result = Vec::with_capacity(abs_count.min(members.len()));
+                        if start_idx > stop_idx || start_idx >= len {
+                            (0, ss.is_empty())
+                        } else {
+                            let start_idx = start_idx.max(0) as usize;
+                            let stop_idx = (stop_idx + 1).min(len) as usize;
 
-                    if allow_duplicates {
-                        // With duplicates allowed
-                        for _ in 0..abs_count {
-                            let idx = fastrand::usize(..members.len());
-                            let (m, s) = &members[idx];
-                            result.push((m.clone(), if with_scores { Some(*s) } else { None }));
+                            let to_remove: Vec<_> = ss
+                                .by_score
+                                .iter()
+                                .skip(start_idx)
+                                .take(stop_idx - start_idx)
+                                .map(|((_, m), _)| m.clone())
+                                .collect();
+
+                            let count = to_remove.len();
+                            for m in to_remove {
+                                ss.remove(&m);
+                            }
+                            (count, ss.is_empty())
                         }
-                    } else {
-                        // Without duplicates
-                        let take = abs_count.min(members.len());
-                        let mut indices: Vec<usize> = (0..members.len()).collect();
-                        fastrand::shuffle(&mut indices);
-                        for i in 0..take {
-                            let (m, s) = &members[indices[i]];
-                            result.push((m.clone(), if with_scores { Some(*s) } else { None }));
-                        }
                     }
+                    None => (0, false),
+                };
 
-                    result
-                })
-            })
-            .unwrap_or_default()
+                if removed > 0 {
+                    entry.bump_version();
+                }
+                if is_empty {
+                    e.remove();
+                }
+                removed
+            }
+            crate::storage::dashtable::Entry::Vacant(_) => 0,
+        }
     }
 
-    /// ZSCAN - Scan sorted set members
-    pub fn zscan(
-        &self,
-        key: &[u8],
-        cursor: usize,
-        pattern: Option<&[u8]>,
-        count: usize,
-    ) -> (usize, Vec<(Bytes, f64)>) {
-        self.data
-            .get(key)
-            .and_then(|e| {
-                if e.is_expired() {
-                    return None;
+    /// ZREMRANGEBYSCORE - Remove members in score range
+    pub fn zremrangebyscore(&self, key: &[u8], min: f64, max: f64) -> usize {
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
+                    e.remove();
+                    return 0;
                 }
-                e.data.as_sorted_set().map(|ss| {
-                    let all: Vec<_> = ss.scores.iter().map(|(m, &s)| (m.clone(), s)).collect();
-                    let len = all.len();
 
-                    if cursor >= len {
-                        return (0, vec![]);
-                    }
+                let (removed, is_empty) = match entry.data.as_sorted_set_mut() {
+                    Some(ss) => {
+                        let to_remove: Vec<_> = ss
+                            .by_score
+                            .iter()
+                            .filter(|((score, _), _)| score.0 >= min && score.0 <= max)
+                            .map(|((_, m), _)| m.clone())
+                            .collect();
 
-                    let mut result = Vec::new();
-                    let mut i = cursor;
-
-                    while result.len() < count && i < len {
-                        let (member, score) = &all[i];
-                        let matches = pattern.map(|p| glob_match(p, member)).unwrap_or(true);
-                        if matches {
-                            result.push((member.clone(), *score));
+                        let count = to_remove.len();
+                        for m in to_remove {
+                            ss.remove(&m);
                         }
-                        i += 1;
+                        (count, ss.is_empty())
                     }
+                    None => (0, false),
+                };
 
-                    let next_cursor = if i >= len { 0 } else { i };
-                    (next_cursor, result)
-                })
-            })
-            .unwrap_or((0, vec![]))
+                if removed > 0 {
+                    entry.bump_version();
+                }
+                if is_empty {
+                    e.remove();
+                }
+                removed
+            }
+            crate::storage::dashtable::Entry::Vacant(_) => 0,
+        }
     }
 }
 
-/// Check if member is in lexicographic range
+/// Helper for lexicographic range matching
 fn lex_in_range(member: &[u8], min: &[u8], max: &[u8]) -> bool {
-    let min_ok = if min == b"-" {
-        true
-    } else if min.starts_with(b"(") {
-        member > &min[1..]
-    } else if min.starts_with(b"[") {
-        member >= &min[1..]
-    } else {
-        member >= min
-    };
+    fn check_bound(m: &[u8], bound: &[u8], is_min: bool) -> bool {
+        if bound.is_empty() {
+            return true;
+        }
 
-    let max_ok = if max == b"+" {
-        true
-    } else if max.starts_with(b"(") {
-        member < &max[1..]
-    } else if max.starts_with(b"[") {
-        member <= &max[1..]
-    } else {
-        member <= max
-    };
+        match bound[0] {
+            b'[' => {
+                let val = &bound[1..];
+                if is_min { m >= val } else { m <= val }
+            }
+            b'(' => {
+                let val = &bound[1..];
+                if is_min { m > val } else { m < val }
+            }
+            b'-' => is_min,  // -inf is Always less than m
+            b'+' => !is_min, // +inf is Always more than m
+            _ => {
+                if is_min {
+                    m >= bound
+                } else {
+                    m <= bound
+                }
+            }
+        }
+    }
 
-    min_ok && max_ok
-}
-
-/// Simple glob pattern match
-fn glob_match(pattern: &[u8], member: &[u8]) -> bool {
-    if pattern == b"*" {
-        return true;
-    }
-    // Simple prefix/suffix matching
-    if pattern.starts_with(b"*") && pattern.ends_with(b"*") && pattern.len() > 2 {
-        let inner = &pattern[1..pattern.len() - 1];
-        return member.windows(inner.len()).any(|w| w == inner);
-    }
-    if pattern.starts_with(b"*") {
-        let suffix = &pattern[1..];
-        return member.ends_with(suffix);
-    }
-    if pattern.ends_with(b"*") {
-        let prefix = &pattern[..pattern.len() - 1];
-        return member.starts_with(prefix);
-    }
-    member == pattern
+    check_bound(member, min, true) && check_bound(member, max, false)
 }
 
 /// Normalize negative indices for sorted set operations
 fn normalize_index(idx: i64, len: i64) -> i64 {
     if idx < 0 { len + idx } else { idx }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_sorted_set_core() {
-        let store = Store::new();
-        let key = Bytes::from("myzset");
-
-        // ZADD
-        store.zadd(key.clone(), vec![
-            (10.0, Bytes::from("a")),
-            (20.0, Bytes::from("b")),
-            (30.0, Bytes::from("c")),
-        ]).unwrap();
-
-        assert_eq!(store.zcard(&key), 3);
-        assert_eq!(store.zscore(&key, b"a"), Some(10.0));
-        assert_eq!(store.zscore(&key, b"b"), Some(20.0));
-
-        // ZRANK
-        assert_eq!(store.zrank(&key, b"a"), Some(0));
-        assert_eq!(store.zrank(&key, b"b"), Some(1));
-        assert_eq!(store.zrank(&key, b"c"), Some(2));
-        assert_eq!(store.zrank(&key, b"d"), None);
-
-        // ZREVRANK
-        assert_eq!(store.zrevrank(&key, b"a"), Some(2));
-        assert_eq!(store.zrevrank(&key, b"b"), Some(1));
-        assert_eq!(store.zrevrank(&key, b"c"), Some(0));
-
-        // ZRANGE
-        let range = store.zrange(&key, 0, -1, false);
-        assert_eq!(range.len(), 3);
-        assert_eq!(range[0].0, "a");
-        assert_eq!(range[1].0, "b");
-        assert_eq!(range[2].0, "c");
-
-        // ZREVRANGE
-        let range = store.zrevrange(&key, 0, -1, false);
-        assert_eq!(range.len(), 3);
-        assert_eq!(range[0].0, "c");
-        assert_eq!(range[1].0, "b");
-        assert_eq!(range[2].0, "a");
-        
-        // ZREM
-        store.zrem(&key, &[Bytes::from("b")]);
-        assert_eq!(store.zcard(&key), 2);
-        assert_eq!(store.zrank(&key, b"c"), Some(1)); // Shifted down
-        
-        // ZPOPMAX
-        let popped = store.zpopmax(&key, 1);
-        assert_eq!(popped.len(), 1);
-        assert_eq!(popped[0].0, "c");
-    }
 }

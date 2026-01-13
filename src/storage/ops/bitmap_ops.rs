@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use dashmap::mapref::entry::Entry as DashEntry;
 
 use crate::error::{Error, Result};
 use crate::storage::Store;
@@ -19,11 +18,10 @@ impl Store {
         let byte_offset = offset / 8;
         let bit_offset = 7 - (offset % 8); // Redis uses big-endian bit ordering
 
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    // Create new string with the bit set
                     let mut bytes = vec![0u8; byte_offset + 1];
                     if value {
                         bytes[byte_offset] |= 1 << bit_offset;
@@ -38,15 +36,12 @@ impl Store {
                     DataType::String(s) => {
                         let mut bytes = s.to_vec();
 
-                        // Extend if needed
                         if byte_offset >= bytes.len() {
                             bytes.resize(byte_offset + 1, 0);
                         }
 
-                        // Get old bit value
                         let old_bit = (bytes[byte_offset] >> bit_offset) & 1;
 
-                        // Set new bit value
                         if value {
                             bytes[byte_offset] |= 1 << bit_offset;
                         } else {
@@ -60,12 +55,12 @@ impl Store {
                     _ => Err(Error::WrongType),
                 }
             }
-            DashEntry::Vacant(e) => {
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let mut bytes = vec![0u8; byte_offset + 1];
                 if value {
                     bytes[byte_offset] |= 1 << bit_offset;
                 }
-                e.insert(Entry::new(DataType::String(Bytes::from(bytes))));
+                e.insert((key, Entry::new(DataType::String(Bytes::from(bytes)))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(0)
             }
@@ -78,12 +73,12 @@ impl Store {
         let byte_offset = offset / 8;
         let bit_offset = 7 - (offset % 8);
 
-        match self.data.get(key) {
-            Some(entry) => {
-                if entry.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return Ok(0);
                 }
-                match &entry.data {
+                match &entry_ref.1.data {
                     DataType::String(s) => {
                         if byte_offset >= s.len() {
                             Ok(0)
@@ -108,12 +103,12 @@ impl Store {
         end: Option<i64>,
         use_bit_index: bool,
     ) -> Result<usize> {
-        match self.data.get(key) {
-            Some(entry) => {
-                if entry.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return Ok(0);
                 }
-                match &entry.data {
+                match &entry_ref.1.data {
                     DataType::String(s) => {
                         if s.is_empty() {
                             return Ok(0);
@@ -122,7 +117,6 @@ impl Store {
                         let len = s.len() as i64;
 
                         if use_bit_index {
-                            // BIT mode: start/end are bit offsets
                             let bit_len = len * 8;
                             let start = normalize_bit_index(start.unwrap_or(0), bit_len);
                             let end = normalize_bit_index(end.unwrap_or(bit_len - 1), bit_len);
@@ -134,7 +128,6 @@ impl Store {
                             let start = start as usize;
                             let end = (end as usize).min((bit_len - 1) as usize);
 
-                            // Count bits in range
                             let mut count = 0usize;
                             for bit_pos in start..=end {
                                 let byte_idx = bit_pos / 8;
@@ -145,18 +138,17 @@ impl Store {
                             }
                             Ok(count)
                         } else {
-                            // BYTE mode (default): start/end are byte offsets
-                            let start = normalize_index(start.unwrap_or(0), len) as usize;
-                            let end = normalize_index(end.unwrap_or(len - 1), len) as usize;
+                            let start_idx = normalize_index(start.unwrap_or(0), len) as usize;
+                            let end_idx = normalize_index(end.unwrap_or(len - 1), len) as usize;
 
-                            if start > end || start >= s.len() {
+                            if start_idx > end_idx || start_idx >= s.len() {
                                 return Ok(0);
                             }
 
-                            let end = end.min(s.len() - 1);
+                            let end_idx = end_idx.min(s.len() - 1);
 
-                            // Use popcount - this compiles to POPCNT instruction
-                            let count: u32 = s[start..=end].iter().map(|b| b.count_ones()).sum();
+                            let count: u32 =
+                                s[start_idx..=end_idx].iter().map(|b| b.count_ones()).sum();
                             Ok(count as usize)
                         }
                     }
@@ -178,13 +170,12 @@ impl Store {
         end: Option<i64>,
         use_bit_index: bool,
     ) -> Result<i64> {
-        match self.data.get(key) {
-            Some(entry) => {
-                if entry.is_expired() {
-                    // Empty string behavior: looking for 0 returns 0, looking for 1 returns -1
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return Ok(if bit == 0 { 0 } else { -1 });
                 }
-                match &entry.data {
+                match &entry_ref.1.data {
                     DataType::String(s) => {
                         if s.is_empty() {
                             return Ok(if bit == 0 { 0 } else { -1 });
@@ -193,7 +184,6 @@ impl Store {
                         let len = s.len() as i64;
 
                         if use_bit_index {
-                            // BIT mode
                             let bit_len = len * 8;
                             let start_bit =
                                 normalize_bit_index(start.unwrap_or(0), bit_len) as usize;
@@ -216,7 +206,6 @@ impl Store {
                             }
                             Ok(-1)
                         } else {
-                            // BYTE mode
                             let start_byte = normalize_index(start.unwrap_or(0), len) as usize;
                             let end_byte = if let Some(e) = end {
                                 normalize_index(e, len) as usize
@@ -231,13 +220,10 @@ impl Store {
                             let end_byte = end_byte.min(s.len() - 1);
                             let has_explicit_end = end.is_some();
 
-                            // Search for the bit
                             for byte_idx in start_byte..=end_byte {
                                 let byte = s[byte_idx];
                                 if bit == 1 {
-                                    // Looking for first 1
                                     if byte != 0 {
-                                        // Find the first set bit
                                         for bit_idx in 0..8 {
                                             if (byte >> (7 - bit_idx)) & 1 == 1 {
                                                 return Ok((byte_idx * 8 + bit_idx) as i64);
@@ -245,9 +231,7 @@ impl Store {
                                         }
                                     }
                                 } else {
-                                    // Looking for first 0
                                     if byte != 0xFF {
-                                        // Find the first clear bit
                                         for bit_idx in 0..8 {
                                             if (byte >> (7 - bit_idx)) & 1 == 0 {
                                                 return Ok((byte_idx * 8 + bit_idx) as i64);
@@ -257,10 +241,7 @@ impl Store {
                                 }
                             }
 
-                            // Not found in range
                             if bit == 0 && !has_explicit_end {
-                                // Special case: if looking for 0 without explicit end,
-                                // return the position just after the string
                                 Ok((s.len() * 8) as i64)
                             } else {
                                 Ok(-1)
@@ -270,10 +251,7 @@ impl Store {
                     _ => Err(Error::WrongType),
                 }
             }
-            None => {
-                // Empty key: looking for 0 returns 0, looking for 1 returns -1
-                Ok(if bit == 0 { 0 } else { -1 })
-            }
+            None => Ok(if bit == 0 { 0 } else { -1 }),
         }
     }
 
@@ -285,17 +263,16 @@ impl Store {
             return Err(Error::WrongArity("BITOP"));
         }
 
-        // Get all source strings
         let mut strings: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
         let mut max_len = 0usize;
 
         for key in keys {
-            match self.data.get(key.as_ref()) {
-                Some(entry) => {
-                    if entry.is_expired() {
+            match self.data_get(key.as_ref()) {
+                Some(entry_ref) => {
+                    if entry_ref.1.is_expired() {
                         strings.push(Vec::new());
                     } else {
-                        match &entry.data {
+                        match &entry_ref.1.data {
                             DataType::String(s) => {
                                 max_len = max_len.max(s.len());
                                 strings.push(s.to_vec());
@@ -308,7 +285,6 @@ impl Store {
             }
         }
 
-        // Handle NOT specially (single operand)
         let op_upper = op.to_ascii_uppercase();
         let result = match op_upper.as_slice() {
             b"NOT" => {
@@ -350,103 +326,23 @@ impl Store {
                 }
                 result
             }
-            b"DIFF" => {
-                // DIFF: first AND NOT(OR of rest) - bits in first but not in any other
-                if strings.is_empty() {
-                    Vec::new()
-                } else {
-                    let first = &strings[0];
-                    let mut result = first.clone();
-                    result.resize(max_len, 0);
-
-                    for s in strings.iter().skip(1) {
-                        for (i, &byte) in s.iter().enumerate() {
-                            result[i] &= !byte;
-                        }
-                    }
-                    result
-                }
-            }
-            b"DIFF1" => {
-                // DIFF1: XOR between first two only (like diff for exactly 2 args)
-                if strings.len() < 2 {
-                    strings.first().cloned().unwrap_or_default()
-                } else {
-                    let mut result = vec![0u8; max_len];
-                    let s1 = &strings[0];
-                    let s2 = &strings[1];
-                    for (i, r) in result.iter_mut().enumerate() {
-                        let b1 = s1.get(i).copied().unwrap_or(0);
-                        let b2 = s2.get(i).copied().unwrap_or(0);
-                        *r = b1 ^ b2;
-                    }
-                    result
-                }
-            }
-            b"ANDOR" => {
-                // ANDOR: AND of first two, then OR with rest
-                if strings.len() < 2 {
-                    strings.first().cloned().unwrap_or_default()
-                } else {
-                    let mut result = vec![0u8; max_len];
-                    let s1 = &strings[0];
-                    let s2 = &strings[1];
-                    // First AND
-                    for (i, r) in result.iter_mut().enumerate() {
-                        let b1 = s1.get(i).copied().unwrap_or(0);
-                        let b2 = s2.get(i).copied().unwrap_or(0);
-                        *r = b1 & b2;
-                    }
-                    // Then OR with rest
-                    for s in strings.iter().skip(2) {
-                        for (i, &byte) in s.iter().enumerate() {
-                            result[i] |= byte;
-                        }
-                    }
-                    result
-                }
-            }
-            b"ONE" => {
-                // ONE: bits that are set in exactly one source
-                let mut counts = vec![0u8; max_len * 8];
-                for s in &strings {
-                    for (byte_idx, &byte) in s.iter().enumerate() {
-                        for bit_idx in 0..8 {
-                            if (byte >> (7 - bit_idx)) & 1 == 1 {
-                                counts[byte_idx * 8 + bit_idx] =
-                                    counts[byte_idx * 8 + bit_idx].saturating_add(1);
-                            }
-                        }
-                    }
-                }
-                let mut result = vec![0u8; max_len];
-                for (bit_pos, &count) in counts.iter().enumerate() {
-                    if count == 1 {
-                        let byte_idx = bit_pos / 8;
-                        let bit_idx = 7 - (bit_pos % 8);
-                        result[byte_idx] |= 1 << bit_idx;
-                    }
-                }
-                result
-            }
             _ => return Err(Error::Syntax),
         };
 
         let result_len = result.len();
 
-        // Store result
         if result.is_empty() {
-            self.del(destkey.as_ref());
+            self.data_remove(&destkey);
         } else {
-            match self.data.entry(destkey) {
-                DashEntry::Occupied(mut e) => {
-                    let entry = e.get_mut();
+            match self.data_entry(&destkey) {
+                crate::storage::dashtable::Entry::Occupied(mut e) => {
+                    let entry = &mut e.get_mut().1;
                     entry.data = DataType::String(Bytes::from(result));
                     entry.persist();
                     entry.bump_version();
                 }
-                DashEntry::Vacant(e) => {
-                    e.insert(Entry::new(DataType::String(Bytes::from(result))));
+                crate::storage::dashtable::Entry::Vacant(e) => {
+                    e.insert((destkey, Entry::new(DataType::String(Bytes::from(result)))));
                     self.key_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -461,9 +357,9 @@ impl Store {
     pub fn bitfield(&self, key: Bytes, ops: Vec<BitfieldOp>) -> Result<Vec<Option<i64>>> {
         let mut results = Vec::with_capacity(ops.len());
 
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     entry.data = DataType::String(Bytes::new());
                     entry.persist();
@@ -520,7 +416,7 @@ impl Store {
                     _ => return Err(Error::WrongType),
                 }
             }
-            DashEntry::Vacant(e) => {
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let mut bytes = Vec::new();
                 let mut overflow_mode = OverflowMode::Wrap;
 
@@ -564,7 +460,7 @@ impl Store {
                 }
 
                 if !bytes.is_empty() {
-                    e.insert(Entry::new(DataType::String(Bytes::from(bytes))));
+                    e.insert((key, Entry::new(DataType::String(Bytes::from(bytes)))));
                     self.key_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -578,12 +474,12 @@ impl Store {
     pub fn bitfield_ro(&self, key: &[u8], ops: Vec<BitfieldOp>) -> Result<Vec<Option<i64>>> {
         let mut results = Vec::with_capacity(ops.len());
 
-        let bytes = match self.data.get(key) {
-            Some(entry) => {
-                if entry.is_expired() {
+        let bytes = match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     Vec::new()
                 } else {
-                    match &entry.data {
+                    match &entry_ref.1.data {
                         DataType::String(s) => s.to_vec(),
                         _ => return Err(Error::WrongType),
                     }
@@ -608,7 +504,6 @@ impl Store {
 
 // ==================== Bitfield Helper Types ====================
 
-/// Encoding for bitfield operations
 #[derive(Debug, Clone, Copy)]
 pub struct BitfieldEncoding {
     pub signed: bool,
@@ -630,7 +525,6 @@ impl BitfieldEncoding {
 
         let bits: u8 = std::str::from_utf8(&s[1..]).ok()?.parse().ok()?;
 
-        // Valid ranges: u1-u63, i1-i64
         if signed {
             if !(1..=64).contains(&bits) {
                 return None;
@@ -661,7 +555,6 @@ impl BitfieldEncoding {
     }
 }
 
-/// Overflow handling mode
 #[derive(Debug, Clone, Copy, Default)]
 pub enum OverflowMode {
     #[default]
@@ -680,8 +573,6 @@ impl OverflowMode {
         }
     }
 
-    /// Apply overflow handling to an increment operation
-    /// Returns None if FAIL mode and overflow would occur
     pub fn apply(self, old: i64, increment: i64, encoding: BitfieldEncoding) -> Option<i64> {
         let min = encoding.min_value();
         let max = encoding.max_value();
@@ -692,7 +583,6 @@ impl OverflowMode {
         match self {
             OverflowMode::Wrap => {
                 if encoding.signed {
-                    // Signed wrap
                     let range = 1i128 << encoding.bits;
                     let mut v = (old as i128 + increment as i128) % range;
                     if v > max as i128 {
@@ -702,7 +592,6 @@ impl OverflowMode {
                     }
                     Some(v as i64)
                 } else {
-                    // Unsigned wrap
                     let mask = if encoding.bits >= 64 {
                         u64::MAX
                     } else {
@@ -730,7 +619,6 @@ impl OverflowMode {
     }
 }
 
-/// Bitfield operation
 #[derive(Debug)]
 pub enum BitfieldOp {
     Get {
@@ -750,17 +638,13 @@ pub enum BitfieldOp {
     Overflow(OverflowMode),
 }
 
-// ==================== Bitfield Helper Functions ====================
-
-/// Ensure bytes vector is large enough for the given bit operation
 fn ensure_bytes_size(bytes: &mut Vec<u8>, bit_offset: usize, bits: u8) {
-    let needed_bytes = (bit_offset + bits as usize).div_ceil(8);
+    let needed_bytes = (bit_offset + bits as usize + 7) / 8;
     if bytes.len() < needed_bytes {
         bytes.resize(needed_bytes, 0);
     }
 }
 
-/// Get a value from the bitfield
 fn bitfield_get(bytes: &[u8], encoding: BitfieldEncoding, bit_offset: usize) -> i64 {
     let bits = encoding.bits as usize;
     let mut value: u64 = 0;
@@ -779,7 +663,6 @@ fn bitfield_get(bytes: &[u8], encoding: BitfieldEncoding, bit_offset: usize) -> 
     }
 
     if encoding.signed && bits > 0 {
-        // Sign extend
         let sign_bit = 1u64 << (bits - 1);
         if value & sign_bit != 0 {
             let mask = !((1u64 << bits) - 1);
@@ -790,7 +673,6 @@ fn bitfield_get(bytes: &[u8], encoding: BitfieldEncoding, bit_offset: usize) -> 
     value as i64
 }
 
-/// Set a value in the bitfield
 fn bitfield_set(bytes: &mut [u8], encoding: BitfieldEncoding, bit_offset: usize, value: i64) {
     let bits = encoding.bits as usize;
     let value = value as u64;
@@ -800,33 +682,27 @@ fn bitfield_set(bytes: &mut [u8], encoding: BitfieldEncoding, bit_offset: usize,
         let byte_idx = pos / 8;
         let bit_idx = 7 - (pos % 8);
 
-        if byte_idx < bytes.len() {
-            let bit = (value >> (bits - 1 - i)) & 1;
-            if bit == 1 {
-                bytes[byte_idx] |= 1 << bit_idx;
-            } else {
-                bytes[byte_idx] &= !(1 << bit_idx);
-            }
+        let bit = (value >> (bits - 1 - i)) & 1;
+        if bit == 1 {
+            bytes[byte_idx] |= 1 << bit_idx;
+        } else {
+            bytes[byte_idx] &= !(1 << bit_idx);
         }
     }
 }
 
-// ==================== Index Helpers ====================
+fn normalize_bit_index(idx: i64, len: i64) -> i64 {
+    if idx < 0 {
+        (len + idx).max(0)
+    } else {
+        idx.min(len - 1)
+    }
+}
 
-/// Normalize index for byte operations (supports negative indices)
 fn normalize_index(idx: i64, len: i64) -> i64 {
     if idx < 0 {
         (len + idx).max(0)
     } else {
-        idx.min(len - 1).max(0)
-    }
-}
-
-/// Normalize index for bit operations
-fn normalize_bit_index(idx: i64, bit_len: i64) -> i64 {
-    if idx < 0 {
-        (bit_len + idx).max(0)
-    } else {
-        idx.min(bit_len - 1).max(0)
+        idx.min(len - 1)
     }
 }

@@ -6,7 +6,6 @@
 //! - Zero-copy where possible
 
 use bytes::Bytes;
-use dashmap::mapref::entry::Entry as DashEntry;
 use std::sync::atomic::Ordering;
 
 use crate::error::{Error, Result};
@@ -35,15 +34,15 @@ impl Store {
         duplicate_policy: DuplicatePolicy,
         labels: Vec<(String, String)>,
     ) -> Result<()> {
-        match self.data.entry(key.clone()) {
-            DashEntry::Occupied(_) => Err(Error::Other("TSDB: key already exists")),
-            DashEntry::Vacant(e) => {
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(_) => {
+                Err(Error::Other("TSDB: key already exists"))
+            }
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let mut ts = TimeSeries::new();
                 ts.retention_ms = retention;
                 ts.duplicate_policy = duplicate_policy;
-                // chunk_size, ignore_* are not supported or handled differently
 
-                // Add labels and update index
                 for (label, value) in labels {
                     let index_key = format!("{}={}", label, value);
                     LABEL_INDEX
@@ -53,7 +52,7 @@ impl Store {
                     ts.labels.insert(label, value);
                 }
 
-                e.insert(Entry::new(DataType::TimeSeries(Box::new(ts))));
+                e.insert((key, Entry::new(DataType::TimeSeries(Box::new(ts)))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -62,22 +61,22 @@ impl Store {
 
     /// TS.ADD key timestamp value [options...]
     pub fn ts_add(&self, key: Bytes, timestamp: i64, value: f64) -> Result<i64> {
-        match self.data.entry(key.clone()) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 match &mut entry.data {
                     DataType::TimeSeries(ts) => {
                         ts.add(timestamp, value).map_err(Error::Other)?;
+                        entry.bump_version();
                         Ok(timestamp)
                     }
                     _ => Err(Error::WrongType),
                 }
             }
-            DashEntry::Vacant(e) => {
-                // Auto-create timeseries
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let mut ts = TimeSeries::new();
                 ts.add(timestamp, value).map_err(Error::Other)?;
-                e.insert(Entry::new(DataType::TimeSeries(Box::new(ts))));
+                e.insert((key, Entry::new(DataType::TimeSeries(Box::new(ts)))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(timestamp)
             }
@@ -94,23 +93,39 @@ impl Store {
 
     /// TS.GET key [LATEST]
     pub fn ts_get(&self, key: &[u8]) -> Option<(i64, f64)> {
-        self.data.get(key).and_then(|e| {
-            if e.is_expired() {
-                None
-            } else {
-                e.data.as_timeseries().and_then(|ts| ts.get_latest())
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    None
+                } else {
+                    entry_ref
+                        .1
+                        .data
+                        .as_timeseries()
+                        .and_then(|ts| ts.get_latest())
+                }
             }
-        })
+            None => None,
+        }
     }
 
     /// TS.DEL key fromTimestamp toTimestamp
     pub fn ts_del(&self, key: &[u8], from: i64, to: i64) -> Result<usize> {
-        match self.data.get_mut(key) {
-            Some(mut e) => match &mut e.value_mut().data {
-                DataType::TimeSeries(ts) => Ok(ts.delete_range(from, to)),
-                _ => Err(Error::WrongType),
-            },
-            None => Ok(0),
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                match &mut entry.data {
+                    DataType::TimeSeries(ts) => {
+                        let deleted = ts.delete_range(from, to);
+                        if deleted > 0 {
+                            entry.bump_version();
+                        }
+                        Ok(deleted)
+                    }
+                    _ => Err(Error::WrongType),
+                }
+            }
+            crate::storage::dashtable::Entry::Vacant(_) => Ok(0),
         }
     }
 
@@ -118,21 +133,22 @@ impl Store {
     pub fn ts_incrby(&self, key: Bytes, value: f64, timestamp: Option<i64>) -> Result<i64> {
         let ts_val = timestamp.unwrap_or_else(crate::storage::value::now_ms);
 
-        match self.data.entry(key.clone()) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 match &mut entry.data {
                     DataType::TimeSeries(ts) => {
                         ts.incrby(value, ts_val).map_err(Error::Other)?;
+                        entry.bump_version();
                         Ok(ts_val)
                     }
                     _ => Err(Error::WrongType),
                 }
             }
-            DashEntry::Vacant(e) => {
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let mut tsdata = TimeSeries::new();
                 tsdata.add(ts_val, value).map_err(Error::Other)?;
-                e.insert(Entry::new(DataType::TimeSeries(Box::new(tsdata))));
+                e.insert((key, Entry::new(DataType::TimeSeries(Box::new(tsdata)))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(ts_val)
             }
@@ -147,20 +163,18 @@ impl Store {
         duplicate_policy: Option<DuplicatePolicy>,
         labels: Option<Vec<(String, String)>>,
     ) -> Result<()> {
-        match self.data.get_mut(key) {
-            Some(mut e) => {
-                let entry = e.value_mut();
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 match &mut entry.data {
                     DataType::TimeSeries(ts) => {
                         if let Some(r) = retention {
                             ts.retention_ms = r;
                         }
-                        // chunk_size not directly supported for modification
                         if let Some(d) = duplicate_policy {
                             ts.duplicate_policy = d;
                         }
                         if let Some(new_labels) = labels {
-                            // Update label index
                             let key_bytes = Bytes::copy_from_slice(key);
                             for (label, value) in &ts.labels {
                                 let index_key = format!("{}={}", label, value);
@@ -178,24 +192,30 @@ impl Store {
                                 ts.labels.insert(label, value);
                             }
                         }
+                        entry.bump_version();
                         Ok(())
                     }
                     _ => Err(Error::WrongType),
                 }
             }
-            None => Err(Error::Other("TSDB: the key does not exist")),
+            crate::storage::dashtable::Entry::Vacant(_) => {
+                Err(Error::Other("TSDB: the key does not exist"))
+            }
         }
     }
 
     /// TS.INFO key [DEBUG]
     pub fn ts_info(&self, key: &[u8]) -> Option<TimeSeriesInfo> {
-        self.data.get(key).and_then(|e| {
-            if e.is_expired() {
-                None
-            } else {
-                e.data.as_timeseries().map(|ts| ts.info())
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    None
+                } else {
+                    entry_ref.1.data.as_timeseries().map(|ts| ts.info())
+                }
             }
-        })
+            None => None,
+        }
     }
 
     // ==================== Range Queries ====================
@@ -209,26 +229,29 @@ impl Store {
         count: Option<usize>,
         aggregation: Option<(Aggregation, i64)>,
     ) -> Option<Vec<(i64, f64)>> {
-        self.data.get(key).and_then(|e| {
-            if e.is_expired() {
-                return None;
-            }
-            e.data.as_timeseries().map(|ts| {
-                if let Some((agg, bucket)) = aggregation {
-                    let mut result = ts.aggregate(from, to, agg, bucket);
-                    if let Some(c) = count {
-                        result.truncate(c);
-                    }
-                    result
-                } else {
-                    let mut result = ts.range(from, to);
-                    if let Some(c) = count {
-                        result.truncate(c);
-                    }
-                    result
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    return None;
                 }
-            })
-        })
+                entry_ref.1.data.as_timeseries().map(|ts| {
+                    if let Some((agg, bucket)) = aggregation {
+                        let mut result = ts.aggregate(from, to, agg, bucket);
+                        if let Some(c) = count {
+                            result.truncate(c);
+                        }
+                        result
+                    } else {
+                        let mut result = ts.range(from, to);
+                        if let Some(c) = count {
+                            result.truncate(c);
+                        }
+                        result
+                    }
+                })
+            }
+            None => None,
+        }
     }
 
     /// TS.REVRANGE key fromTimestamp toTimestamp [options...]
@@ -240,27 +263,30 @@ impl Store {
         count: Option<usize>,
         aggregation: Option<(Aggregation, i64)>,
     ) -> Option<Vec<(i64, f64)>> {
-        self.data.get(key).and_then(|e| {
-            if e.is_expired() {
-                return None;
-            }
-            e.data.as_timeseries().map(|ts| {
-                if let Some((agg, bucket)) = aggregation {
-                    let mut result = ts.aggregate(from, to, agg, bucket);
-                    result.reverse();
-                    if let Some(c) = count {
-                        result.truncate(c);
-                    }
-                    result
-                } else {
-                    let mut result = ts.rev_range(from, to);
-                    if let Some(c) = count {
-                        result.truncate(c);
-                    }
-                    result
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    return None;
                 }
-            })
-        })
+                entry_ref.1.data.as_timeseries().map(|ts| {
+                    if let Some((agg, bucket)) = aggregation {
+                        let mut result = ts.aggregate(from, to, agg, bucket);
+                        result.reverse();
+                        if let Some(c) = count {
+                            result.truncate(c);
+                        }
+                        result
+                    } else {
+                        let mut result = ts.rev_range(from, to);
+                        if let Some(c) = count {
+                            result.truncate(c);
+                        }
+                        result
+                    }
+                })
+            }
+            None => None,
+        }
     }
 
     /// TS.MGET - get latest from multiple series by filter
@@ -300,7 +326,6 @@ impl Store {
             return vec![];
         }
 
-        // Start with first filter
         let first = &filters[0];
         let index_key = format!("{}={}", first.0, first.1);
 
@@ -312,7 +337,6 @@ impl Store {
             set
         });
 
-        // Intersect with remaining filters
         for filter in &filters[1..] {
             let index_key = format!("{}={}", filter.0, filter.1);
             if let Some(current) = &result {
@@ -347,49 +371,59 @@ impl Store {
         bucket_duration: i64,
         align_timestamp: i64,
     ) -> Result<()> {
-        // Verify dest key exists
-        if !self.data.contains_key(dest_key.as_ref()) {
+        if self.data_get(dest_key.as_ref()).is_none() {
             return Err(Error::Other("TSDB: the key does not exist"));
         }
 
-        match self.data.get_mut(source_key) {
-            Some(mut e) => match &mut e.value_mut().data {
-                DataType::TimeSeries(ts) => {
-                    // Check if rule already exists
-                    if ts.rules.iter().any(|r| r.dest_key == dest_key) {
-                        return Err(Error::Other("TSDB: compaction rule already exists"));
-                    }
+        match self.data_entry(source_key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                match &mut entry.data {
+                    DataType::TimeSeries(ts) => {
+                        if ts.rules.iter().any(|r| r.dest_key == dest_key) {
+                            return Err(Error::Other("TSDB: compaction rule already exists"));
+                        }
 
-                    ts.rules.push(CompactionRule {
-                        dest_key,
-                        aggregation,
-                        bucket_duration,
-                        align_timestamp,
-                    });
-                    Ok(())
+                        ts.rules.push(CompactionRule {
+                            dest_key,
+                            aggregation,
+                            bucket_duration,
+                            align_timestamp,
+                        });
+                        entry.bump_version();
+                        Ok(())
+                    }
+                    _ => Err(Error::WrongType),
                 }
-                _ => Err(Error::WrongType),
-            },
-            None => Err(Error::Other("TSDB: the key does not exist")),
+            }
+            crate::storage::dashtable::Entry::Vacant(_) => {
+                Err(Error::Other("TSDB: the key does not exist"))
+            }
         }
     }
 
     /// TS.DELETERULE sourceKey destKey
     pub fn ts_deleterule(&self, source_key: &[u8], dest_key: &[u8]) -> Result<()> {
-        match self.data.get_mut(source_key) {
-            Some(mut e) => match &mut e.value_mut().data {
-                DataType::TimeSeries(ts) => {
-                    let original_len = ts.rules.len();
-                    ts.rules.retain(|r| r.dest_key.as_ref() != dest_key);
-                    if ts.rules.len() == original_len {
-                        Err(Error::Other("TSDB: compaction rule does not exist"))
-                    } else {
-                        Ok(())
+        match self.data_entry(source_key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                match &mut entry.data {
+                    DataType::TimeSeries(ts) => {
+                        let original_len = ts.rules.len();
+                        ts.rules.retain(|r| r.dest_key.as_ref() != dest_key);
+                        if ts.rules.len() == original_len {
+                            Err(Error::Other("TSDB: compaction rule does not exist"))
+                        } else {
+                            entry.bump_version();
+                            Ok(())
+                        }
                     }
+                    _ => Err(Error::WrongType),
                 }
-                _ => Err(Error::WrongType),
-            },
-            None => Err(Error::Other("TSDB: the key does not exist")),
+            }
+            crate::storage::dashtable::Entry::Vacant(_) => {
+                Err(Error::Other("TSDB: the key does not exist"))
+            }
         }
     }
 }

@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use dashmap::mapref::entry::Entry as DashEntry;
 
 use crate::error::{Error, Result};
 use crate::storage::Store;
@@ -14,9 +13,9 @@ impl Store {
     /// Add elements to HyperLogLog
     #[inline]
     pub fn pfadd(&self, key: Bytes, elements: &[Bytes]) -> Result<bool> {
-        match self.data.entry(key) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     let mut hll = HyperLogLogData::new();
                     let mut changed = false;
@@ -48,7 +47,7 @@ impl Store {
                 }
                 result
             }
-            DashEntry::Vacant(e) => {
+            crate::storage::dashtable::Entry::Vacant(e) => {
                 let mut hll = HyperLogLogData::new();
                 let mut changed = false;
                 for element in elements {
@@ -56,7 +55,7 @@ impl Store {
                         changed = true;
                     }
                 }
-                e.insert(Entry::new(DataType::HyperLogLog(hll)));
+                e.insert((key, Entry::new(DataType::HyperLogLog(hll))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(changed)
             }
@@ -71,13 +70,12 @@ impl Store {
         }
 
         if keys.len() == 1 {
-            // Single key - simple case
-            match self.data.get(keys[0].as_ref()) {
-                Some(e) => {
-                    if e.is_expired() {
+            match self.data_get(keys[0].as_ref()) {
+                Some(entry_ref) => {
+                    if entry_ref.1.is_expired() {
                         return 0;
                     }
-                    match e.data.as_hyperloglog() {
+                    match entry_ref.1.data.as_hyperloglog() {
                         Some(hll) => hll.count(),
                         None => 0,
                     }
@@ -85,13 +83,12 @@ impl Store {
                 None => 0,
             }
         } else {
-            // Multiple keys - merge HLLs
             let mut merged = HyperLogLogData::new();
             for key in keys {
-                if let Some(e) = self.data.get(key.as_ref())
-                    && !e.is_expired()
+                if let Some(entry_ref) = self.data_get(key.as_ref())
+                    && !entry_ref.1.is_expired()
                 {
-                    match e.data.as_hyperloglog() {
+                    match entry_ref.1.data.as_hyperloglog() {
                         Some(hll) => merged.merge(hll),
                         None => return 0,
                     }
@@ -107,26 +104,25 @@ impl Store {
         let mut merged = HyperLogLogData::new();
 
         for source in sources {
-            if let Some(e) = self.data.get(source.as_ref())
-                && !e.is_expired()
+            if let Some(entry_ref) = self.data_get(source.as_ref())
+                && !entry_ref.1.is_expired()
             {
-                match e.data.as_hyperloglog() {
+                match entry_ref.1.data.as_hyperloglog() {
                     Some(hll) => merged.merge(hll),
                     None => return Err(Error::WrongType),
                 }
             }
         }
 
-        // Store merged HLL in destination
-        match self.data.entry(dest) {
-            DashEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
+        match self.data_entry(&dest) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
                 entry.data = DataType::HyperLogLog(merged);
                 entry.persist();
                 entry.bump_version();
             }
-            DashEntry::Vacant(e) => {
-                e.insert(Entry::new(DataType::HyperLogLog(merged)));
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                e.insert((dest, Entry::new(DataType::HyperLogLog(merged))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -137,12 +133,12 @@ impl Store {
     /// Get HyperLogLog registers (for PFDEBUG GETREG)
     #[inline]
     pub fn pf_get_registers(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return Ok(None);
                 }
-                match e.data.as_hyperloglog() {
+                match entry_ref.1.data.as_hyperloglog() {
                     Some(hll) => Ok(Some(hll.get_registers())),
                     None => Err(Error::WrongType),
                 }
@@ -154,12 +150,12 @@ impl Store {
     /// Check if HyperLogLog uses sparse encoding (for PFDEBUG)
     #[inline]
     pub fn pf_is_sparse(&self, key: &[u8]) -> Result<Option<bool>> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return Ok(None);
                 }
-                match e.data.as_hyperloglog() {
+                match entry_ref.1.data.as_hyperloglog() {
                     Some(hll) => Ok(Some(hll.is_sparse())),
                     None => Err(Error::WrongType),
                 }
@@ -171,12 +167,12 @@ impl Store {
     /// Get HyperLogLog encoding name (for PFDEBUG ENCODING)
     #[inline]
     pub fn pf_encoding(&self, key: &[u8]) -> Result<Option<&'static str>> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return Ok(None);
                 }
-                match e.data.as_hyperloglog() {
+                match entry_ref.1.data.as_hyperloglog() {
                     Some(hll) => Ok(Some(hll.encoding_name())),
                     None => Err(Error::WrongType),
                 }
@@ -188,12 +184,13 @@ impl Store {
     /// Promote HyperLogLog to dense encoding (for PFDEBUG TODENSE)
     #[inline]
     pub fn pf_to_dense(&self, key: &[u8]) -> Result<Option<bool>> {
-        match self.data.get_mut(key) {
-            Some(mut e) => {
-                if e.is_expired() {
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
                     return Ok(None);
                 }
-                match &mut e.data {
+                match &mut entry.data {
                     DataType::HyperLogLog(hll) => {
                         let was_sparse = hll.is_sparse();
                         hll.promote_to_dense();
@@ -202,19 +199,19 @@ impl Store {
                     _ => Err(Error::WrongType),
                 }
             }
-            None => Ok(None),
+            crate::storage::dashtable::Entry::Vacant(_) => Ok(None),
         }
     }
 
     /// Get sparse decode string (for PFDEBUG DECODE)
     #[inline]
     pub fn pf_decode_sparse(&self, key: &[u8]) -> Result<Option<Option<String>>> {
-        match self.data.get(key) {
-            Some(e) => {
-                if e.is_expired() {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
                     return Ok(None);
                 }
-                match e.data.as_hyperloglog() {
+                match entry_ref.1.data.as_hyperloglog() {
                     Some(hll) => Ok(Some(hll.decode_sparse())),
                     None => Err(Error::WrongType),
                 }

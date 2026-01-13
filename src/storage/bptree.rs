@@ -16,13 +16,15 @@
 // ============================================================================
 
 /// Maximum keys per leaf node (tuned for cache efficiency)
-const MAX_LEAF_KEYS: usize = 15;
+/// Maximum keys per leaf node (tuned for cache efficiency)
+/// Maximum keys per leaf node (tuned for cache efficiency)
+const MAX_LEAF_KEYS: usize = 127;
 
 /// Minimum keys per leaf node
 const MIN_LEAF_KEYS: usize = MAX_LEAF_KEYS / 2;
 
 /// Maximum keys per inner node
-const MAX_INNER_KEYS: usize = 15;
+const MAX_INNER_KEYS: usize = 127;
 
 /// Minimum keys per inner node
 const MIN_INNER_KEYS: usize = MAX_INNER_KEYS / 2;
@@ -36,6 +38,8 @@ const MIN_INNER_KEYS: usize = MAX_INNER_KEYS / 2;
 struct LeafNode<K, V> {
     keys: Vec<K>,
     values: Vec<V>,
+    next: Option<usize>,
+    prev: Option<usize>,
 }
 
 impl<K: Clone + Ord, V: Clone> LeafNode<K, V> {
@@ -43,6 +47,8 @@ impl<K: Clone + Ord, V: Clone> LeafNode<K, V> {
         Self {
             keys: Vec::with_capacity(MAX_LEAF_KEYS),
             values: Vec::with_capacity(MAX_LEAF_KEYS),
+            next: None,
+            prev: None,
         }
     }
 
@@ -261,6 +267,10 @@ impl BPTreePath {
 // BPTree
 // ============================================================================
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const CACHE_NONE: usize = usize::MAX;
+
 /// A high-performance B+Tree map
 #[derive(Debug)]
 pub struct BPTree<K: Clone + Ord, V: Clone> {
@@ -276,6 +286,8 @@ pub struct BPTree<K: Clone + Ord, V: Clone> {
     first_leaf: Option<usize>,
     /// Cached index of rightmost (last) leaf node for O(1) last() access
     last_leaf: Option<usize>,
+    /// Hint for the last accessed leaf node to speed up sequential/local access
+    last_accessed_leaf: AtomicUsize,
 }
 
 impl<K: Clone + Ord, V: Clone> Default for BPTree<K, V> {
@@ -294,6 +306,7 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
             free_list: Vec::new(),
             first_leaf: None,
             last_leaf: None,
+            last_accessed_leaf: AtomicUsize::new(CACHE_NONE),
         }
     }
 
@@ -359,6 +372,7 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
             }
             self.update_tree_counts(&path, 1);
             self.count += 1;
+            self.last_accessed_leaf.store(leaf_idx, Ordering::Relaxed);
             return true;
         }
 
@@ -378,6 +392,26 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
 
     /// Get value for key
     pub fn get(&self, key: &K) -> Option<V> {
+        let cached_idx = self.last_accessed_leaf.load(Ordering::Relaxed);
+        if cached_idx != CACHE_NONE {
+            if let Some(Node::Leaf(leaf)) = self.nodes.get(cached_idx) {
+                // Determine bounds
+                let min_match = leaf.keys.first().map_or(false, |k| key >= k);
+                let max_match = leaf.keys.last().map_or(false, |k| key <= k);
+
+                if min_match && max_match {
+                    let (pos, found) = leaf.search(key);
+                    if found {
+                        // Hint was useful and valid, it's already set correctly
+                        return Some(leaf.values[pos].clone());
+                    }
+                }
+            } else {
+                // Hint pointed to non-leaf or out of bounds
+                self.last_accessed_leaf.store(CACHE_NONE, Ordering::Relaxed);
+            }
+        }
+
         let root_idx = self.root?;
         let mut node_idx = root_idx;
 
@@ -386,6 +420,7 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
                 Node::Leaf(leaf) => {
                     let (pos, found) = leaf.search(key);
                     return if found {
+                        self.last_accessed_leaf.store(node_idx, Ordering::Relaxed);
                         Some(leaf.values[pos].clone())
                     } else {
                         None
@@ -408,6 +443,8 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
     /// Remove a key, returning its value if it existed
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let mut path = BPTreePath::new();
+        // Invalidate hint on modification
+        self.last_accessed_leaf.store(CACHE_NONE, Ordering::Relaxed);
         if !self.locate(key, &mut path) {
             return None;
         }
@@ -624,8 +661,6 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         }
     }
 
-    /// Insert into a full leaf, splitting as needed
-    /// Returns the index of the new right leaf if a split occurred at the leaf level
     fn insert_full_leaf(&mut self, key: K, value: V, mut path: BPTreePath) -> Option<usize> {
         let (leaf_idx, insert_pos) = path.pop().unwrap();
 
@@ -633,12 +668,37 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         let (right_leaf, median) = if let Node::Leaf(leaf) = &mut self.nodes[leaf_idx] {
             // First insert, then split
             leaf.insert(insert_pos, key, value);
-            leaf.split()
+            let next_idx = leaf.next;
+            let (mut right, median) = leaf.split();
+
+            // Link new right leaf
+            right.next = next_idx;
+            right.prev = Some(leaf_idx);
+
+            (right, median)
         } else {
             unreachable!()
         };
 
         let right_idx = self.alloc_node(Node::Leaf(right_leaf));
+
+        // Finalize links
+        if let Node::Leaf(leaf) = &mut self.nodes[leaf_idx] {
+            leaf.next = Some(right_idx);
+        }
+
+        // Link the node that was previously after leaf_idx
+        let next_idx = if let Node::Leaf(right) = &self.nodes[right_idx] {
+            right.next
+        } else {
+            None
+        };
+
+        if let Some(n_idx) = next_idx {
+            if let Node::Leaf(next_leaf) = &mut self.nodes[n_idx] {
+                next_leaf.prev = Some(right_idx);
+            }
+        }
 
         // Propagate split up the tree
         self.propagate_split(median, right_idx, &mut path);
@@ -989,13 +1049,28 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
             };
 
             // Merge into left
+            let next_idx = if let Node::Leaf(node) = &self.nodes[node_idx] {
+                node.next
+            } else {
+                unreachable!()
+            };
+
             if let Node::Leaf(left) = &mut self.nodes[left_idx] {
-                left.keys.push(separator);
-                left.values.push(values[0].clone()); // Dummy value for separator
-                left.keys.pop(); // Actually, leaf merge doesn't use separator
-                left.values.pop();
                 left.keys.extend(keys);
                 left.values.extend(values);
+                left.next = next_idx;
+            }
+
+            // Update next node's prev pointer
+            if let Some(n_idx) = next_idx {
+                if let Node::Leaf(next_node) = &mut self.nodes[n_idx] {
+                    next_node.prev = Some(left_idx);
+                }
+            }
+
+            // Update last_leaf cache
+            if self.last_leaf == Some(node_idx) {
+                self.last_leaf = Some(left_idx);
             }
 
             self.free_node(node_idx);
@@ -1051,17 +1126,29 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         let is_leaf = self.nodes[node_idx].is_leaf();
 
         if is_leaf {
-            // Get right's data
-            let (keys, values) = if let Node::Leaf(right) = &self.nodes[right_idx] {
-                (right.keys.clone(), right.values.clone())
+            // Merge right into node (not using separator for leaf)
+            let (keys, values, next_idx) = if let Node::Leaf(right) = &self.nodes[right_idx] {
+                (right.keys.clone(), right.values.clone(), right.next)
             } else {
                 return;
             };
 
-            // Merge right into node (not using separator for leaf)
             if let Node::Leaf(node) = &mut self.nodes[node_idx] {
                 node.keys.extend(keys);
                 node.values.extend(values);
+                node.next = next_idx;
+            }
+
+            // Update next node's prev pointer
+            if let Some(n_idx) = next_idx {
+                if let Node::Leaf(next_node) = &mut self.nodes[n_idx] {
+                    next_node.prev = Some(node_idx);
+                }
+            }
+
+            // Update last_leaf cache
+            if self.last_leaf == Some(right_idx) {
+                self.last_leaf = Some(node_idx);
             }
 
             self.free_node(right_idx);
@@ -1246,26 +1333,29 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
 /// Iterator over all entries
 pub struct Iter<'a, K: Clone + Ord, V: Clone> {
     tree: &'a BPTree<K, V>,
-    start_path: BPTreePath,
-    end_path: BPTreePath,
+    current_leaf_idx: Option<usize>,
+    current_pos: usize,
+    back_leaf_idx: Option<usize>,
+    back_pos: usize,
     yielded_count: usize,
     total_count: usize,
 }
 
 impl<'a, K: Clone + Ord, V: Clone> Iter<'a, K, V> {
     fn new(tree: &'a BPTree<K, V>) -> Self {
-        let mut start_path = BPTreePath::new();
-        let mut end_path = BPTreePath::new();
-
-        if let Some(root_idx) = tree.root {
-            tree.descend_left(&mut start_path, root_idx);
-            tree.descend_right(&mut end_path, root_idx);
-        }
-
         Self {
             tree,
-            start_path,
-            end_path,
+            current_leaf_idx: tree.first_leaf,
+            current_pos: 0,
+            back_leaf_idx: tree.last_leaf,
+            back_pos: tree.last().map_or(0, |_| {
+                if let Some(idx) = tree.last_leaf {
+                    if let Node::Leaf(leaf) = &tree.nodes[idx] {
+                        return leaf.len().saturating_sub(1);
+                    }
+                }
+                0
+            }),
             yielded_count: 0,
             total_count: tree.len(),
         }
@@ -1280,23 +1370,28 @@ impl<'a, K: Clone + Ord, V: Clone> Iterator for Iter<'a, K, V> {
             return None;
         }
 
-        let (node_idx, pos) = self.start_path.last()?;
-        let result = if let Node::Leaf(leaf) = &self.tree.nodes[node_idx]
-            && pos < leaf.len()
-        {
-            Some((leaf.keys[pos].clone(), leaf.values[pos].clone()))
+        let leaf_idx = self.current_leaf_idx?;
+        let result = if let Node::Leaf(leaf) = &self.tree.nodes[leaf_idx] {
+            let res = (
+                leaf.keys[self.current_pos].clone(),
+                leaf.values[self.current_pos].clone(),
+            );
+
+            // Advance
+            self.current_pos += 1;
+            if self.current_pos >= leaf.len() {
+                self.current_leaf_idx = leaf.next;
+                self.current_pos = 0;
+            }
+
+            Some(res)
         } else {
             None
         };
 
         if result.is_some() {
             self.yielded_count += 1;
-            // Advance start path
-            if self.yielded_count < self.total_count {
-                self.tree.path_next(&mut self.start_path);
-            }
         }
-
         result
     }
 }
@@ -1307,23 +1402,33 @@ impl<'a, K: Clone + Ord, V: Clone> DoubleEndedIterator for Iter<'a, K, V> {
             return None;
         }
 
-        let (node_idx, pos) = self.end_path.last()?;
-        let result = if let Node::Leaf(leaf) = &self.tree.nodes[node_idx]
-            && pos < leaf.len()
-        {
-            Some((leaf.keys[pos].clone(), leaf.values[pos].clone()))
+        let leaf_idx = self.back_leaf_idx?;
+        let result = if let Node::Leaf(leaf) = &self.tree.nodes[leaf_idx] {
+            let res = (
+                leaf.keys[self.back_pos].clone(),
+                leaf.values[self.back_pos].clone(),
+            );
+
+            // Retreat
+            if self.back_pos > 0 {
+                self.back_pos -= 1;
+            } else {
+                self.back_leaf_idx = leaf.prev;
+                if let Some(prev_idx) = self.back_leaf_idx {
+                    if let Node::Leaf(prev_leaf) = &self.tree.nodes[prev_idx] {
+                        self.back_pos = prev_leaf.len().saturating_sub(1);
+                    }
+                }
+            }
+
+            Some(res)
         } else {
             None
         };
 
         if result.is_some() {
             self.yielded_count += 1;
-            // Retreat end path
-            if self.yielded_count < self.total_count {
-                self.tree.path_prev(&mut self.end_path);
-            }
         }
-
         result
     }
 }
@@ -1386,14 +1491,15 @@ impl<'a, K: Clone + Ord, V: Clone> RangeIter<'a, K, V> {
 
     /// Slow path: move to next leaf node
     fn advance_to_next_leaf(&mut self) -> bool {
-        if !self.tree.path_next(&mut self.path) {
-            return false;
-        }
+        let next_idx = if let Node::Leaf(leaf) = &self.tree.nodes[self.current_leaf_idx] {
+            leaf.next
+        } else {
+            None
+        };
 
-        // Update cached leaf info
-        if let Some((idx, pos)) = self.path.last() {
+        if let Some(idx) = next_idx {
             self.current_leaf_idx = idx;
-            self.current_pos = pos;
+            self.current_pos = 0;
             if let Node::Leaf(leaf) = &self.tree.nodes[idx] {
                 self.current_leaf_len = leaf.len();
                 return true;

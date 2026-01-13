@@ -4,6 +4,8 @@
 //! Operations are organized into separate modules by data type to keep the codebase
 //! maintainable as new commands are added.
 
+pub mod dashtable;
+pub use dashtable::{DashTable, calculate_hash};
 mod multi_store;
 mod store;
 mod types;
@@ -22,6 +24,8 @@ pub mod timeseries;
 pub mod eviction;
 pub mod ops;
 
+#[cfg(test)]
+mod bptree_bench;
 // Re-export the main Store struct
 pub use multi_store::{DEFAULT_DB_COUNT, MultiStore};
 pub use store::Store;

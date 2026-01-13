@@ -1,3 +1,4 @@
+use crate::storage::dashtable::{DashTable, calculate_hash};
 use bytes::Bytes;
 use dashmap::DashMap;
 use roaring::RoaringBitmap;
@@ -665,7 +666,7 @@ fn encode_geohash(lat: f64, lon: f64, precision: usize) -> String {
 impl Store {
     /// Get search indexes map from Store field
     #[inline]
-    fn search_indexes(&self) -> &DashMap<Bytes, SearchIndex> {
+    fn search_indexes(&self) -> &DashTable<(Bytes, SearchIndex)> {
         &self.search_indexes
     }
 
@@ -679,7 +680,8 @@ impl Store {
     ) -> Result<()> {
         let indexes = self.search_indexes();
 
-        if indexes.contains_key(&name) {
+        let h = calculate_hash(&name);
+        if indexes.get(h, |kv| kv.0 == name).is_some() {
             return Err(Error::Custom("Index already exists".into()));
         }
 
@@ -687,7 +689,13 @@ impl Store {
         index.key_prefixes = prefixes;
         index.schema = schema;
 
-        indexes.insert(name, index);
+        let h = calculate_hash(&name);
+        indexes.insert(
+            h,
+            (name.clone(), index),
+            |kv| kv.0 == name,
+            |kv| calculate_hash(&kv.0),
+        );
         Ok(())
     }
 
@@ -695,7 +703,8 @@ impl Store {
     pub fn ft_dropindex(&self, name: &[u8], delete_docs: bool) -> Result<()> {
         let indexes = self.search_indexes();
 
-        let removed = indexes.remove(name);
+        let h = calculate_hash(name);
+        let removed = indexes.remove(h, |kv| kv.0 == name);
         if removed.is_none() {
             return Err(Error::Custom("Unknown Index name".into()));
         }
@@ -717,16 +726,18 @@ impl Store {
     /// List all search indexes
     pub fn ft_list(&self) -> Vec<Bytes> {
         let indexes = self.search_indexes();
-        indexes.iter().map(|r| r.key().clone()).collect()
+        indexes.iter().map(|r| r.0.clone()).collect()
     }
 
     /// Get index info
     pub fn ft_info(&self, name: &[u8]) -> Result<SearchIndex> {
         let indexes = self.search_indexes();
+        let h = calculate_hash(name);
 
         indexes
-            .get(name)
+            .get(h, |kv| kv.0 == name)
             .map(|r| {
+                let r = &r.1;
                 // Return a minimal clone for info purposes
                 SearchIndex {
                     name: r.name.clone(),
@@ -760,10 +771,11 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<(Bytes, f64)>> {
         let indexes = self.search_indexes();
+        let h = calculate_hash(index_name);
 
         indexes
-            .get(index_name)
-            .map(|idx| idx.search(query, offset, limit))
+            .get(h, |kv| kv.0 == index_name)
+            .map(|idx| idx.1.search(query, offset, limit))
             .ok_or(Error::Custom("Unknown Index name".into()))
     }
 
@@ -771,7 +783,8 @@ impl Store {
     pub fn ft_index_document(&self, key: &Bytes, fields: &HashMap<Bytes, Bytes>) {
         let indexes = self.search_indexes();
 
-        for index in indexes.iter() {
+        for entry in indexes.iter() {
+            let index = &entry.1;
             // Check if key matches any prefix
             let matches_prefix = index.key_prefixes.is_empty()
                 || index
@@ -787,7 +800,7 @@ impl Store {
 
     /// Get alias map from Store field
     #[inline]
-    fn search_aliases(&self) -> &DashMap<Bytes, Bytes> {
+    fn search_aliases(&self) -> &DashTable<(Bytes, Bytes)> {
         &self.search_aliases
     }
 
@@ -796,22 +809,30 @@ impl Store {
         let indexes = self.search_indexes();
         let aliases = self.search_aliases();
 
-        if !indexes.contains_key(index_name) {
+        let h_idx = calculate_hash(index_name);
+        if indexes.get(h_idx, |kv| kv.0 == index_name).is_none() {
             return Err(Error::Custom("Unknown Index name".into()));
         }
 
-        if aliases.contains_key(&alias) {
+        let h_alias = calculate_hash(&alias);
+        if aliases.get(h_alias, |kv| kv.0 == alias).is_some() {
             return Err(Error::Custom("Alias already exists".into()));
         }
 
-        aliases.insert(alias, Bytes::copy_from_slice(index_name));
+        aliases.insert(
+            h_alias,
+            (alias.clone(), Bytes::copy_from_slice(index_name)),
+            |kv| kv.0 == alias,
+            |kv| calculate_hash(&kv.0),
+        );
         Ok(())
     }
 
     /// Delete alias
     pub fn ft_aliasdel(&self, alias: &[u8]) -> Result<()> {
         let aliases = self.search_aliases();
-        if aliases.remove(alias).is_none() {
+        let h = calculate_hash(alias);
+        if aliases.remove(h, |kv| kv.0 == alias).is_none() {
             return Err(Error::Custom("Alias does not exist".into()));
         }
         Ok(())
@@ -822,27 +843,37 @@ impl Store {
         let indexes = self.search_indexes();
         let aliases = self.search_aliases();
 
-        if !indexes.contains_key(index_name) {
+        let h_idx = calculate_hash(index_name);
+        if indexes.get(h_idx, |kv| kv.0 == index_name).is_none() {
             return Err(Error::Custom("Unknown Index name".into()));
         }
 
-        aliases.insert(alias, Bytes::copy_from_slice(index_name));
+        let h_alias = calculate_hash(&alias);
+        aliases.insert(
+            h_alias,
+            (alias.clone(), Bytes::copy_from_slice(index_name)),
+            |kv| kv.0 == alias,
+            |kv| calculate_hash(&kv.0),
+        );
         Ok(())
     }
 
     /// Resolve alias to index name
     pub fn ft_resolve_alias(&self, name: &[u8]) -> Option<Bytes> {
         let aliases = self.search_aliases();
-        aliases.get(name).map(|r| r.value().clone())
+        let h = calculate_hash(name);
+        aliases.get(h, |kv| kv.0 == name).map(|r| r.1.clone())
     }
 
     /// Get unique tag values for a field in an index
     pub fn ft_tagvals(&self, index_name: &[u8], field_name: &[u8]) -> Result<Vec<Bytes>> {
         let indexes = self.search_indexes();
+        let h = calculate_hash(index_name);
 
-        let index = indexes
-            .get(index_name)
+        let index_ref = indexes
+            .get(h, |kv| kv.0 == index_name)
             .ok_or_else(|| Error::Custom("Unknown Index name".into()))?;
+        let index = &index_ref.1;
 
         // Find the field to verify it's a TAG field
         let field = index
