@@ -149,19 +149,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_acceptor = if config.tls_port > 0 {
         match (&config.tls_cert_file, &config.tls_key_file) {
             (Some(cert_file), Some(key_file)) => {
-                match sockudo_kv::tls::load_tls_config(
-                    cert_file,
-                    key_file,
-                    config.tls_key_file_pass.as_deref(),
-                    config.tls_ca_cert_file.as_deref(),
-                    &config.tls_auth_clients,
-                    if config.tls_session_caching {
-                        config.tls_session_cache_size
-                    } else {
-                        0
+                match sockudo_kv::tls::load_tls_config_with_options(
+                    &sockudo_kv::tls::TlsServerOptions {
+                        cert_path: cert_file,
+                        key_path: key_file,
+                        key_password: config.tls_key_file_pass.as_deref(),
+                        ca_cert_file: config.tls_ca_cert_file.as_deref(),
+                        ca_cert_dir: config.tls_ca_cert_dir.as_deref(),
+                        auth_clients: &config.tls_auth_clients,
+                        session_cache_size: if config.tls_session_caching {
+                            config.tls_session_cache_size
+                        } else {
+                            0
+                        },
+                        session_cache_timeout: config.tls_session_cache_timeout,
+                        prefer_server_ciphers: config.tls_prefer_server_ciphers,
+                        protocols: config.tls_protocols.as_deref(),
+                        ciphers: config.tls_ciphers.as_deref(),
+                        ciphersuites: config.tls_ciphersuites.as_deref(),
                     },
-                    config.tls_session_cache_timeout,
-                    config.tls_prefer_server_ciphers,
                 ) {
                     Ok(tls_config) => {
                         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -272,19 +278,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cluster_tls_acceptor, cluster_tls_client_config) = if config.tls_cluster {
         let acceptor = match (&config.tls_cert_file, &config.tls_key_file) {
             (Some(cert), Some(key)) => {
-                match sockudo_kv::tls::load_tls_config(
-                    cert,
-                    key,
-                    config.tls_key_file_pass.as_deref(),
-                    config.tls_ca_cert_file.as_deref(),
-                    &config.tls_auth_clients, // Use same auth policy? Or strict?
-                    if config.tls_session_caching {
-                        config.tls_session_cache_size
-                    } else {
-                        0
+                match sockudo_kv::tls::load_tls_config_with_options(
+                    &sockudo_kv::tls::TlsServerOptions {
+                        cert_path: cert,
+                        key_path: key,
+                        key_password: config.tls_key_file_pass.as_deref(),
+                        ca_cert_file: config.tls_ca_cert_file.as_deref(),
+                        ca_cert_dir: config.tls_ca_cert_dir.as_deref(),
+                        auth_clients: &config.tls_auth_clients,
+                        session_cache_size: if config.tls_session_caching {
+                            config.tls_session_cache_size
+                        } else {
+                            0
+                        },
+                        session_cache_timeout: config.tls_session_cache_timeout,
+                        prefer_server_ciphers: config.tls_prefer_server_ciphers,
+                        protocols: config.tls_protocols.as_deref(),
+                        ciphers: config.tls_ciphers.as_deref(),
+                        ciphersuites: config.tls_ciphersuites.as_deref(),
                     },
-                    config.tls_session_cache_timeout,
-                    config.tls_prefer_server_ciphers,
                 ) {
                     Ok(cfg) => Some(tokio_rustls::TlsAcceptor::from(cfg)),
                     Err(e) => {
@@ -296,10 +308,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         };
 
-        let client_config = match sockudo_kv::tls::load_client_tls_config(
-            config.tls_ca_cert_file.as_deref(),
-            config.tls_cert_file.as_deref(),
-            config.tls_key_file.as_deref(),
+        let client_config = match sockudo_kv::tls::load_client_tls_config_with_options(
+            &sockudo_kv::tls::TlsClientOptions {
+                ca_cert_file: config.tls_ca_cert_file.as_deref(),
+                ca_cert_dir: config.tls_ca_cert_dir.as_deref(),
+                client_cert_file: config
+                    .tls_client_cert_file
+                    .as_deref()
+                    .or(config.tls_cert_file.as_deref()),
+                client_key_file: config
+                    .tls_client_key_file
+                    .as_deref()
+                    .or(config.tls_key_file.as_deref()),
+                client_key_password: config.tls_client_key_file_pass.as_deref(),
+                protocols: config.tls_protocols.as_deref(),
+                ciphers: config.tls_ciphers.as_deref(),
+                ciphersuites: config.tls_ciphersuites.as_deref(),
+            },
         ) {
             Ok(cfg) => Some(cfg),
             Err(e) => {

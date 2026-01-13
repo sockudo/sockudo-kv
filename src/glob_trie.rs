@@ -50,6 +50,12 @@ pub struct GlobTrie<V> {
     count: usize,
 }
 
+impl<V> Default for GlobTrie<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<V> GlobTrie<V> {
     pub fn new() -> Self {
         Self {
@@ -187,10 +193,8 @@ impl<V> GlobTrie<V> {
                     return Self::remove_recursive(child, count, p, i + 1);
                 }
             }
-        } else {
-            if let Some(child) = node.children.get_mut(&b) {
-                return Self::remove_recursive(child, count, p, i + 1);
-            }
+        } else if let Some(child) = node.children.get_mut(&b) {
+            return Self::remove_recursive(child, count, p, i + 1);
         }
         None
     }
@@ -234,10 +238,10 @@ impl<V> GlobTrie<V> {
             // But `*` is tricky. `*` loop might leave us "here" with different `ti`.
             // Actually, we should verify the Full Pattern match at the end to be 100% sure,
             // especially due to the `[...]` -> `?` simplification.
-            if let Some(ref pat) = node.pattern {
-                if crate::pattern::matches_glob(pat, text) {
-                    results.push((pat, val));
-                }
+            if let Some(ref pat) = node.pattern
+                && crate::pattern::matches_glob(pat, text)
+            {
+                results.push((pat, val));
             }
         }
 
@@ -250,10 +254,10 @@ impl<V> GlobTrie<V> {
         }
 
         // 3. Try '?' Wildcard (matches any single char)
-        if ti < text.len() {
-            if let Some(ref child) = node.question_child {
-                self.match_recursive(child, text, ti + 1, results);
-            }
+        if ti < text.len()
+            && let Some(ref child) = node.question_child
+        {
+            self.match_recursive(child, text, ti + 1, results);
         }
 
         // 4. Try '*' Wildcard (matches 0 or more chars)
@@ -328,13 +332,11 @@ impl<V> GlobTrie<V> {
                         return None;
                     }
                 }
+            } else if let Some(child) = node.children.get_mut(&b) {
+                node = child;
+                i += 1;
             } else {
-                if let Some(child) = node.children.get_mut(&b) {
-                    node = child;
-                    i += 1;
-                } else {
-                    return None;
-                }
+                return None;
             }
         }
 
@@ -343,5 +345,9 @@ impl<V> GlobTrie<V> {
 
     pub fn len(&self) -> usize {
         self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 }

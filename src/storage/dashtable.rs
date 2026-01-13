@@ -135,7 +135,7 @@ impl<T> DashTable<T> {
         let guard = self.shards[shard_idx].read();
 
         // Safety: Extend lifetime of the reference since we hold the guard.
-        let shard: &HashTable<T> = &*guard;
+        let shard: &HashTable<T> = &guard;
         let value = shard.find(hash, |v| eq(v))?;
         let value: &'a T = unsafe { &*(value as *const T) };
 
@@ -248,6 +248,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
 
             let guard = self.table.shards[self.shard_idx].read();
             // Safety: Transmuting to extend lifetime because we hold the guard.
+            #[allow(clippy::missing_transmute_annotations)]
             let iter = unsafe { std::mem::transmute(guard.iter()) };
             self.current_guard = Some((guard, iter));
             self.shard_idx += 1;

@@ -1642,6 +1642,626 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         setter: int_setter!(socket_mark_id, u32),
         applier: None,
     },
+    // === Network (additional) ===
+    ConfigEntry {
+        name: "unixsocket",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.unixsocket.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "unixsocketperm",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::Integer,
+        default_value: "0",
+        getter: |c| c.unixsocketperm.map(|v| v.to_string()).unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "bind-source-addr",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.bind_source_addr.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    // === TLS (file paths and additional) ===
+    ConfigEntry {
+        name: "tls-cert-file",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.tls_cert_file.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-key-file",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.tls_key_file.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-key-file-pass",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE.union(ConfigFlags::SENSITIVE),
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |_| "".to_string(), // Don't expose passwords
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-client-cert-file",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.tls_client_cert_file.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-client-key-file",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.tls_client_key_file.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-client-key-file-pass",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE.union(ConfigFlags::SENSITIVE),
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |_| "".to_string(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-dh-params-file",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.tls_dh_params_file.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-ca-cert-file",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.tls_ca_cert_file.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-ca-cert-dir",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.tls_ca_cert_dir.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-auth-clients-user",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "off",
+        getter: |c| {
+            c.tls_auth_clients_user
+                .clone()
+                .unwrap_or_else(|| "off".to_string())
+        },
+        setter: |c, v| {
+            c.tls_auth_clients_user = if v == "off" {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-protocols",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.tls_protocols.clone().unwrap_or_default(),
+        setter: |c, v| {
+            c.tls_protocols = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-ciphers",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.tls_ciphers.clone().unwrap_or_default(),
+        setter: |c, v| {
+            c.tls_ciphers = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "tls-ciphersuites",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.tls_ciphersuites.clone().unwrap_or_default(),
+        setter: |c, v| {
+            c.tls_ciphersuites = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    // === Security ===
+    ConfigEntry {
+        name: "requirepass",
+        alias: None,
+        flags: ConfigFlags::SENSITIVE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |_| "".to_string(), // Don't expose password
+        setter: |c, v| {
+            c.requirepass = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "aclfile",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.aclfile.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    // === Replication (additional) ===
+    ConfigEntry {
+        name: "replicaof",
+        alias: Some("slaveof"),
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| {
+            c.replicaof
+                .as_ref()
+                .map(|(h, p)| format!("{} {}", h, p))
+                .unwrap_or_default()
+        },
+        setter: |c, v| {
+            if v.is_empty() || v.to_lowercase() == "no one" {
+                c.replicaof = None;
+            } else {
+                let parts: Vec<&str> = v.split_whitespace().collect();
+                if parts.len() == 2 {
+                    let port = parts[1].parse().map_err(|_| "Invalid port")?;
+                    c.replicaof = Some((parts[0].to_string(), port));
+                } else {
+                    return Err("Invalid replicaof format".into());
+                }
+            }
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "masterauth",
+        alias: None,
+        flags: ConfigFlags::SENSITIVE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |_| "".to_string(),
+        setter: |c, v| {
+            c.masterauth = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "masteruser",
+        alias: None,
+        flags: ConfigFlags::SENSITIVE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.masteruser.clone().unwrap_or_default(),
+        setter: |c, v| {
+            c.masteruser = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "replica-announce-ip",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.replica_announce_ip.clone().unwrap_or_default(),
+        setter: |c, v| {
+            c.replica_announce_ip = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "replica-announce-port",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Integer,
+        default_value: "0",
+        getter: |c| {
+            c.replica_announce_port
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "0".to_string())
+        },
+        setter: |c, v| {
+            let port: u16 = v.parse().map_err(|_| "Invalid port")?;
+            c.replica_announce_port = if port == 0 { None } else { Some(port) };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "replica-full-sync-buffer-limit",
+        alias: None,
+        flags: ConfigFlags::MEMORY,
+        config_type: ConfigType::Memory,
+        default_value: "0",
+        getter: int_getter!(replica_full_sync_buffer_limit),
+        setter: int_setter!(replica_full_sync_buffer_limit, u64),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "replica-ignore-disk-write-errors",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "no",
+        getter: string_getter!(replica_ignore_disk_write_errors),
+        setter: string_setter!(replica_ignore_disk_write_errors),
+        applier: None,
+    },
+    // === Cluster (additional) ===
+    ConfigEntry {
+        name: "cluster-announce-ip",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.cluster_announce_ip.clone().unwrap_or_default(),
+        setter: |c, v| {
+            c.cluster_announce_ip = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "cluster-announce-port",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Integer,
+        default_value: "0",
+        getter: |c| {
+            c.cluster_announce_port
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "0".to_string())
+        },
+        setter: |c, v| {
+            let port: u16 = v.parse().map_err(|_| "Invalid port")?;
+            c.cluster_announce_port = if port == 0 { None } else { Some(port) };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "cluster-announce-tls-port",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Integer,
+        default_value: "0",
+        getter: |c| {
+            c.cluster_announce_tls_port
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "0".to_string())
+        },
+        setter: |c, v| {
+            let port: u16 = v.parse().map_err(|_| "Invalid port")?;
+            c.cluster_announce_tls_port = if port == 0 { None } else { Some(port) };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "cluster-announce-bus-port",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Integer,
+        default_value: "0",
+        getter: |c| {
+            c.cluster_announce_bus_port
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "0".to_string())
+        },
+        setter: |c, v| {
+            let port: u16 = v.parse().map_err(|_| "Invalid port")?;
+            c.cluster_announce_bus_port = if port == 0 { None } else { Some(port) };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "cluster-announce-hostname",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.cluster_announce_hostname.clone().unwrap_or_default(),
+        setter: |c, v| {
+            c.cluster_announce_hostname = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "cluster-announce-human-nodename",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| {
+            c.cluster_announce_human_nodename
+                .clone()
+                .unwrap_or_default()
+        },
+        setter: |c, v| {
+            c.cluster_announce_human_nodename = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    ConfigEntry {
+        name: "cluster-compatibility-sample-ratio",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Integer,
+        default_value: "0",
+        getter: int_getter!(cluster_compatibility_sample_ratio),
+        setter: int_setter!(cluster_compatibility_sample_ratio, u32),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "cluster-slot-stats-enabled",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Bool,
+        default_value: "no",
+        getter: bool_getter!(cluster_slot_stats_enabled),
+        setter: bool_setter!(cluster_slot_stats_enabled),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "cluster-slot-migration-write-pause-timeout",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Integer,
+        default_value: "10000",
+        getter: int_getter!(cluster_slot_migration_write_pause_timeout),
+        setter: int_setter!(cluster_slot_migration_write_pause_timeout, u64),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "cluster-slot-migration-handoff-max-lag-bytes",
+        alias: None,
+        flags: ConfigFlags::MEMORY,
+        config_type: ConfigType::Memory,
+        default_value: "1048576",
+        getter: int_getter!(cluster_slot_migration_handoff_max_lag_bytes),
+        setter: int_setter!(cluster_slot_migration_handoff_max_lag_bytes, u64),
+        applier: None,
+    },
+    // === AOF (additional) ===
+    ConfigEntry {
+        name: "aof-load-corrupt-tail-max-size",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Integer,
+        default_value: "0",
+        getter: int_getter!(aof_load_corrupt_tail_max_size),
+        setter: int_setter!(aof_load_corrupt_tail_max_size, u64),
+        applier: None,
+    },
+    // === CPU Affinity ===
+    ConfigEntry {
+        name: "server-cpulist",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.server_cpulist.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "bio-cpulist",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.bio_cpulist.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "aof-rewrite-cpulist",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.aof_rewrite_cpulist.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "bgsave-cpulist",
+        alias: None,
+        flags: ConfigFlags::IMMUTABLE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.bgsave_cpulist.clone().unwrap_or_default(),
+        setter: immutable_setter!(),
+        applier: None,
+    },
+    // === OOM Score Adjustment ===
+    ConfigEntry {
+        name: "oom-score-adj-values",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "0 200 800",
+        getter: |c| {
+            format!(
+                "{} {} {}",
+                c.oom_score_adj_values.0, c.oom_score_adj_values.1, c.oom_score_adj_values.2
+            )
+        },
+        setter: |c, v| {
+            let parts: Vec<&str> = v.split_whitespace().collect();
+            if parts.len() != 3 {
+                return Err("Expected 3 values".into());
+            }
+            let v0: i32 = parts[0].parse().map_err(|_| "Invalid integer")?;
+            let v1: i32 = parts[1].parse().map_err(|_| "Invalid integer")?;
+            let v2: i32 = parts[2].parse().map_err(|_| "Invalid integer")?;
+            c.oom_score_adj_values = (v0, v1, v2);
+            Ok(())
+        },
+        applier: None,
+    },
+    // === Misc ===
+    ConfigEntry {
+        name: "ignore-warnings",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "",
+        getter: |c| c.ignore_warnings.clone().unwrap_or_default(),
+        setter: |c, v| {
+            c.ignore_warnings = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok(())
+        },
+        applier: None,
+    },
+    // === Save Points ===
+    ConfigEntry {
+        name: "save",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::String,
+        default_value: "3600 1 300 100 60 10000",
+        getter: |c| {
+            c.save_points
+                .iter()
+                .map(|(s, ch)| format!("{} {}", s, ch))
+                .collect::<Vec<_>>()
+                .join(" ")
+        },
+        setter: |c, v| {
+            if v.is_empty() || v == "\"\"" {
+                c.save_points = Vec::new();
+                return Ok(());
+            }
+            let parts: Vec<&str> = v.split_whitespace().collect();
+            if !parts.len().is_multiple_of(2) {
+                return Err("save requires pairs of <seconds> <changes>".into());
+            }
+            let mut new_points = Vec::new();
+            for chunk in parts.chunks(2) {
+                let seconds: u64 = chunk[0].parse().map_err(|_| "Invalid seconds")?;
+                let changes: u64 = chunk[1].parse().map_err(|_| "Invalid changes")?;
+                new_points.push((seconds, changes));
+            }
+            c.save_points = new_points;
+            Ok(())
+        },
+        applier: None,
+    },
 ];
 
 /// Find a config entry by name or alias

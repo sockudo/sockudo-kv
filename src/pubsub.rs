@@ -109,6 +109,7 @@ impl PubSub {
         if let Some((_, sub)) = self.subscribers.remove(&id) {
             // Remove from all channels
             for channel in sub.channels.iter() {
+                #[allow(clippy::explicit_auto_deref)]
                 if let Some(subs) = self.channels.get(&*channel) {
                     subs.remove(&id);
                     if subs.is_empty() {
@@ -120,6 +121,7 @@ impl PubSub {
             // Remove from all patterns
             for pattern in sub.patterns.iter() {
                 let mut patterns = self.patterns.write();
+                #[allow(clippy::explicit_auto_deref)]
                 if let Some(subs) = patterns.get_mut(&*pattern) {
                     subs.remove(&id);
                     if subs.is_empty() {
@@ -286,10 +288,10 @@ impl PubSub {
     /// This is an optimized check to avoid allocation in keyspace notifications
     pub fn has_subscribers_for_channel(&self, channel: &[u8]) -> bool {
         // Check exact channel match
-        if let Some(subs) = self.channels.get(channel) {
-            if !subs.is_empty() {
-                return true;
-            }
+        if let Some(subs) = self.channels.get(channel)
+            && !subs.is_empty()
+        {
+            return true;
         }
 
         // Check pattern matches
