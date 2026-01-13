@@ -18,6 +18,7 @@ pub mod hyperloglog;
 pub mod bench_ops;
 pub mod bptree;
 pub mod intset;
+pub mod listpack;
 pub mod quicklist;
 
 // Ultra-high-performance TimeSeries with Gorilla compression

@@ -152,6 +152,15 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType) {
                 write_string(rdb, &item.1);
             }
         }
+        DataType::HashPacked(lp) => {
+            rdb.push(RDB_TYPE_HASH);
+            write_string(rdb, key);
+            write_length(rdb, lp.len());
+            for (k, v) in lp.iter() {
+                write_string(rdb, &k);
+                write_string(rdb, &v);
+            }
+        }
         DataType::SortedSet(zset) => {
             rdb.push(RDB_TYPE_ZSET);
             write_string(rdb, key);
@@ -160,6 +169,16 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType) {
                 write_string(rdb, member);
                 // Write score as double
                 write_double(rdb, *score);
+            }
+        }
+        DataType::SortedSetPacked(lp) => {
+            rdb.push(RDB_TYPE_ZSET);
+            write_string(rdb, key);
+            write_length(rdb, lp.len());
+            for (member, score) in lp.ziter() {
+                write_string(rdb, &member);
+                // Write score as double
+                write_double(rdb, score);
             }
         }
         DataType::HyperLogLog(hll) => {

@@ -186,6 +186,8 @@ impl Store {
                 };
                 DataType::VectorSet(Box::new(new_vs))
             }
+            DataType::HashPacked(lp) => DataType::HashPacked(lp.clone()),
+            DataType::SortedSetPacked(lp) => DataType::SortedSetPacked(lp.clone()),
         };
 
         let new_entry = Entry::new(cloned_data);
@@ -432,8 +434,8 @@ impl Store {
             DataType::List(_) => 1,
             DataType::Set(_) => 2,
             DataType::IntSet(_) => 2, // Dump as regular set
-            DataType::Hash(_) => 3,
-            DataType::SortedSet(_) => 4,
+            DataType::Hash(_) | DataType::HashPacked(_) => 3,
+            DataType::SortedSet(_) | DataType::SortedSetPacked(_) => 4,
             DataType::Stream(_) => 5,
             DataType::HyperLogLog(_) => 6,
             DataType::Json(_) => 7,
@@ -481,11 +483,28 @@ impl Store {
                     data.extend_from_slice(&kv.1);
                 });
             }
+            DataType::HashPacked(lp) => {
+                write_varint(&mut data, lp.len() as u64);
+                for (k, v) in lp.iter() {
+                    write_varint(&mut data, k.len() as u64);
+                    data.extend_from_slice(&k);
+                    write_varint(&mut data, v.len() as u64);
+                    data.extend_from_slice(&v);
+                }
+            }
             DataType::SortedSet(zs) => {
                 write_varint(&mut data, zs.len() as u64);
                 for (member, &score) in zs.scores.iter() {
                     write_varint(&mut data, member.len() as u64);
                     data.extend_from_slice(member);
+                    data.extend_from_slice(&score.to_le_bytes());
+                }
+            }
+            DataType::SortedSetPacked(lp) => {
+                write_varint(&mut data, lp.len() as u64);
+                for (member, score) in lp.ziter() {
+                    write_varint(&mut data, member.len() as u64);
+                    data.extend_from_slice(&member);
                     data.extend_from_slice(&score.to_le_bytes());
                 }
             }

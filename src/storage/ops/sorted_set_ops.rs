@@ -2,33 +2,107 @@ use bytes::Bytes;
 
 use crate::error::{Error, Result};
 use crate::storage::Store;
+use crate::storage::listpack::{LISTPACK_MAX_ENTRY_SIZE, LISTPACK_ZSET_MAX_ENTRIES, Listpack};
 use crate::storage::types::{DataType, Entry, SortedSetData};
 
 use std::sync::atomic::Ordering;
+
+/// Check if a member should use packed encoding
+#[inline]
+fn should_use_packed(member: &[u8]) -> bool {
+    member.len() <= LISTPACK_MAX_ENTRY_SIZE
+}
+
+/// Upgrade a SortedSetPacked to a full SortedSet
+#[inline]
+fn upgrade_zset_packed_to_full(lp: &Listpack) -> SortedSetData {
+    let mut zset = SortedSetData::new();
+    for (member, score) in lp.ziter() {
+        zset.insert(member, score);
+    }
+    zset
+}
+
+/// Get sorted entries from listpack (needed for range operations)
+#[inline]
+fn get_sorted_from_packed(lp: &Listpack) -> Vec<(Bytes, f64)> {
+    lp.zrange_sorted()
+}
+
+/// Get scores HashMap from listpack (needed for set operations)
+#[inline]
+fn get_scores_from_packed(lp: &Listpack) -> std::collections::HashMap<Bytes, f64> {
+    lp.ziter().collect()
+}
 
 /// Sorted set operations for the Store
 impl Store {
     // ==================== Sorted Set operations ====================
 
-    /// Add members with scores to sorted set
+    /// Add members with scores to sorted set. Uses packed encoding for small sets.
     #[inline]
     pub fn zadd(&self, key: Bytes, members: Vec<(f64, Bytes)>) -> Result<usize> {
         match self.data_entry(&key) {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    let mut zset = SortedSetData::new();
-                    for (score, member) in &members {
-                        zset.insert(member.clone(), *score);
+                    // Expired entry: create new
+                    let should_pack = members.len() < LISTPACK_ZSET_MAX_ENTRIES
+                        && members.iter().all(|(_, m)| should_use_packed(m));
+
+                    if should_pack {
+                        let mut lp = Listpack::with_capacity(members.len());
+                        for (score, member) in &members {
+                            lp.zinsert(member, *score);
+                        }
+                        let count = lp.len();
+                        entry.data = DataType::SortedSetPacked(lp);
+                        entry.persist();
+                        entry.bump_version();
+                        return Ok(count);
+                    } else {
+                        let mut zset = SortedSetData::new();
+                        for (score, member) in &members {
+                            zset.insert(member.clone(), *score);
+                        }
+                        let count = zset.len();
+                        entry.data = DataType::SortedSet(zset);
+                        entry.persist();
+                        entry.bump_version();
+                        return Ok(count);
                     }
-                    let count = zset.len();
-                    entry.data = DataType::SortedSet(zset);
-                    entry.persist();
-                    entry.bump_version();
-                    return Ok(count);
                 }
 
-                let result = match &mut entry.data {
+                match &mut entry.data {
+                    DataType::SortedSetPacked(lp) => {
+                        // Check if we need to upgrade
+                        let needs_upgrade = members.iter().any(|(_, m)| !should_use_packed(m))
+                            || lp.len() + members.len() > LISTPACK_ZSET_MAX_ENTRIES;
+
+                        if needs_upgrade {
+                            // Upgrade to full SortedSet
+                            let mut zset = upgrade_zset_packed_to_full(lp);
+                            let mut added = 0;
+                            for (score, member) in &members {
+                                if zset.insert(member.clone(), *score) {
+                                    added += 1;
+                                }
+                            }
+                            entry.data = DataType::SortedSet(zset);
+                            entry.bump_version();
+                            Ok(added)
+                        } else {
+                            // Stay packed
+                            let mut added = 0;
+                            for (score, member) in &members {
+                                if lp.zinsert(member, *score) {
+                                    added += 1;
+                                }
+                            }
+                            entry.bump_version();
+                            Ok(added)
+                        }
+                    }
                     DataType::SortedSet(zset) => {
                         let mut added = 0;
                         for (score, member) in &members {
@@ -36,24 +110,36 @@ impl Store {
                                 added += 1;
                             }
                         }
+                        entry.bump_version();
                         Ok(added)
                     }
                     _ => Err(Error::WrongType),
-                };
-                if result.is_ok() {
-                    entry.bump_version();
                 }
-                result
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
-                let mut zset = SortedSetData::new();
-                for (score, member) in &members {
-                    zset.insert(member.clone(), *score);
+                // New key: use packed if small enough
+                let should_pack = members.len() < LISTPACK_ZSET_MAX_ENTRIES
+                    && members.iter().all(|(_, m)| should_use_packed(m));
+
+                if should_pack {
+                    let mut lp = Listpack::with_capacity(members.len());
+                    for (score, member) in &members {
+                        lp.zinsert(member, *score);
+                    }
+                    let count = lp.len();
+                    e.insert((key, Entry::new(DataType::SortedSetPacked(lp))));
+                    self.key_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(count)
+                } else {
+                    let mut zset = SortedSetData::new();
+                    for (score, member) in &members {
+                        zset.insert(member.clone(), *score);
+                    }
+                    let count = zset.len();
+                    e.insert((key, Entry::new(DataType::SortedSet(zset))));
+                    self.key_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(count)
                 }
-                let count = zset.len();
-                e.insert((key, Entry::new(DataType::SortedSet(zset))));
-                self.key_count.fetch_add(1, Ordering::Relaxed);
-                Ok(count)
             }
         }
     }
@@ -66,9 +152,10 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return None;
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(zset) => zset.score(member),
-                    None => None,
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => lp.zscore(member),
+                    DataType::SortedSet(zset) => zset.score(member),
+                    _ => None,
                 }
             }
             None => None,
@@ -83,9 +170,10 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return 0;
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(zset) => zset.len(),
-                    None => 0,
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => lp.len(),
+                    DataType::SortedSet(zset) => zset.len(),
+                    _ => 0,
                 }
             }
             None => 0,
@@ -100,16 +188,17 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return None;
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(zset) => zset.rank(member),
-                    None => None,
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => lp.zrank(member),
+                    DataType::SortedSet(zset) => zset.rank(member),
+                    _ => None,
                 }
             }
             None => None,
         }
     }
 
-    /// Get range of members by score
+    /// Get range of members by index
     #[inline]
     pub fn zrange(
         &self,
@@ -123,24 +212,24 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(zset) => {
+
+                let (len, sorted): (i64, Vec<(Bytes, f64)>) = match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => (lp.len() as i64, get_sorted_from_packed(lp)),
+                    DataType::SortedSet(zset) => {
                         let len = zset.len() as i64;
                         if len == 0 {
                             return vec![];
                         }
-
                         let start_idx = normalize_index(start, len);
                         let stop_idx = normalize_index(stop, len);
-
                         if start_idx > stop_idx || start_idx >= len {
                             return vec![];
                         }
-
                         let start_idx = start_idx.max(0) as usize;
                         let stop_idx = (stop_idx + 1).min(len) as usize;
 
-                        zset.by_score
+                        return zset
+                            .by_score
                             .iter()
                             .skip(start_idx)
                             .take(stop_idx - start_idx)
@@ -148,10 +237,34 @@ impl Store {
                                 let score_opt = if with_scores { Some(score.0) } else { None };
                                 (member.clone(), score_opt)
                             })
-                            .collect()
+                            .collect();
                     }
-                    None => vec![],
+                    _ => return vec![],
+                };
+
+                if len == 0 {
+                    return vec![];
                 }
+
+                let start_idx = normalize_index(start, len);
+                let stop_idx = normalize_index(stop, len);
+
+                if start_idx > stop_idx || start_idx >= len {
+                    return vec![];
+                }
+
+                let start_idx = start_idx.max(0) as usize;
+                let stop_idx = (stop_idx + 1).min(len) as usize;
+
+                sorted
+                    .into_iter()
+                    .skip(start_idx)
+                    .take(stop_idx - start_idx)
+                    .map(|(member, score)| {
+                        let score_opt = if with_scores { Some(score) } else { None };
+                        (member, score_opt)
+                    })
+                    .collect()
             }
             None => vec![],
         }
@@ -168,19 +281,26 @@ impl Store {
                     return 0;
                 }
 
-                let (removed, is_empty) = {
-                    let zset = match entry.data.as_sorted_set_mut() {
-                        Some(z) => z,
-                        None => return 0,
-                    };
-
-                    let mut removed = 0;
-                    for member in members {
-                        if zset.remove(member) {
-                            removed += 1;
+                let (removed, is_empty) = match &mut entry.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let mut removed = 0;
+                        for member in members {
+                            if lp.zremove(member).is_some() {
+                                removed += 1;
+                            }
                         }
+                        (removed, lp.is_empty())
                     }
-                    (removed, zset.is_empty())
+                    DataType::SortedSet(zset) => {
+                        let mut removed = 0;
+                        for member in members {
+                            if zset.remove(member) {
+                                removed += 1;
+                            }
+                        }
+                        (removed, zset.is_empty())
+                    }
+                    _ => (0, false),
                 };
 
                 if removed > 0 {
@@ -202,11 +322,41 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    entry.data = DataType::SortedSet(SortedSetData::new());
+                    // Create new packed
+                    if should_use_packed(&member) {
+                        let mut lp = Listpack::new();
+                        lp.zinsert(&member, delta);
+                        entry.data = DataType::SortedSetPacked(lp);
+                    } else {
+                        let mut zset = SortedSetData::new();
+                        zset.insert(member, delta);
+                        entry.data = DataType::SortedSet(zset);
+                    }
                     entry.persist();
+                    entry.bump_version();
+                    return Ok(delta);
                 }
 
                 let result = match &mut entry.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let current = lp.zscore(&member).unwrap_or(0.0);
+                        let new_score = current + delta;
+                        if !new_score.is_finite() {
+                            return Err(Error::NotFloat);
+                        }
+
+                        // Check if we need to upgrade
+                        if !should_use_packed(&member)
+                            || (!lp.contains_key(&member) && lp.zset_at_capacity())
+                        {
+                            let mut zset = upgrade_zset_packed_to_full(lp);
+                            zset.insert(member, new_score);
+                            entry.data = DataType::SortedSet(zset);
+                        } else {
+                            lp.zinsert(&member, new_score);
+                        }
+                        Ok(new_score)
+                    }
                     DataType::SortedSet(zset) => {
                         let new_score = zset.scores.get(&member).copied().unwrap_or(0.0) + delta;
                         if !new_score.is_finite() {
@@ -223,9 +373,15 @@ impl Store {
                 result
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
-                let mut zset = SortedSetData::new();
-                zset.insert(member, delta);
-                e.insert((key, Entry::new(DataType::SortedSet(zset))));
+                if should_use_packed(&member) {
+                    let mut lp = Listpack::new();
+                    lp.zinsert(&member, delta);
+                    e.insert((key, Entry::new(DataType::SortedSetPacked(lp))));
+                } else {
+                    let mut zset = SortedSetData::new();
+                    zset.insert(member, delta);
+                    e.insert((key, Entry::new(DataType::SortedSet(zset))));
+                }
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(delta)
             }
@@ -240,13 +396,17 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return 0;
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(zset) => zset
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => lp
+                        .ziter()
+                        .filter(|(_, score)| *score >= min && *score <= max)
+                        .count(),
+                    DataType::SortedSet(zset) => zset
                         .by_score
                         .iter()
                         .filter(|((score, _), _)| score.0 >= min && score.0 <= max)
                         .count(),
-                    None => 0,
+                    _ => 0,
                 }
             }
             None => 0,
@@ -261,9 +421,10 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return None;
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(zset) => zset.rev_rank(member),
-                    None => None,
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => lp.zrank(member).map(|r| lp.len() - 1 - r),
+                    DataType::SortedSet(zset) => zset.rev_rank(member),
+                    _ => None,
                 }
             }
             None => None,
@@ -284,24 +445,28 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(zset) => {
+
+                let (len, sorted): (i64, Vec<(Bytes, f64)>) = match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let mut s = get_sorted_from_packed(lp);
+                        s.reverse();
+                        (lp.len() as i64, s)
+                    }
+                    DataType::SortedSet(zset) => {
                         let len = zset.len() as i64;
                         if len == 0 {
                             return vec![];
                         }
-
                         let start_idx = normalize_index(start, len);
                         let stop_idx = normalize_index(stop, len);
-
                         if start_idx > stop_idx || start_idx >= len {
                             return vec![];
                         }
-
                         let start_idx = start_idx.max(0) as usize;
                         let stop_idx = (stop_idx + 1).min(len) as usize;
 
-                        zset.by_score
+                        return zset
+                            .by_score
                             .iter()
                             .rev()
                             .skip(start_idx)
@@ -310,10 +475,34 @@ impl Store {
                                 let score_opt = if with_scores { Some(score.0) } else { None };
                                 (member.clone(), score_opt)
                             })
-                            .collect()
+                            .collect();
                     }
-                    None => vec![],
+                    _ => return vec![],
+                };
+
+                if len == 0 {
+                    return vec![];
                 }
+
+                let start_idx = normalize_index(start, len);
+                let stop_idx = normalize_index(stop, len);
+
+                if start_idx > stop_idx || start_idx >= len {
+                    return vec![];
+                }
+
+                let start_idx = start_idx.max(0) as usize;
+                let stop_idx = (stop_idx + 1).min(len) as usize;
+
+                sorted
+                    .into_iter()
+                    .skip(start_idx)
+                    .take(stop_idx - start_idx)
+                    .map(|(member, score)| {
+                        let score_opt = if with_scores { Some(score) } else { None };
+                        (member, score_opt)
+                    })
+                    .collect()
             }
             None => vec![],
         }
@@ -335,8 +524,29 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(zset) => {
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let sorted = get_sorted_from_packed(lp);
+                        let iter = sorted
+                            .into_iter()
+                            .filter(|(_, score)| *score >= min && *score <= max)
+                            .skip(offset);
+
+                        let result: Vec<_> = if count > 0 {
+                            iter.take(count).collect()
+                        } else {
+                            iter.collect()
+                        };
+
+                        result
+                            .into_iter()
+                            .map(|(member, score)| {
+                                let score_opt = if with_scores { Some(score) } else { None };
+                                (member, score_opt)
+                            })
+                            .collect()
+                    }
+                    DataType::SortedSet(zset) => {
                         let iter = zset
                             .by_score
                             .iter()
@@ -355,7 +565,7 @@ impl Store {
                         })
                         .collect()
                     }
-                    None => vec![],
+                    _ => vec![],
                 }
             }
             None => vec![],
@@ -378,8 +588,30 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(zset) => {
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let mut sorted = get_sorted_from_packed(lp);
+                        sorted.reverse();
+                        let iter = sorted
+                            .into_iter()
+                            .filter(|(_, score)| *score >= min && *score <= max)
+                            .skip(offset);
+
+                        let result: Vec<_> = if count > 0 {
+                            iter.take(count).collect()
+                        } else {
+                            iter.collect()
+                        };
+
+                        result
+                            .into_iter()
+                            .map(|(member, score)| {
+                                let score_opt = if with_scores { Some(score) } else { None };
+                                (member, score_opt)
+                            })
+                            .collect()
+                    }
+                    DataType::SortedSet(zset) => {
                         let iter = zset
                             .by_score
                             .iter()
@@ -399,7 +631,7 @@ impl Store {
                         })
                         .collect()
                     }
-                    None => vec![],
+                    _ => vec![],
                 }
             }
             None => vec![],
@@ -417,25 +649,32 @@ impl Store {
                     return vec![];
                 }
 
-                let (result, is_empty) = {
-                    let zset = match entry.data.as_sorted_set_mut() {
-                        Some(z) => z,
-                        None => return vec![],
-                    };
-
-                    let mut result = Vec::with_capacity(count.min(zset.len()));
-
-                    for _ in 0..count {
-                        if let Some(((score, member), _)) = zset.by_score.iter().next() {
-                            let member_clone = member.clone();
-                            let score_val = score.0;
-                            zset.remove(&member_clone);
-                            result.push((member_clone, score_val));
-                        } else {
-                            break;
+                let (result, is_empty) = match &mut entry.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let sorted = get_sorted_from_packed(lp);
+                        let to_pop: Vec<_> = sorted.into_iter().take(count).collect();
+                        let result: Vec<(Bytes, f64)> =
+                            to_pop.iter().map(|(m, s)| (m.clone(), *s)).collect();
+                        for (member, _) in &to_pop {
+                            lp.zremove(member);
                         }
+                        (result, lp.is_empty())
                     }
-                    (result, zset.is_empty())
+                    DataType::SortedSet(zset) => {
+                        let mut result = Vec::with_capacity(count.min(zset.len()));
+                        for _ in 0..count {
+                            if let Some(((score, member), _)) = zset.by_score.iter().next() {
+                                let member_clone = member.clone();
+                                let score_val = score.0;
+                                zset.remove(&member_clone);
+                                result.push((member_clone, score_val));
+                            } else {
+                                break;
+                            }
+                        }
+                        (result, zset.is_empty())
+                    }
+                    _ => return vec![],
                 };
 
                 if !result.is_empty() {
@@ -461,25 +700,33 @@ impl Store {
                     return vec![];
                 }
 
-                let (result, is_empty) = {
-                    let zset = match entry.data.as_sorted_set_mut() {
-                        Some(z) => z,
-                        None => return vec![],
-                    };
-
-                    let mut result = Vec::with_capacity(count.min(zset.len()));
-
-                    for _ in 0..count {
-                        if let Some(((score, member), _)) = zset.by_score.iter().next_back() {
-                            let member_clone = member.clone();
-                            let score_val = score.0;
-                            zset.remove(&member_clone);
-                            result.push((member_clone, score_val));
-                        } else {
-                            break;
+                let (result, is_empty) = match &mut entry.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let mut sorted = get_sorted_from_packed(lp);
+                        sorted.reverse();
+                        let to_pop: Vec<_> = sorted.into_iter().take(count).collect();
+                        let result: Vec<(Bytes, f64)> =
+                            to_pop.iter().map(|(m, s)| (m.clone(), *s)).collect();
+                        for (member, _) in &to_pop {
+                            lp.zremove(member);
                         }
+                        (result, lp.is_empty())
                     }
-                    (result, zset.is_empty())
+                    DataType::SortedSet(zset) => {
+                        let mut result = Vec::with_capacity(count.min(zset.len()));
+                        for _ in 0..count {
+                            if let Some(((score, member), _)) = zset.by_score.iter().next_back() {
+                                let member_clone = member.clone();
+                                let score_val = score.0;
+                                zset.remove(&member_clone);
+                                result.push((member_clone, score_val));
+                            } else {
+                                break;
+                            }
+                        }
+                        (result, zset.is_empty())
+                    }
+                    _ => return vec![],
                 };
 
                 if !result.is_empty() {
@@ -502,9 +749,10 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return members.iter().map(|_| None).collect();
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(zset) => members.iter().map(|m| zset.score(m)).collect(),
-                    None => members.iter().map(|_| None).collect(),
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => members.iter().map(|m| lp.zscore(m)).collect(),
+                    DataType::SortedSet(zset) => members.iter().map(|m| zset.score(m)).collect(),
+                    _ => members.iter().map(|_| None).collect(),
                 }
             }
             None => members.iter().map(|_| None).collect(),
@@ -520,13 +768,11 @@ impl Store {
         }
 
         let first = match self.data_get(&keys[0]) {
-            Some(entry_ref) if !entry_ref.1.is_expired() => {
-                if let Some(ss) = entry_ref.1.data.as_sorted_set() {
-                    ss.scores.clone()
-                } else {
-                    return vec![];
-                }
-            }
+            Some(entry_ref) if !entry_ref.1.is_expired() => match &entry_ref.1.data {
+                DataType::SortedSetPacked(lp) => get_scores_from_packed(lp),
+                DataType::SortedSet(ss) => ss.scores.clone(),
+                _ => return vec![],
+            },
             _ => return vec![],
         };
 
@@ -534,10 +780,14 @@ impl Store {
         for key in &keys[1..] {
             if let Some(entry_ref) = self.data_get(key.as_ref())
                 && !entry_ref.1.is_expired()
-                && let Some(ss) = entry_ref.1.data.as_sorted_set()
             {
-                for member in ss.scores.keys() {
-                    result.remove(member);
+                let other_members: Vec<Bytes> = match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => lp.ziter().map(|(m, _)| m).collect(),
+                    DataType::SortedSet(ss) => ss.scores.keys().cloned().collect(),
+                    _ => continue,
+                };
+                for member in other_members {
+                    result.remove(&member);
                 }
             }
         }
@@ -561,13 +811,11 @@ impl Store {
         }
 
         let first = match self.data_get(&keys[0]) {
-            Some(entry_ref) if !entry_ref.1.is_expired() => {
-                if let Some(ss) = entry_ref.1.data.as_sorted_set() {
-                    ss.scores.clone()
-                } else {
-                    return vec![];
-                }
-            }
+            Some(entry_ref) if !entry_ref.1.is_expired() => match &entry_ref.1.data {
+                DataType::SortedSetPacked(lp) => get_scores_from_packed(lp),
+                DataType::SortedSet(ss) => ss.scores.clone(),
+                _ => return vec![],
+            },
             _ => return vec![],
         };
 
@@ -582,20 +830,22 @@ impl Store {
             for (i, key) in keys[1..].iter().enumerate() {
                 if let Some(entry_ref) = self.data_get(key.as_ref()) {
                     if !entry_ref.1.is_expired() {
-                        if let Some(ss) = entry_ref.1.data.as_sorted_set() {
-                            if let Some(&s) = ss.scores.get(&member) {
-                                let w = weights
-                                    .map(|ws| ws.get(i + 1).copied().unwrap_or(1.0))
-                                    .unwrap_or(1.0);
-                                let weighted = s * w;
-                                final_score = match aggregate.to_uppercase().as_str() {
-                                    "MIN" => final_score.min(weighted),
-                                    "MAX" => final_score.max(weighted),
-                                    _ => final_score + weighted, // SUM
-                                };
-                            } else {
-                                continue 'outer;
-                            }
+                        let other_score = match &entry_ref.1.data {
+                            DataType::SortedSetPacked(lp) => lp.zscore(&member),
+                            DataType::SortedSet(ss) => ss.scores.get(&member).copied(),
+                            _ => continue 'outer,
+                        };
+
+                        if let Some(s) = other_score {
+                            let w = weights
+                                .map(|ws| ws.get(i + 1).copied().unwrap_or(1.0))
+                                .unwrap_or(1.0);
+                            let weighted = s * w;
+                            final_score = match aggregate.to_uppercase().as_str() {
+                                "MIN" => final_score.min(weighted),
+                                "MAX" => final_score.max(weighted),
+                                _ => final_score + weighted, // SUM
+                            };
                         } else {
                             continue 'outer;
                         }
@@ -622,14 +872,12 @@ impl Store {
             return 0;
         }
 
-        let first = match self.data_get(&keys[0]) {
-            Some(entry_ref) if !entry_ref.1.is_expired() => {
-                if let Some(ss) = entry_ref.1.data.as_sorted_set() {
-                    ss.scores.keys().cloned().collect::<Vec<_>>()
-                } else {
-                    return 0;
-                }
-            }
+        let first: Vec<Bytes> = match self.data_get(&keys[0]) {
+            Some(entry_ref) if !entry_ref.1.is_expired() => match &entry_ref.1.data {
+                DataType::SortedSetPacked(lp) => lp.ziter().map(|(m, _)| m).collect(),
+                DataType::SortedSet(ss) => ss.scores.keys().cloned().collect(),
+                _ => return 0,
+            },
             _ => return 0,
         };
 
@@ -640,11 +888,12 @@ impl Store {
             for key in &keys[1..] {
                 if let Some(entry_ref) = self.data_get(key.as_ref()) {
                     if !entry_ref.1.is_expired() {
-                        if let Some(ss) = entry_ref.1.data.as_sorted_set() {
-                            if !ss.scores.contains_key(&member) {
-                                continue 'outer;
-                            }
-                        } else {
+                        let contains = match &entry_ref.1.data {
+                            DataType::SortedSetPacked(lp) => lp.contains_key(&member),
+                            DataType::SortedSet(ss) => ss.scores.contains_key(&member),
+                            _ => continue 'outer,
+                        };
+                        if !contains {
                             continue 'outer;
                         }
                     } else {
@@ -677,15 +926,22 @@ impl Store {
         for (i, key) in keys.iter().enumerate() {
             if let Some(entry_ref) = self.data_get(key.as_ref())
                 && !entry_ref.1.is_expired()
-                && let Some(ss) = entry_ref.1.data.as_sorted_set()
             {
+                let scores: Vec<(Bytes, f64)> = match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => lp.ziter().collect(),
+                    DataType::SortedSet(ss) => {
+                        ss.scores.iter().map(|(m, &s)| (m.clone(), s)).collect()
+                    }
+                    _ => continue,
+                };
+
                 let w = weights
                     .map(|ws| ws.get(i).copied().unwrap_or(1.0))
                     .unwrap_or(1.0);
-                for (member, &score) in &ss.scores {
+                for (member, score) in scores {
                     let weighted = score * w;
                     result
-                        .entry(member.clone())
+                        .entry(member)
                         .and_modify(|existing| {
                             *existing = match aggregate.to_uppercase().as_str() {
                                 "MIN" => existing.min(weighted),
@@ -713,13 +969,17 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return 0;
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(ss) => ss
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => lp
+                        .ziter()
+                        .filter(|(m, _)| lex_in_range(m, min, max))
+                        .count(),
+                    DataType::SortedSet(ss) => ss
                         .scores
                         .keys()
                         .filter(|m| lex_in_range(m, min, max))
                         .count(),
-                    None => 0,
+                    _ => 0,
                 }
             }
             None => 0,
@@ -740,8 +1000,17 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(ss) => {
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let mut members: Vec<_> = lp
+                            .ziter()
+                            .map(|(m, _)| m)
+                            .filter(|m| lex_in_range(m, min, max))
+                            .collect();
+                        members.sort();
+                        members.into_iter().skip(offset).take(count).collect()
+                    }
+                    DataType::SortedSet(ss) => {
                         let mut members: Vec<_> = ss
                             .scores
                             .keys()
@@ -751,14 +1020,14 @@ impl Store {
                         members.sort();
                         members.into_iter().skip(offset).take(count).collect()
                     }
-                    None => vec![],
+                    _ => vec![],
                 }
             }
             None => vec![],
         }
     }
 
-    /// ZREVRANGEBYLEX - Get members in reverse lexicographic range  
+    /// ZREVRANGEBYLEX - Get members in reverse lexicographic range
     pub fn zrevrangebylex(
         &self,
         key: &[u8],
@@ -772,8 +1041,18 @@ impl Store {
                 if entry_ref.1.is_expired() {
                     return vec![];
                 }
-                match entry_ref.1.data.as_sorted_set() {
-                    Some(ss) => {
+                match &entry_ref.1.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let mut members: Vec<_> = lp
+                            .ziter()
+                            .map(|(m, _)| m)
+                            .filter(|m| lex_in_range(m, min, max))
+                            .collect();
+                        members.sort();
+                        members.reverse();
+                        members.into_iter().skip(offset).take(count).collect()
+                    }
+                    DataType::SortedSet(ss) => {
                         let mut members: Vec<_> = ss
                             .scores
                             .keys()
@@ -784,7 +1063,7 @@ impl Store {
                         members.reverse();
                         members.into_iter().skip(offset).take(count).collect()
                     }
-                    None => vec![],
+                    _ => vec![],
                 }
             }
             None => vec![],
@@ -801,22 +1080,33 @@ impl Store {
                     return 0;
                 }
 
-                let (removed, is_empty) = match entry.data.as_sorted_set_mut() {
-                    Some(ss) => {
+                let (removed, is_empty) = match &mut entry.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let to_remove: Vec<_> = lp
+                            .ziter()
+                            .filter(|(m, _)| lex_in_range(m, min, max))
+                            .map(|(m, _)| m)
+                            .collect();
+                        let count = to_remove.len();
+                        for m in to_remove {
+                            lp.zremove(&m);
+                        }
+                        (count, lp.is_empty())
+                    }
+                    DataType::SortedSet(ss) => {
                         let to_remove: Vec<_> = ss
                             .scores
                             .keys()
                             .filter(|m| lex_in_range(m, min, max))
                             .cloned()
                             .collect();
-
                         let count = to_remove.len();
                         for m in to_remove {
                             ss.remove(&m);
                         }
                         (count, ss.is_empty())
                     }
-                    None => (0, false),
+                    _ => (0, false),
                 };
 
                 if removed > 0 {
@@ -841,8 +1131,34 @@ impl Store {
                     return 0;
                 }
 
-                let (removed, is_empty) = match entry.data.as_sorted_set_mut() {
-                    Some(ss) => {
+                let (removed, is_empty) = match &mut entry.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let len = lp.len() as i64;
+                        let start_idx = normalize_index(start, len);
+                        let stop_idx = normalize_index(stop, len);
+
+                        if start_idx > stop_idx || start_idx >= len {
+                            (0, lp.is_empty())
+                        } else {
+                            let start_idx = start_idx.max(0) as usize;
+                            let stop_idx = (stop_idx + 1).min(len) as usize;
+
+                            let sorted = get_sorted_from_packed(lp);
+                            let to_remove: Vec<_> = sorted
+                                .into_iter()
+                                .skip(start_idx)
+                                .take(stop_idx - start_idx)
+                                .map(|(m, _)| m)
+                                .collect();
+
+                            let count = to_remove.len();
+                            for m in to_remove {
+                                lp.zremove(&m);
+                            }
+                            (count, lp.is_empty())
+                        }
+                    }
+                    DataType::SortedSet(ss) => {
                         let len = ss.len() as i64;
                         let start_idx = normalize_index(start, len);
                         let stop_idx = normalize_index(stop, len);
@@ -868,7 +1184,7 @@ impl Store {
                             (count, ss.is_empty())
                         }
                     }
-                    None => (0, false),
+                    _ => (0, false),
                 };
 
                 if removed > 0 {
@@ -893,8 +1209,21 @@ impl Store {
                     return 0;
                 }
 
-                let (removed, is_empty) = match entry.data.as_sorted_set_mut() {
-                    Some(ss) => {
+                let (removed, is_empty) = match &mut entry.data {
+                    DataType::SortedSetPacked(lp) => {
+                        let to_remove: Vec<_> = lp
+                            .ziter()
+                            .filter(|(_, score)| *score >= min && *score <= max)
+                            .map(|(m, _)| m)
+                            .collect();
+
+                        let count = to_remove.len();
+                        for m in to_remove {
+                            lp.zremove(&m);
+                        }
+                        (count, lp.is_empty())
+                    }
+                    DataType::SortedSet(ss) => {
                         let to_remove: Vec<_> = ss
                             .by_score
                             .iter()
@@ -908,7 +1237,7 @@ impl Store {
                         }
                         (count, ss.is_empty())
                     }
-                    None => (0, false),
+                    _ => (0, false),
                 };
 
                 if removed > 0 {

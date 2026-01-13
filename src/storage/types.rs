@@ -18,10 +18,14 @@ pub enum DataType {
     Set(DashSet<Bytes>),
     /// IntSet - memory optimized integer set
     IntSet(super::intset::IntSet),
-    /// Hash - field-value pairs
+    /// Hash - field-value pairs (full DashTable for large hashes)
     Hash(DashTable<(Bytes, Bytes)>),
-    /// Sorted Set - unique strings ordered by score
+    /// HashPacked - memory-efficient listpack for small hashes (< 512 entries)
+    HashPacked(super::listpack::Listpack),
+    /// Sorted Set - unique strings ordered by score (full structure for large sets)
     SortedSet(SortedSetData),
+    /// SortedSetPacked - memory-efficient listpack for small sorted sets (< 128 entries)
+    SortedSetPacked(super::listpack::Listpack),
     /// Stream - append-only log
     Stream(StreamData),
     /// HyperLogLog - cardinality estimation
@@ -42,7 +46,9 @@ impl std::fmt::Debug for DataType {
             DataType::Set(s) => f.debug_tuple("Set").field(s).finish(),
             DataType::IntSet(s) => f.debug_tuple("IntSet").field(s).finish(),
             DataType::Hash(_) => f.debug_struct("Hash").finish(), // DashTable doesn't impl Debug
+            DataType::HashPacked(lp) => f.debug_tuple("HashPacked").field(lp).finish(),
             DataType::SortedSet(z) => f.debug_tuple("SortedSet").field(z).finish(),
+            DataType::SortedSetPacked(lp) => f.debug_tuple("SortedSetPacked").field(lp).finish(),
             DataType::Stream(s) => f.debug_tuple("Stream").field(s).finish(),
             DataType::HyperLogLog(h) => f.debug_tuple("HyperLogLog").field(h).finish(),
             DataType::Json(j) => f.debug_tuple("Json").field(j).finish(),
@@ -60,8 +66,8 @@ impl DataType {
             DataType::List(_) => "list",
             DataType::Set(_) => "set",
             DataType::IntSet(_) => "set",
-            DataType::Hash(_) => "hash",
-            DataType::SortedSet(_) => "zset",
+            DataType::Hash(_) | DataType::HashPacked(_) => "hash",
+            DataType::SortedSet(_) | DataType::SortedSetPacked(_) => "zset",
             DataType::Stream(_) => "stream",
             DataType::HyperLogLog(_) => "string", // HLL is stored as string in Redis
             DataType::Json(_) => "ReJSON-RL",
@@ -143,6 +149,22 @@ impl DataType {
     }
 
     #[inline]
+    pub fn as_hash_packed(&self) -> Option<&super::listpack::Listpack> {
+        match self {
+            DataType::HashPacked(lp) => Some(lp),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_hash_packed_mut(&mut self) -> Option<&mut super::listpack::Listpack> {
+        match self {
+            DataType::HashPacked(lp) => Some(lp),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn as_sorted_set(&self) -> Option<&SortedSetData> {
         match self {
             DataType::SortedSet(z) => Some(z),
@@ -154,6 +176,22 @@ impl DataType {
     pub fn as_sorted_set_mut(&mut self) -> Option<&mut SortedSetData> {
         match self {
             DataType::SortedSet(z) => Some(z),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_sorted_set_packed(&self) -> Option<&super::listpack::Listpack> {
+        match self {
+            DataType::SortedSetPacked(lp) => Some(lp),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_sorted_set_packed_mut(&mut self) -> Option<&mut super::listpack::Listpack> {
+        match self {
+            DataType::SortedSetPacked(lp) => Some(lp),
             _ => None,
         }
     }
