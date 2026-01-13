@@ -705,7 +705,7 @@ pub struct ClusterState {
     slot_owners: SlotOwnerTable,
     /// Legacy compatibility: slot -> node_id mapping
     /// Only used for commands that need actual Bytes, protected by RwLock
-    pub slots_owner: RwLock<[Option<Bytes>; CLUSTER_SLOTS]>,
+    pub slots_owner: RwLock<Vec<Option<Bytes>>>,
 }
 
 impl Default for ClusterState {
@@ -746,7 +746,7 @@ impl ClusterState {
             messages_received: AtomicU64::new(0),
             messages_sent: AtomicU64::new(0),
             slot_owners: SlotOwnerTable::new(),
-            slots_owner: RwLock::new(std::array::from_fn(|_| None)),
+            slots_owner: RwLock::new(vec![None; CLUSTER_SLOTS]),
         }
     }
 

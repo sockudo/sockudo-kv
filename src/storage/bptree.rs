@@ -16,8 +16,6 @@
 // ============================================================================
 
 /// Maximum keys per leaf node (tuned for cache efficiency)
-/// Maximum keys per leaf node (tuned for cache efficiency)
-/// Maximum keys per leaf node (tuned for cache efficiency)
 const MAX_LEAF_KEYS: usize = 127;
 
 /// Minimum keys per leaf node
