@@ -179,16 +179,24 @@ impl KeyspaceNotifier {
 
         // __keyspace@<db>__:<key> with event as message
         if self.flags.keyspace {
-            let channel = format!("__keyspace@{}__:{}", db, String::from_utf8_lossy(key));
-            self.pubsub
-                .publish(channel.as_bytes(), Bytes::from(event.to_string()));
+            let channel_prefix = format!("__keyspace@{}__:", db);
+            let channel_bytes = [channel_prefix.as_bytes(), key].concat();
+
+            // Optimization: check if anyone is listening before formatting/allocating message
+            if self.pubsub.has_subscribers_for_channel(&channel_bytes) {
+                self.pubsub
+                    .publish(&channel_bytes, Bytes::from(event.to_string()));
+            }
         }
 
         // __keyevent@<db>__:<event> with key as message
         if self.flags.keyevent {
             let channel = format!("__keyevent@{}__:{}", db, event);
-            self.pubsub
-                .publish(channel.as_bytes(), Bytes::copy_from_slice(key));
+            // Optimization: check if anyone is listening
+            if self.pubsub.has_subscribers_for_channel(channel.as_bytes()) {
+                self.pubsub
+                    .publish(channel.as_bytes(), Bytes::copy_from_slice(key));
+            }
         }
     }
 

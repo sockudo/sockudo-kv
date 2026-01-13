@@ -3,7 +3,6 @@
 //! Full RDB format implementation for generating snapshots and loading data.
 
 use bytes::Bytes;
-use std::collections::VecDeque;
 
 use crate::storage::dashtable::{DashTable, calculate_hash};
 use crate::storage::{DataType, Entry, SortedSetData, now_ms};
@@ -122,8 +121,8 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType) {
             rdb.push(RDB_TYPE_LIST);
             write_string(rdb, key);
             write_length(rdb, list.len());
-            for item in list {
-                write_string(rdb, item);
+            for item in list.iter() {
+                write_string(rdb, &item);
             }
         }
         DataType::Set(set) => {
@@ -132,6 +131,16 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType) {
             write_length(rdb, set.len());
             for item in set.iter() {
                 write_string(rdb, item.key());
+            }
+        }
+        DataType::IntSet(set) => {
+            // Serialize as regular SET of strings for compatibility
+            rdb.push(RDB_TYPE_SET);
+            write_string(rdb, key);
+            write_length(rdb, set.len());
+            for item in set.iter() {
+                let s = item.to_string();
+                write_string(rdb, &Bytes::from(s));
             }
         }
         DataType::Hash(hash) => {
@@ -317,7 +326,7 @@ pub fn load_rdb(data: &[u8], multi_store: &crate::storage::MultiStore) -> Result
                 let (list_len, llen) = read_length(&data[cursor..])?;
                 cursor += llen;
 
-                let mut list = VecDeque::with_capacity(list_len);
+                let mut list = crate::storage::quicklist::QuickList::new();
                 for _ in 0..list_len {
                     let (item, ilen) = read_string(&data[cursor..])?;
                     cursor += ilen;

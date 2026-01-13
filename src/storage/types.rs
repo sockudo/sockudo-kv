@@ -2,7 +2,7 @@ use super::dashtable::DashTable;
 use bytes::Bytes;
 use dashmap::DashSet;
 use sonic_rs::Value as JsonValue;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use super::value::now_ms;
@@ -12,10 +12,12 @@ use super::value::now_ms;
 pub enum DataType {
     /// String - raw bytes
     String(Bytes),
-    /// List - doubly-linked list (VecDeque for O(1) push/pop both ends)
-    List(VecDeque<Bytes>),
+    /// List - doubly-linked list (QuickList for memory efficiency)
+    List(super::quicklist::QuickList),
     /// Set - unordered unique strings
     Set(DashSet<Bytes>),
+    /// IntSet - memory optimized integer set
+    IntSet(super::intset::IntSet),
     /// Hash - field-value pairs
     Hash(DashTable<(Bytes, Bytes)>),
     /// Sorted Set - unique strings ordered by score
@@ -38,6 +40,7 @@ impl std::fmt::Debug for DataType {
             DataType::String(s) => f.debug_tuple("String").field(s).finish(),
             DataType::List(l) => f.debug_tuple("List").field(l).finish(),
             DataType::Set(s) => f.debug_tuple("Set").field(s).finish(),
+            DataType::IntSet(s) => f.debug_tuple("IntSet").field(s).finish(),
             DataType::Hash(_) => f.debug_struct("Hash").finish(), // DashTable doesn't impl Debug
             DataType::SortedSet(z) => f.debug_tuple("SortedSet").field(z).finish(),
             DataType::Stream(s) => f.debug_tuple("Stream").field(s).finish(),
@@ -56,6 +59,7 @@ impl DataType {
             DataType::String(_) => "string",
             DataType::List(_) => "list",
             DataType::Set(_) => "set",
+            DataType::IntSet(_) => "set",
             DataType::Hash(_) => "hash",
             DataType::SortedSet(_) => "zset",
             DataType::Stream(_) => "stream",
@@ -83,7 +87,7 @@ impl DataType {
     }
 
     #[inline]
-    pub fn as_list(&self) -> Option<&VecDeque<Bytes>> {
+    pub fn as_list(&self) -> Option<&super::quicklist::QuickList> {
         match self {
             DataType::List(l) => Some(l),
             _ => None,
@@ -91,7 +95,7 @@ impl DataType {
     }
 
     #[inline]
-    pub fn as_list_mut(&mut self) -> Option<&mut VecDeque<Bytes>> {
+    pub fn as_list_mut(&mut self) -> Option<&mut super::quicklist::QuickList> {
         match self {
             DataType::List(l) => Some(l),
             _ => None,
@@ -110,6 +114,22 @@ impl DataType {
     pub fn as_set_mut(&mut self) -> Option<&mut DashSet<Bytes>> {
         match self {
             DataType::Set(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_int_set(&self) -> Option<&super::intset::IntSet> {
+        match self {
+            DataType::IntSet(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_int_set_mut(&mut self) -> Option<&mut super::intset::IntSet> {
+        match self {
+            DataType::IntSet(s) => Some(s),
             _ => None,
         }
     }

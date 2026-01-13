@@ -1,0 +1,17 @@
+
+running 1 test
+
+=== Data Structure Benchmarks (100000 items) ===
+
+--- List Benchmarks ---
+VecDeque:  Push: 1.9306ms, Get: 72.3µs (checksum: 488890)
+QuickList: Push: 721.6µs, Get: 137.8772ms (checksum: 488890)
+QuickList: Iter: 851.7µs (count: 100000)
+
+--- IntSet Benchmarks ---
+HashSet:   Insert: 2.5631ms, Contains: 1.1182ms (found: 100000)
+IntSet:    Insert: 1.046ms, Contains: 246.5µs (found: 100000)
+test storage::bench_ops::tests::bench_optimizations ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.15s
+

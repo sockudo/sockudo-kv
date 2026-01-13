@@ -15,7 +15,10 @@ mod value;
 pub mod hyperloglog;
 
 // High-performance B+Tree inspired by Dragonfly
+pub mod bench_ops;
 pub mod bptree;
+pub mod intset;
+pub mod quicklist;
 
 // Ultra-high-performance TimeSeries with Gorilla compression
 pub mod timeseries;

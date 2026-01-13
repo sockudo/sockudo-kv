@@ -282,6 +282,26 @@ impl PubSub {
         count
     }
 
+    /// Check if there are any subscribers for a channel (or pattern matching it)
+    /// This is an optimized check to avoid allocation in keyspace notifications
+    pub fn has_subscribers_for_channel(&self, channel: &[u8]) -> bool {
+        // Check exact channel match
+        if let Some(subs) = self.channels.get(channel) {
+            if !subs.is_empty() {
+                return true;
+            }
+        }
+
+        // Check pattern matches
+        // Note: This acquires a read lock on patterns, so it's not strictly wait-free but efficient
+        let patterns = self.patterns.read();
+        // Since we don't have an "any_match" API in GlobTrie yet, we rely on matches() check or existence
+        // For keyspace events, meaningful patterns are typically `__key*` or `*`
+        // If we have ANY patterns, we assume yes to be safe/simple, OR we check properly.
+        // Let's check properly:
+        !patterns.matches(channel).is_empty()
+    }
+
     /// Subscribe to sharded channels
     /// Returns subscription counts for each channel
     pub fn ssubscribe(&self, id: u64, channels: &[Bytes]) -> Vec<usize> {

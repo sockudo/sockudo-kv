@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::storage::Store;
 use crate::storage::types::{DataType, Entry};
 
-use std::collections::VecDeque;
+use crate::storage::quicklist::QuickList;
 use std::sync::atomic::Ordering;
 
 /// List operations for the Store
@@ -18,7 +18,7 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    let mut list = VecDeque::new();
+                    let mut list = QuickList::new();
                     for val in values.iter().rev() {
                         list.push_front(val.clone());
                     }
@@ -44,7 +44,7 @@ impl Store {
                 result
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
-                let mut list = VecDeque::new();
+                let mut list = QuickList::new();
                 for val in values.iter().rev() {
                     list.push_front(val.clone());
                 }
@@ -63,7 +63,7 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    let mut list = VecDeque::new();
+                    let mut list = QuickList::new();
                     for val in &values {
                         list.push_back(val.clone());
                     }
@@ -89,7 +89,7 @@ impl Store {
                 result
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
-                let mut list = VecDeque::new();
+                let mut list = QuickList::new();
                 for val in &values {
                     list.push_back(val.clone());
                 }
@@ -225,11 +225,7 @@ impl Store {
                         let start = start.max(0) as usize;
                         let stop = (stop + 1).min(len) as usize;
 
-                        list.iter()
-                            .skip(start)
-                            .take(stop - start)
-                            .cloned()
-                            .collect()
+                        list.iter().skip(start).take(stop - start).collect()
                     }
                     None => vec![],
                 }
@@ -253,7 +249,7 @@ impl Store {
                         if index < 0 || index >= len {
                             None
                         } else {
-                            list.get(index as usize).cloned()
+                            list.get(index as usize)
                         }
                     }
                     None => None,
@@ -279,7 +275,7 @@ impl Store {
                         if index < 0 || index >= len {
                             Err(Error::IndexOutOfRange)
                         } else {
-                            list[index as usize] = value;
+                            list.set(index as usize, value);
                             entry.bump_version();
                             Ok(())
                         }
@@ -322,20 +318,24 @@ impl Store {
                     if count >= 0 {
                         let mut i = 0;
                         while i < list.len() && removed < limit {
-                            if list[i].as_ref() == element {
-                                list.remove(i);
-                                removed += 1;
-                            } else {
-                                i += 1;
+                            if let Some(val) = list.get(i) {
+                                if val.as_ref() == element {
+                                    list.remove(i);
+                                    removed += 1;
+                                    continue;
+                                }
                             }
+                            i += 1;
                         }
                     } else {
                         let mut i = list.len();
                         while i > 0 && removed < limit {
                             i -= 1;
-                            if list[i].as_ref() == element {
-                                list.remove(i);
-                                removed += 1;
+                            if let Some(val) = list.get(i) {
+                                if val.as_ref() == element {
+                                    list.remove(i);
+                                    removed += 1;
+                                }
                             }
                         }
                     }
@@ -488,12 +488,14 @@ impl Store {
         if reverse {
             let start = len.saturating_sub(limit);
             for i in (start..len).rev() {
-                if list[i].as_ref() == element {
-                    found_count += 1;
-                    if found_count >= target_rank {
-                        positions.push(i as i64);
-                        if positions.len() >= want_count {
-                            break;
+                if let Some(item) = list.get(i) {
+                    if item.as_ref() == element {
+                        found_count += 1;
+                        if found_count >= target_rank {
+                            positions.push(i as i64);
+                            if positions.len() >= want_count {
+                                break;
+                            }
                         }
                     }
                 }

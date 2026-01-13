@@ -487,7 +487,7 @@ fn sort_impl(store: &Store, args: &[Bytes], read_only: bool) -> Result<RespValue
     // Get elements to sort
     let elements: Vec<Bytes> = match store.data_get(key) {
         Some(entry_ref) if !entry_ref.1.is_expired() => match &entry_ref.1.data {
-            DataType::List(l) => l.iter().cloned().collect(),
+            DataType::List(l) => l.iter().collect(),
             DataType::Set(s) => s.iter().map(|x| x.clone()).collect(),
             DataType::SortedSet(zs) => {
                 // Use scores HashMap for iteration
@@ -562,8 +562,10 @@ fn sort_impl(store: &Store, args: &[Bytes], read_only: bool) -> Result<RespValue
 
     // STORE if requested
     if let Some(dest) = store_dest {
-        use std::collections::VecDeque;
-        let list: VecDeque<Bytes> = result.iter().cloned().collect();
+        let mut list = crate::storage::quicklist::QuickList::new();
+        for val in &result {
+            list.push_back(val.clone());
+        }
         store.data_remove(dest);
         store.data_insert(dest.clone(), Entry::new(DataType::List(list)));
         store

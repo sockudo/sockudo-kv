@@ -126,6 +126,7 @@ impl Store {
             DataType::String(s) => DataType::String(s.clone()),
             DataType::List(l) => DataType::List(l.clone()),
             DataType::Set(s) => DataType::Set(s.clone()),
+            DataType::IntSet(s) => DataType::IntSet(s.clone()),
             DataType::Hash(h) => {
                 let new_hash = DashTable::with_shard_amount(h.shards_len());
                 for item in h.iter() {
@@ -396,6 +397,7 @@ impl Store {
             DataType::String(_) => "raw",
             DataType::List(_) => "quicklist",
             DataType::Set(_) => "hashtable",
+            DataType::IntSet(_) => "intset",
             DataType::Hash(_) => "hashtable",
             DataType::SortedSet(_) => "skiplist",
             DataType::Stream(_) => "stream",
@@ -429,6 +431,7 @@ impl Store {
             DataType::String(_) => 0u8,
             DataType::List(_) => 1,
             DataType::Set(_) => 2,
+            DataType::IntSet(_) => 2, // Dump as regular set
             DataType::Hash(_) => 3,
             DataType::SortedSet(_) => 4,
             DataType::Stream(_) => 5,
@@ -448,7 +451,7 @@ impl Store {
                 write_varint(&mut data, l.len() as u64);
                 for item in l.iter() {
                     write_varint(&mut data, item.len() as u64);
-                    data.extend_from_slice(item);
+                    data.extend_from_slice(&item);
                 }
             }
             DataType::Set(s) => {
@@ -456,6 +459,17 @@ impl Store {
                 for item in s.iter() {
                     write_varint(&mut data, item.len() as u64);
                     data.extend_from_slice(&item);
+                }
+            }
+            DataType::IntSet(s) => {
+                // Dump as regular set
+                write_varint(&mut data, s.len() as u64);
+
+                // Manual iteration over IntSet
+                for item in s.iter() {
+                    let s_val = item.to_string();
+                    write_varint(&mut data, s_val.len() as u64);
+                    data.extend_from_slice(s_val.as_bytes());
                 }
             }
             DataType::Hash(h) => {
@@ -529,7 +543,7 @@ impl Store {
             1 => {
                 let (count, new_pos) = read_varint(data, pos).map_err(|e| e.to_string())?;
                 pos = new_pos;
-                let mut list = std::collections::VecDeque::with_capacity(count as usize);
+                let mut list = crate::storage::quicklist::QuickList::new();
                 for _ in 0..count {
                     let (len, next_pos) = read_varint(data, pos).map_err(|e| e.to_string())?;
                     pos = next_pos;
