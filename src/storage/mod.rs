@@ -26,6 +26,7 @@ pub mod ops;
 
 #[cfg(test)]
 mod bptree_bench;
+
 // Re-export the main Store struct
 pub use multi_store::{DEFAULT_DB_COUNT, MultiStore};
 pub use store::Store;

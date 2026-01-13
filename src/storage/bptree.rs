@@ -89,9 +89,17 @@ impl<K: Clone + Ord, V: Clone> LeafNode<K, V> {
         let mid = self.keys.len() / 2;
         let median = self.keys[mid].clone();
 
-        let mut right = Self::new();
-        right.keys = self.keys.split_off(mid);
-        right.values = self.values.split_off(mid);
+        let right = LeafNode {
+            keys: self.keys.split_off(mid),
+            values: self.values.split_off(mid),
+            next: None,
+            prev: None,
+        };
+
+        // Important: shrink the left node to free up unused capacity
+        // split_off keeps original capacity (MAX_LEAF_KEYS) for the left part
+        self.keys.shrink_to_fit();
+        self.values.shrink_to_fit();
 
         (right, median)
     }
@@ -155,13 +163,19 @@ impl<K: Clone + Ord> InnerNode<K> {
         let mid = self.keys.len() / 2;
         let median = self.keys[mid].clone();
 
-        let mut right = Self::new();
-        right.keys = self.keys.split_off(mid + 1);
-        right.children = self.children.split_off(mid + 1);
-        right.subtree_counts = self.subtree_counts.split_off(mid + 1);
+        let right = InnerNode {
+            keys: self.keys.split_off(mid + 1),
+            children: self.children.split_off(mid + 1),
+            subtree_counts: self.subtree_counts.split_off(mid + 1),
+        };
 
         // Remove the median from left
         self.keys.pop();
+
+        // Important: shrink the left node to free up unused capacity
+        self.keys.shrink_to_fit();
+        self.children.shrink_to_fit();
+        self.subtree_counts.shrink_to_fit();
 
         (right, median)
     }
@@ -318,6 +332,28 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Calculate approximate memory usage in bytes
+    pub fn memory_usage(&self) -> usize {
+        let mut size = std::mem::size_of::<Self>();
+        size += self.nodes.capacity() * std::mem::size_of::<Node<K, V>>();
+        size += self.free_list.capacity() * std::mem::size_of::<usize>();
+
+        for node in &self.nodes {
+            match node {
+                Node::Leaf(leaf) => {
+                    size += leaf.keys.capacity() * std::mem::size_of::<K>();
+                    size += leaf.values.capacity() * std::mem::size_of::<V>();
+                }
+                Node::Inner(inner) => {
+                    size += inner.keys.capacity() * std::mem::size_of::<K>();
+                    size += inner.children.capacity() * std::mem::size_of::<usize>();
+                    size += inner.subtree_counts.capacity() * std::mem::size_of::<usize>();
+                }
+            }
+        }
+        size
     }
 
     /// Allocate a new node, returns its index
@@ -931,12 +967,6 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
 
             if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
                 parent.keys[separator_pos] = key;
-                // Update subtree counts: `left` lost `count`, `node` gained `count`
-                // But wait, the key also moved? Inner keys don't count towards size?
-                // In B+Tree, only leaves contain data. Inner keys are separators.
-                // So total size of subtree depends on sum of children counts.
-                // `left` lost `child` (size `count`). `node` gained `child` (size `count`).
-                // So we just subtract `count` from left and add `count` to node in parent logic.
                 let left_cnt = &mut parent.subtree_counts[child_pos - 1];
                 *left_cnt -= count;
                 let node_cnt = &mut parent.subtree_counts[child_pos];
@@ -1011,7 +1041,6 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
 
             if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
                 parent.keys[separator_pos] = key;
-                // Update subtree counts: `right` lost `count`, `node` gained `count`
                 let right_cnt = &mut parent.subtree_counts[child_pos + 1];
                 *right_cnt -= count;
                 let node_cnt = &mut parent.subtree_counts[child_pos];
@@ -1031,7 +1060,7 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
             return;
         };
 
-        // Remove separator from parent - this handles keys and children removal
+        // Remove separator from parent
         if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
             parent.remove(child_pos - 1);
         }
@@ -1096,10 +1125,8 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         }
 
         // Update parent tree count
-        // Update parent's count for the merged child (left_idx)
         let new_child_count = self.nodes[left_idx].tree_count();
         if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
-            // The merged node is at child_pos - 1
             parent.subtree_counts[child_pos - 1] = new_child_count;
         }
     }
@@ -1124,7 +1151,7 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         let is_leaf = self.nodes[node_idx].is_leaf();
 
         if is_leaf {
-            // Merge right into node (not using separator for leaf)
+            // Merge right into node
             let (keys, values, next_idx) = if let Node::Leaf(right) = &self.nodes[right_idx] {
                 (right.keys.clone(), right.values.clone(), right.next)
             } else {
@@ -1174,152 +1201,9 @@ impl<K: Clone + Ord, V: Clone> BPTree<K, V> {
         }
 
         // Update parent tree count
-        // Update parent's count for the merged child (node_idx)
         let new_child_count = self.nodes[node_idx].tree_count();
         if let Node::Inner(parent) = &mut self.nodes[parent_idx] {
-            // The merged node is at child_pos
             parent.subtree_counts[child_pos] = new_child_count;
-        }
-    }
-
-    /// Advance path to next entry (optimized version)
-    #[inline]
-    fn path_next(&self, path: &mut BPTreePath) -> bool {
-        if path.is_empty() {
-            return false;
-        }
-
-        let (node_idx, pos) = path.last().unwrap();
-
-        // Fast path: try to advance within current leaf
-        if let Node::Leaf(leaf) = &self.nodes[node_idx] {
-            let next_pos = pos + 1;
-            if next_pos < leaf.len() {
-                path.set_last_pos(next_pos);
-                return true;
-            }
-        } else {
-            return false;
-        }
-
-        // Slow path: need to go up and find next subtree
-        self.path_next_slow(path)
-    }
-
-    /// Slow path for path_next - separated for better inlining
-    #[cold]
-    fn path_next_slow(&self, path: &mut BPTreePath) -> bool {
-        loop {
-            path.pop();
-            if path.is_empty() {
-                return false;
-            }
-
-            let (parent_idx, parent_pos) = path.last().unwrap();
-            if let Node::Inner(parent) = &self.nodes[parent_idx] {
-                let next_child_pos = parent_pos + 1;
-                if next_child_pos < parent.children.len() {
-                    // Descend to leftmost leaf of next child
-                    path.set_last_pos(next_child_pos);
-                    let next_child = parent.children[next_child_pos];
-                    self.descend_left(path, next_child);
-                    return true;
-                }
-            }
-        }
-    }
-
-    /// Descend to leftmost leaf from a node (optimized)
-    #[inline]
-    fn descend_left(&self, path: &mut BPTreePath, mut node_idx: usize) {
-        loop {
-            let node = &self.nodes[node_idx];
-            if node.is_leaf() {
-                path.push(node_idx, 0);
-                return;
-            }
-            if let Node::Inner(inner) = node {
-                path.push(node_idx, 0);
-                node_idx = inner.children[0];
-            }
-        }
-    }
-
-    /// Descend to rightmost leaf from a node
-    fn descend_right(&self, path: &mut BPTreePath, mut node_idx: usize) {
-        loop {
-            match &self.nodes[node_idx] {
-                Node::Leaf(_) => {
-                    let len = self.nodes[node_idx].len();
-                    let pos = if len > 0 { len - 1 } else { 0 };
-                    path.push(node_idx, pos);
-                    return;
-                }
-                Node::Inner(inner) => {
-                    let child_pos = inner.children.len() - 1;
-                    path.push(node_idx, child_pos);
-                    node_idx = inner.children[child_pos];
-                }
-            }
-        }
-    }
-
-    /// Advance path to previous entry
-    fn path_prev(&self, path: &mut BPTreePath) -> bool {
-        if path.is_empty() {
-            return false;
-        }
-
-        let (node_idx, pos) = path.last().unwrap();
-
-        // Try to move left in current node
-        if pos > 0 {
-            path.set_last_pos(pos - 1);
-
-            if let Node::Leaf(_) = &self.nodes[node_idx] {
-                return true;
-            }
-            // Logic for inner node descent below
-        } else {
-            // Need to go up
-            loop {
-                path.pop();
-                if path.is_empty() {
-                    return false;
-                }
-                let (_, parent_pos) = path.last().unwrap();
-                if parent_pos > 0 {
-                    break;
-                }
-            }
-            // Now at parent where pos > 0. Decrement pos.
-            let (_, parent_pos) = path.last().unwrap();
-            path.set_last_pos(parent_pos - 1);
-        }
-
-        // Now we are at an inner node (or just moved in one).
-        // We need to descend to the rightmost leaf of the child we just moved to.
-        loop {
-            let (node_idx, pos) = path.last().unwrap();
-            match &self.nodes[node_idx] {
-                Node::Leaf(_) => return true,
-                Node::Inner(inner) => {
-                    let child_idx = inner.children[pos];
-                    // Descend to rightmost child of this child
-                    let child_node = &self.nodes[child_idx];
-                    match child_node {
-                        Node::Leaf(l) => {
-                            let p = if l.len() > 0 { l.len() - 1 } else { 0 };
-                            path.push(child_idx, p);
-                            return true;
-                        }
-                        Node::Inner(i) => {
-                            let p = i.children.len() - 1;
-                            path.push(child_idx, p);
-                        }
-                    }
-                }
-            }
         }
     }
 }
