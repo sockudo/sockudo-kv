@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use itertools::Itertools;
+
 use crate::config::ServerConfig;
 use crate::storage::MultiStore;
 
@@ -19,10 +21,9 @@ pub struct SavePoint {
 impl SavePoint {
     /// Parse from config string "seconds changes"
     pub fn parse(config: &str) -> Option<Self> {
-        let parts: Vec<&str> = config.split_whitespace().collect();
-        if parts.len() == 2 {
-            let seconds = parts[0].parse().ok()?;
-            let changes = parts[1].parse().ok()?;
+        if let Some((Ok(seconds), Ok(changes))) =
+            config.split_whitespace().map(str::parse).collect_tuple()
+        {
             Some(Self { seconds, changes })
         } else {
             None
@@ -94,10 +95,7 @@ impl PersistenceManager {
             save_points: config
                 .save_points
                 .iter()
-                .map(|(seconds, changes)| SavePoint {
-                    seconds: *seconds,
-                    changes: *changes,
-                })
+                .map(|&(seconds, changes)| SavePoint { seconds, changes })
                 .collect(),
             changes_since_save: AtomicU64::new(0),
             last_save: std::sync::Mutex::new(Instant::now()),
