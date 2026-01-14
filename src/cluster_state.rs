@@ -1332,6 +1332,148 @@ impl ClusterState {
             }
         }
     }
+
+    // =========================================================================
+    // Cluster Health & Coverage Checks
+    // =========================================================================
+
+    /// Check if cluster has full slot coverage
+    /// Returns true if all 16384 slots are assigned
+    pub fn has_full_coverage(&self) -> bool {
+        // Count all assigned slots (our slots + other nodes' slots)
+        let mut total_assigned = self.slots.count();
+
+        for node in self.nodes.iter() {
+            total_assigned += node.value().slots.count();
+        }
+
+        total_assigned >= CLUSTER_SLOTS
+    }
+
+    /// Check if cluster is healthy based on cluster_require_full_coverage config
+    /// When require_full_coverage is true, cluster is unhealthy if any slots are uncovered
+    pub fn is_cluster_healthy(&self, require_full_coverage: bool) -> bool {
+        if !self.state_ok.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        if require_full_coverage && !self.has_full_coverage() {
+            return false;
+        }
+
+        true
+    }
+
+    /// Check if a command should be allowed based on cluster state
+    ///
+    /// Arguments:
+    /// - `is_write`: true if the command is a write command
+    /// - `is_pubsub_shard`: true if the command is SPUBLISH or SSUBSCRIBE
+    /// - `require_full_coverage`: cluster_require_full_coverage config
+    /// - `allow_reads_when_down`: cluster_allow_reads_when_down config  
+    /// - `allow_pubsubshard_when_down`: cluster_allow_pubsubshard_when_down config
+    ///
+    /// Returns Ok(()) if allowed, or Err with error message if not
+    pub fn should_allow_command(
+        &self,
+        is_write: bool,
+        is_pubsub_shard: bool,
+        require_full_coverage: bool,
+        allow_reads_when_down: bool,
+        allow_pubsubshard_when_down: bool,
+    ) -> Result<(), &'static str> {
+        // Check if cluster is healthy
+        let is_healthy = self.is_cluster_healthy(require_full_coverage);
+
+        if is_healthy {
+            return Ok(());
+        }
+
+        // Cluster is down - check graceful degradation configs
+
+        // Check pubsub shard commands
+        if is_pubsub_shard && allow_pubsubshard_when_down {
+            return Ok(());
+        }
+
+        // Check read commands
+        if !is_write && allow_reads_when_down {
+            return Ok(());
+        }
+
+        Err("CLUSTERDOWN The cluster is down")
+    }
+
+    /// Mark a node as PFAIL if it hasn't responded within timeout
+    /// Returns true if node was marked as PFAIL
+    pub fn check_node_timeout(&self, node_id: &Bytes, timeout_ms: u64) -> bool {
+        if let Some(node) = self.nodes.get(node_id) {
+            let last_pong = node.pong_recv.load(Ordering::Relaxed);
+            let now = crate::storage::now_ms() as u64;
+
+            if now.saturating_sub(last_pong) > timeout_ms
+                && !node.flags.pfail()
+                && !node.flags.fail()
+            {
+                node.flags.set_pfail(true);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Run timeout checks on all nodes
+    /// Returns count of nodes newly marked as PFAIL
+    pub fn run_timeout_checks(&self, timeout_ms: u64) -> usize {
+        let mut pfail_count = 0;
+
+        for node in self.nodes.iter() {
+            if self.check_node_timeout(&node.id, timeout_ms) {
+                pfail_count += 1;
+            }
+        }
+
+        pfail_count
+    }
+
+    /// Get announced IP (cluster_announce_ip or actual IP)
+    pub fn get_announced_ip(&self, announce_ip: &Option<String>) -> String {
+        announce_ip
+            .clone()
+            .unwrap_or_else(|| self.my_ip.read().clone())
+    }
+
+    /// Get announced port (cluster_announce_port or actual port)
+    pub fn get_announced_port(&self, announce_port: Option<u16>, actual_port: u16) -> u16 {
+        announce_port.unwrap_or(actual_port)
+    }
+
+    /// Get announced cluster bus port
+    pub fn get_announced_bus_port(
+        &self,
+        announce_bus_port: Option<u16>,
+        cluster_port: u16,
+        actual_port: u16,
+    ) -> u16 {
+        if let Some(port) = announce_bus_port {
+            return port;
+        }
+        if cluster_port > 0 {
+            return cluster_port;
+        }
+        actual_port + 10000
+    }
+
+    /// Update cluster state based on coverage
+    pub fn update_cluster_state(&self, require_full_coverage: bool) {
+        let is_ok = if require_full_coverage {
+            self.has_full_coverage()
+        } else {
+            self.slots.count() > 0 || self.nodes.iter().any(|n| n.slots.count() > 0)
+        };
+
+        self.state_ok.store(is_ok, Ordering::Relaxed);
+    }
 }
 
 // =============================================================================

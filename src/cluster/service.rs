@@ -82,18 +82,27 @@ impl ClusterService {
 
     /// Start the cluster service
     pub async fn start(self: Arc<Self>) {
-        let (enabled, port) = {
+        let (enabled, port, cluster_port_cfg, node_timeout) = {
             let config = self.server.config.read();
-            // Check implicit TLS cluster requirement?
-            // Usually if tls-cluster yes, we expect configs.
-            (config.cluster_enabled, config.port)
+            (
+                config.cluster_enabled,
+                config.port,
+                config.cluster_port,
+                config.cluster_node_timeout,
+            )
         };
 
         if !enabled {
             return;
         }
 
-        let cluster_port = port + 10000;
+        // Use configured cluster_port if set, otherwise port + 10000
+        let cluster_port = if cluster_port_cfg > 0 {
+            cluster_port_cfg
+        } else {
+            port + 10000
+        };
+
         let bind_addr = format!("0.0.0.0:{}", cluster_port);
 
         info!("Starting Cluster Bus on {}", bind_addr);
@@ -136,6 +145,13 @@ impl ClusterService {
         let service = self.clone();
         tokio::spawn(async move {
             service.gossip_loop().await;
+        });
+
+        // Spawn failure detection loop
+        let service = self.clone();
+        let timeout_ms = node_timeout;
+        tokio::spawn(async move {
+            service.failure_detection_loop(timeout_ms).await;
         });
     }
 
@@ -489,9 +505,32 @@ impl ClusterService {
         let mut msg = ClusterMsg::new(type_);
         msg.sender = self.server.cluster.my_id.clone();
 
-        let port = self.server.config.read().port;
-        msg.port = port;
-        msg.cport = port + 10000;
+        let config = self.server.config.read();
+
+        // Use announced port if configured, otherwise actual port
+        let actual_port = config.port;
+        msg.port = self
+            .server
+            .cluster
+            .get_announced_port(config.cluster_announce_port, actual_port);
+
+        // Use announced bus port if configured
+        msg.cport = self.server.cluster.get_announced_bus_port(
+            config.cluster_announce_bus_port,
+            config.cluster_port,
+            actual_port,
+        );
+
+        // Use announced IP if configured
+        let announced_ip = self
+            .server
+            .cluster
+            .get_announced_ip(&config.cluster_announce_ip);
+        let ip_bytes = announced_ip.as_bytes();
+        let len = ip_bytes.len().min(46);
+        msg.myip[..len].copy_from_slice(&ip_bytes[..len]);
+
+        drop(config);
 
         // Serialize slots bitmap efficiently
         self.server.cluster.slots.to_bytes(&mut msg.myslots);
@@ -500,5 +539,36 @@ impl ClusterService {
         msg.current_epoch = self.server.cluster.current_epoch.load(Ordering::Relaxed);
 
         msg
+    }
+
+    /// Failure detection loop - checks node timeouts and upgrades PFAIL to FAIL
+    async fn failure_detection_loop(&self, timeout_ms: u64) {
+        // Run at cluster_node_timeout / 10 interval (100ms min)
+        let interval_ms = (timeout_ms / 10).max(100);
+        let interval = Duration::from_millis(interval_ms);
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            // Run timeout checks on all nodes
+            let pfail_count = self.server.cluster.run_timeout_checks(timeout_ms);
+            if pfail_count > 0 {
+                debug!("Marked {} nodes as PFAIL due to timeout", pfail_count);
+            }
+
+            // Check PFAIL -> FAIL upgrades based on quorum
+            for node_entry in self.server.cluster.nodes.iter() {
+                let node = node_entry.value();
+                if node.flags.pfail() && !node.flags.fail() {
+                    crate::cluster::failover::check_pfail_to_fail(&self.server.cluster, node);
+                }
+            }
+
+            // Update cluster state (ok/down) based on coverage
+            let require_full_coverage = self.server.config.read().cluster_require_full_coverage;
+            self.server
+                .cluster
+                .update_cluster_state(require_full_coverage);
+        }
     }
 }

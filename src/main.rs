@@ -471,6 +471,35 @@ sockudo-kv version 7.0.0 - Ready to accept connections
         cluster_tls_acceptor,
         cluster_tls_client_config,
     ));
+
+    // Load cluster state from nodes.conf if cluster is enabled
+    if config.cluster_enabled {
+        match sockudo_kv::cluster::load_nodes_conf(&config, &server_state.cluster) {
+            Ok(true) => println!("Loaded cluster state from {}", config.cluster_config_file),
+            Ok(false) => println!("No cluster config file found, starting fresh"),
+            Err(e) => eprintln!("Failed to load cluster config: {}", e),
+        }
+
+        // Set cluster IP and port based on config
+        *server_state.cluster.my_ip.write() = config
+            .cluster_announce_ip
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        server_state
+            .cluster
+            .my_port
+            .store(config.port as u64, std::sync::atomic::Ordering::Relaxed);
+        server_state
+            .cluster
+            .enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Initialize cluster state based on require_full_coverage
+        server_state
+            .cluster
+            .update_cluster_state(config.cluster_require_full_coverage);
+    }
+
     let cs = cluster_service.clone();
     tokio::spawn(async move {
         cs.start().await;
@@ -653,6 +682,15 @@ sockudo-kv version 7.0.0 - Ready to accept connections
         }
         _ = async { tasks.join_all().await } => {
             println!("All listeners stopped unexpectedly.");
+        }
+    }
+
+    // Save cluster state on shutdown if enabled
+    if config.cluster_enabled {
+        if let Err(e) = sockudo_kv::cluster::save_nodes_conf(&config, &server_state.cluster) {
+            eprintln!("Failed to save cluster config on shutdown: {}", e);
+        } else {
+            println!("Saved cluster state to {}", config.cluster_config_file);
         }
     }
 

@@ -76,6 +76,33 @@ impl Dispatcher {
                 || cmd.is_command(b"KEYS");
 
             if !skip {
+                // Determine if this is a write command or pubsub shard command
+                let is_write = is_write_command(cmd_name);
+                let is_pubsub_shard = cmd.is_command(b"SPUBLISH")
+                    || cmd.is_command(b"SSUBSCRIBE")
+                    || cmd.is_command(b"SUNSUBSCRIBE");
+
+                // Read cluster config once
+                let (require_full_coverage, allow_reads_when_down, allow_pubsubshard_when_down) = {
+                    let config = state.config.read();
+                    (
+                        config.cluster_require_full_coverage,
+                        config.cluster_allow_reads_when_down,
+                        config.cluster_allow_pubsubshard_when_down,
+                    )
+                };
+
+                // Check if cluster is healthy and command is allowed
+                if let Err(err_msg) = state.cluster.should_allow_command(
+                    is_write,
+                    is_pubsub_shard,
+                    require_full_coverage,
+                    allow_reads_when_down,
+                    allow_pubsubshard_when_down,
+                ) {
+                    return Ok(RespValue::error(err_msg));
+                }
+
                 // Calculate hashing slot for first key
                 // Note: MGET/MSET etc might have multiple. We check first for now.
                 let key = &args[0];
@@ -436,4 +463,19 @@ fn is_cluster_protocol_command(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"ASKING")
         || cmd.eq_ignore_ascii_case(b"READONLY")
         || cmd.eq_ignore_ascii_case(b"READWRITE")
+}
+
+/// Check if a command is a write command (used for cluster read/write checks)
+fn is_write_command(cmd: &[u8]) -> bool {
+    let c = std::str::from_utf8(cmd).unwrap_or("").to_uppercase();
+    match c.as_str() {
+        "SET" | "MSET" | "SETNX" | "MSETNX" | "DEL" | "UNLINK" | "EXPIRE" | "PEXPIRE"
+        | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LSET"
+        | "LINSERT" | "LTRIM" | "LREM" | "SADD" | "SREM" | "SPOP" | "SMOVE" | "HSET" | "HMSET"
+        | "HSETNX" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "ZADD" | "ZREM" | "ZINCRBY"
+        | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZPOPMAX" | "ZPOPMIN" | "FLUSHDB"
+        | "FLUSHALL" | "RESTORE" | "RENAME" | "RENAMENX" | "APPEND" | "INCR" | "DECR"
+        | "INCRBY" | "DECRBY" | "INCRBYFLOAT" => true,
+        _ => false,
+    }
 }
