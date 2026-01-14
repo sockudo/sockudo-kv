@@ -25,8 +25,37 @@ pub const RDB_TYPE_HASH_LISTPACK: u8 = 16;
 pub const RDB_TYPE_SET_LISTPACK: u8 = 20;
 pub const RDB_TYPE_ZSET_LISTPACK: u8 = 17;
 
-/// Generate RDB snapshot of store
+/// LZF compression encoding
+pub const RDB_ENC_LZF: u8 = 3;
+
+/// RDB configuration options
+#[derive(Debug, Clone, Copy)]
+pub struct RdbConfig {
+    /// Enable LZF compression for strings (default: true)
+    pub compression: bool,
+    /// Append CRC64 checksum to RDB file (default: true)
+    pub checksum: bool,
+}
+
+impl Default for RdbConfig {
+    fn default() -> Self {
+        Self {
+            compression: true,
+            checksum: true,
+        }
+    }
+}
+
+/// Generate RDB snapshot of store with default settings
 pub fn generate_rdb(multi_store: &crate::storage::MultiStore) -> Bytes {
+    generate_rdb_with_config(multi_store, RdbConfig::default())
+}
+
+/// Generate RDB snapshot of store with custom configuration
+pub fn generate_rdb_with_config(
+    multi_store: &crate::storage::MultiStore,
+    config: RdbConfig,
+) -> Bytes {
     let mut rdb = Vec::with_capacity(1024 * 1024); // 1MB initial capacity
 
     // Magic number and version
@@ -95,27 +124,27 @@ pub fn generate_rdb(multi_store: &crate::storage::MultiStore) -> Bytes {
             }
 
             // Write value based on type
-            write_value(&mut rdb, key, &value.data);
+            write_value(&mut rdb, key, &value.data, config.compression);
         }
     }
 
     // EOF
     rdb.push(RDB_OPCODE_EOF);
 
-    // CRC64 checksum (compute real checksum)
-    let checksum = crc64(&rdb);
+    // CRC64 checksum (write 0 if disabled)
+    let checksum = if config.checksum { crc64(&rdb) } else { 0 };
     rdb.extend_from_slice(&checksum.to_le_bytes());
 
     Bytes::from(rdb)
 }
 
 /// Write a key-value pair to RDB
-fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType) {
+fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) {
     match data {
         DataType::String(s) => {
             rdb.push(RDB_TYPE_STRING);
             write_string(rdb, key);
-            write_string(rdb, s);
+            write_string_compressed(rdb, s, compress);
         }
         DataType::List(list) => {
             rdb.push(RDB_TYPE_LIST);
@@ -233,10 +262,28 @@ fn write_aux_int(rdb: &mut Vec<u8>, key: &str, value: i64) {
     write_int(rdb, value);
 }
 
-/// Write length-prefixed string
+/// Write length-prefixed string (no compression, used for keys and aux)
 fn write_string(rdb: &mut Vec<u8>, s: &Bytes) {
     write_length(rdb, s.len());
     rdb.extend_from_slice(s);
+}
+
+/// Write string with optional LZF compression (for values)
+/// Compresses if enabled and string is > 20 bytes and compression saves space
+fn write_string_compressed(rdb: &mut Vec<u8>, s: &Bytes, compress: bool) {
+    // Only attempt compression for strings over 20 bytes
+    if compress && s.len() > 20 {
+        if let Some(compressed) = crate::lzf::compress(s) {
+            // Write LZF encoding: 0xC3 (RDB_ENC_LZF), compressed_len, orig_len, data
+            rdb.push(RDB_ENC_LZF | 0xC0); // 0xC3
+            write_length(rdb, compressed.len());
+            write_length(rdb, s.len());
+            rdb.extend_from_slice(&compressed);
+            return;
+        }
+    }
+    // Fallback to uncompressed
+    write_string(rdb, s);
 }
 
 /// Write integer in RDB encoding
@@ -291,7 +338,23 @@ pub fn load_rdb(data: &[u8], multi_store: &crate::storage::MultiStore) -> Result
         cursor += 1;
 
         match opcode {
-            RDB_OPCODE_EOF => break,
+            RDB_OPCODE_EOF => {
+                // Verify checksum if present
+                if cursor + 8 <= data.len() {
+                    let checksum = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                    if checksum != 0 {
+                        // Calculate checksum of data loaded so far (including EOF marker)
+                        let calculated = crc64(&data[0..cursor]);
+                        if calculated != checksum {
+                            return Err(format!(
+                                "RDB checksum mismatch: expected {}, got {}",
+                                checksum, calculated
+                            ));
+                        }
+                    }
+                }
+                break;
+            }
             RDB_OPCODE_AUX => {
                 // Skip aux field
                 let (_, len1) = read_string(&data[cursor..])?;
@@ -479,6 +542,31 @@ fn read_length(data: &[u8]) -> Result<(usize, usize), String> {
 
 /// Read string from RDB
 fn read_string(data: &[u8]) -> Result<(Bytes, usize), String> {
+    if data.is_empty() {
+        return Err("Truncated string header".to_string());
+    }
+
+    // Check for LZF encoding (0xC3)
+    if (data[0] & 0xC0) == 0xC0 && (data[0] & 0x3F) == RDB_ENC_LZF {
+        let mut cursor = 1;
+        // Read compressed length
+        let (clen, clen_size) = read_length(&data[cursor..])?;
+        cursor += clen_size;
+        // Read original length
+        let (len, len_size) = read_length(&data[cursor..])?;
+        cursor += len_size;
+
+        if data.len() < cursor + clen {
+            return Err("Truncated LZF data".to_string());
+        }
+
+        let compressed = &data[cursor..cursor + clen];
+        let decompressed =
+            crate::lzf::decompress(compressed, len).map_err(|e| format!("LZF error: {}", e))?;
+
+        return Ok((Bytes::from(decompressed), cursor + clen));
+    }
+
     let (len, len_size) = read_length(data)?;
 
     // Check for special encodings
@@ -503,6 +591,7 @@ fn read_string(data: &[u8]) -> Result<(Bytes, usize), String> {
                 let val = i32::from_le_bytes(data[1..5].try_into().unwrap());
                 return Ok((Bytes::from(val.to_string()), 5));
             }
+            // RDB_ENC_LZF is handled above
             _ => {}
         }
     }

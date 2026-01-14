@@ -16,6 +16,7 @@ pub mod glob_trie;
 pub mod keyspace_notify;
 pub mod logging;
 pub mod lua_engine;
+pub mod lzf;
 pub mod pattern;
 pub mod persistence;
 pub mod process_mgmt;

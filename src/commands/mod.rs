@@ -195,7 +195,7 @@ impl Dispatcher {
         }
 
         // New generic commands (COPY, DUMP, RESTORE, KEYS, SCAN, RENAME, etc.)
-        match generic::execute(store, cmd_name, args) {
+        match generic::execute(store, server, cmd_name, args) {
             Ok(resp) => return Ok(resp),
             Err(Error::UnknownCommand(_)) => {}
             Err(e) => return Err(e),

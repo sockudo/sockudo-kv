@@ -525,9 +525,11 @@ impl Store {
         data: &[u8],
         replace: bool,
         absttl: bool,
+        _sanitize: bool,
     ) -> std::result::Result<(), String> {
-        if data.len() < 10 {
-            return Err("ERR invalid serialized data".into());
+        let data_len = data.len();
+        if data_len < 10 {
+            return Err("ERR invalid dump data".into());
         }
 
         if !replace && self.exists(key) {

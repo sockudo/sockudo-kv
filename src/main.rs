@@ -32,7 +32,10 @@ use sockudo_kv::commands::transaction::{
 use sockudo_kv::config::ServerConfig;
 use sockudo_kv::protocol::{Command, Parser, RespValue};
 use sockudo_kv::pubsub::PubSubMessage;
+use sockudo_kv::replication::rdb::RdbConfig;
 use sockudo_kv::server_state::ServerState;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 
 #[global_allocator]
@@ -895,6 +898,15 @@ where
                                     }
                                 } else {
                                     // Normal command processing
+
+                                    // Check stop-writes-on-bgsave-error
+                                    if config.stop_writes_on_bgsave_error
+                                        && server_state.last_bgsave_status.load(std::sync::atomic::Ordering::Relaxed)
+                                        && is_write_command(cmd_name)
+                                    {
+                                        write_buf.extend_from_slice(b"-MISCONF Redis is configured to save RDB snapshots, but is currently not able to persist on disk. Commands that may modify the data set are disabled. Please check Redis logs for details about the error.\r\n");
+                                        continue;
+                                    }
                                     if cmd.is_command(b"SWAPDB") {
                                         // SWAPDB needs access to MultiStore
                                         let response = handle_swapdb(multi_store, &cmd.args);
@@ -903,30 +915,42 @@ where
                                         }
                                     } else if cmd.is_command(b"SAVE") {
                                         // Synchronous SAVE
-                                        use sockudo_kv::replication::rdb::generate_rdb;
-                                        let rdb_data = generate_rdb(multi_store);
+                                        use sockudo_kv::replication::rdb::generate_rdb_with_config;
+                                        let rdb_config = RdbConfig {
+                                            compression: config.rdbcompression,
+                                            checksum: config.rdbchecksum,
+                                        };
+                                        let rdb_data = generate_rdb_with_config(multi_store, rdb_config);
                                         let rdb_path = Path::new(&config.dir).join(&config.dbfilename);
-                                        match std::fs::write(&rdb_path, &rdb_data) {
+                                        match save_rdb_file(&rdb_path, &rdb_data, config.rdb_save_incremental_fsync) {
                                             Ok(_) => {
                                                 server_state.last_save_time.store(server_state.now_unix(), std::sync::atomic::Ordering::Relaxed);
+                                                server_state.last_bgsave_status.store(false, std::sync::atomic::Ordering::Relaxed);
                                                 write_buf.extend_from_slice(b"+OK\r\n");
                                             }
                                             Err(e) => {
+                                                server_state.last_bgsave_status.store(true, std::sync::atomic::Ordering::Relaxed);
                                                 write_buf.extend_from_slice(b"-ERR Failed to save: ");
                                                 write_buf.extend_from_slice(e.to_string().as_bytes());
                                                 write_buf.extend_from_slice(b"\r\n");
                                             }
                                         }
                                     } else if cmd.is_command(b"BGSAVE") {
-                                        use sockudo_kv::replication::rdb::generate_rdb;
-                                        let rdb_data = generate_rdb(multi_store);
+                                        use sockudo_kv::replication::rdb::generate_rdb_with_config;
+                                        let rdb_config = RdbConfig {
+                                            compression: config.rdbcompression,
+                                            checksum: config.rdbchecksum,
+                                        };
+                                        let rdb_data = generate_rdb_with_config(multi_store, rdb_config);
                                         let rdb_path = Path::new(&config.dir).join(&config.dbfilename);
-                                        match std::fs::write(&rdb_path, &rdb_data) {
+                                        match save_rdb_file(&rdb_path, &rdb_data, config.rdb_save_incremental_fsync) {
                                             Ok(_) => {
                                                 server_state.last_save_time.store(server_state.now_unix(), std::sync::atomic::Ordering::Relaxed);
+                                                server_state.last_bgsave_status.store(false, std::sync::atomic::Ordering::Relaxed);
                                                 write_buf.extend_from_slice(b"+Background saving started\r\n");
                                             }
                                             Err(e) => {
+                                                server_state.last_bgsave_status.store(true, std::sync::atomic::Ordering::Relaxed);
                                                 write_buf.extend_from_slice(b"-ERR Failed to save: ");
                                                 write_buf.extend_from_slice(e.to_string().as_bytes());
                                                 write_buf.extend_from_slice(b"\r\n");
@@ -1271,4 +1295,42 @@ fn create_unix_listener(path: &str, perm: Option<u32>) -> std::io::Result<UnixLi
     }
 
     UnixListener::from_std(listener)
+}
+
+/// Check if a command is a write command
+fn is_write_command(cmd: &[u8]) -> bool {
+    let c = std::str::from_utf8(cmd).unwrap_or("").to_uppercase();
+    match c.as_str() {
+        "SET" | "MSET" | "SETNX" | "MSETNX" | "DEL" | "UNLINK" | "EXPIRE" | "PEXPIRE"
+        | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LSET"
+        | "LINSERT" | "LTRIM" | "LREM" | "SADD" | "SREM" | "SPOP" | "SMOVE" | "HSET" | "HMSET"
+        | "HSETNX" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "ZADD" | "ZREM" | "ZINCRBY"
+        | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZPOPMAX" | "ZPOPMIN" | "FLUSHDB"
+        | "FLUSHALL" | "RESTORE" | "RENAME" | "RENAMENX" | "APPEND" | "INCR" | "DECR"
+        | "INCRBY" | "DECRBY" | "INCRBYFLOAT" => true,
+        _ => false,
+    }
+}
+
+/// Save RDB data to file with optional incremental fsync
+fn save_rdb_file(path: &Path, data: &[u8], incremental_fsync: bool) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+
+    if !incremental_fsync {
+        file.write_all(data)?;
+        return Ok(());
+    }
+
+    // Incremental fsync every 4MB
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+    for chunk in data.chunks(CHUNK_SIZE) {
+        file.write_all(chunk)?;
+        file.sync_data()?;
+    }
+
+    Ok(())
 }

@@ -3,18 +3,25 @@
 //! Implements COPY, DUMP, RESTORE, KEYS, SCAN, RENAME, TOUCH, UNLINK,
 //! OBJECT, SORT, EXPIREAT, EXPIRETIME, RANDOMKEY, WAIT, WAITAOF and related commands.
 
+use crate::server_state::ServerState;
 use bytes::Bytes;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use crate::storage::{DataType, Entry, Store};
 
 /// Execute generic commands
-pub fn execute(store: &Store, cmd: &[u8], args: &[Bytes]) -> Result<RespValue> {
+pub fn execute(
+    store: &Store,
+    server: Option<&Arc<ServerState>>,
+    cmd: &[u8],
+    args: &[Bytes],
+) -> Result<RespValue> {
     match cmd.to_ascii_uppercase().as_slice() {
         b"COPY" => cmd_copy(store, args),
         b"DUMP" => cmd_dump(store, args),
-        b"RESTORE" => cmd_restore(store, args),
+        b"RESTORE" => cmd_restore(store, server, args),
         b"EXPIREAT" => cmd_expireat(store, args),
         b"PEXPIREAT" => cmd_pexpireat(store, args),
         b"EXPIRETIME" => cmd_expiretime(store, args),
@@ -85,7 +92,11 @@ fn cmd_dump(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 // ==================== RESTORE ====================
 
 /// RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]
-fn cmd_restore(store: &Store, args: &[Bytes]) -> Result<RespValue> {
+fn cmd_restore(
+    store: &Store,
+    server: Option<&Arc<ServerState>>,
+    args: &[Bytes],
+) -> Result<RespValue> {
     if args.len() < 3 {
         return Err(Error::WrongArity("RESTORE"));
     }
@@ -115,7 +126,17 @@ fn cmd_restore(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         i += 1;
     }
 
-    match store.restore_key(key, ttl, data, replace, absttl) {
+    // Check sanitize_dump_payload
+    let sanitize = server
+        .map(|s| {
+            let config = s.config.read();
+            // sanity check should be performed if yes or clients (since this is a client command)
+            // If "no" (default), we skip extra validation (though restore_key does basic validation)
+            config.sanitize_dump_payload == "yes" || config.sanitize_dump_payload == "clients"
+        })
+        .unwrap_or(false);
+
+    match store.restore_key(key, ttl, data, replace, absttl, sanitize) {
         Ok(()) => Ok(RespValue::ok()),
         Err(msg) => Ok(RespValue::error(&msg)),
     }

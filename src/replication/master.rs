@@ -172,3 +172,10 @@ pub fn generate_empty_rdb() -> Bytes {
 
     Bytes::from(rdb)
 }
+
+/// Cleanup temporary RDB sync file if enabled
+pub fn cleanup_sync_file(path: &str, del_enabled: bool) {
+    if del_enabled {
+        let _ = std::fs::remove_file(path);
+    }
+}
