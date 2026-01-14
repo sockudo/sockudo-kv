@@ -269,6 +269,29 @@ impl LuaEngine {
             .set("redis", redis_table)
             .map_err(|e| format!("Failed to set redis global: {}", e))?;
 
+        // Add locale-aware string comparison to the string library
+        // This provides string.locale_compare(a, b) for locale-aware sorting
+        let string_table: mlua::Table = globals
+            .get("string")
+            .map_err(|e| format!("Failed to get string table: {}", e))?;
+
+        let locale_compare_fn = lua
+            .create_function(|_, (a, b): (String, String)| {
+                // Use Unicode-aware comparison (case-insensitive first, then case-sensitive)
+                // This provides reasonable locale-like behavior without libc dependency
+                let a_lower = a.to_lowercase();
+                let b_lower = b.to_lowercase();
+                match a_lower.cmp(&b_lower) {
+                    std::cmp::Ordering::Equal => Ok(a.cmp(&b) as i32),
+                    ord => Ok(ord as i32),
+                }
+            })
+            .map_err(|e| format!("Failed to create string.locale_compare: {}", e))?;
+
+        string_table
+            .set("locale_compare", locale_compare_fn)
+            .map_err(|e| format!("Failed to set string.locale_compare: {}", e))?;
+
         Ok(())
     }
 

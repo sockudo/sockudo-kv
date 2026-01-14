@@ -14,6 +14,7 @@ pub mod config_table;
 pub mod error;
 pub mod glob_trie;
 pub mod keyspace_notify;
+pub mod logging;
 pub mod lua_engine;
 pub mod pattern;
 pub mod persistence;

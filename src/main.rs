@@ -43,11 +43,94 @@ const WRITE_BUF_SIZE: usize = 64 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
     let config = sockudo_kv::cli::Cli::load_config().unwrap_or_else(|e| {
         eprintln!("Error loading config: {}", e);
         std::process::exit(1);
     });
+
+    // Initialize logging from config (loglevel, logfile, syslog)
+    if let Err(e) = sockudo_kv::logging::init_logging(&config) {
+        eprintln!("Warning: Failed to initialize logging: {}", e);
+        // Fall back to env_logger
+        env_logger::init();
+    }
+
+    // Apply supervised mode (systemd/upstart notification)
+    let supervised_mode: sockudo_kv::process_mgmt::SupervisedMode = config
+        .supervised
+        .parse()
+        .unwrap_or(sockudo_kv::process_mgmt::SupervisedMode::No);
+    supervised_mode.apply();
+
+    // Set up crash handler if crash_log_enabled
+    if config.crash_log_enabled {
+        let memcheck = config.crash_memcheck_enabled;
+        std::panic::set_hook(Box::new(move |panic_info| {
+            eprintln!("\n=== SOCKUDO-KV CRASH REPORT ===");
+            eprintln!("Time: {:?}", std::time::SystemTime::now());
+            eprintln!("Panic: {}", panic_info);
+            if let Some(location) = panic_info.location() {
+                eprintln!(
+                    "Location: {}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                );
+            }
+            // Backtrace
+            eprintln!("\nBacktrace:");
+            eprintln!("{:?}", std::backtrace::Backtrace::force_capture());
+
+            if memcheck {
+                eprintln!("\n--- Memory Statistics ---");
+                // Try to get basic memory stats
+                #[cfg(target_os = "linux")]
+                if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                    for line in status.lines() {
+                        if line.starts_with("VmRSS")
+                            || line.starts_with("VmPeak")
+                            || line.starts_with("VmSize")
+                            || line.starts_with("VmData")
+                        {
+                            eprintln!("  {}", line);
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    eprintln!("  (Memory stats only available on Linux)");
+                }
+            }
+            eprintln!("=== END CRASH REPORT ===\n");
+        }));
+    }
+
+    // Set process title if enabled
+    if config.set_proc_title {
+        let config_path = std::env::args().nth(1).unwrap_or_default();
+        let title = sockudo_kv::process_mgmt::format_process_title(
+            &config.proc_title_template,
+            config.port,
+            &config_path,
+        );
+        sockudo_kv::process_mgmt::set_process_title(&title);
+    }
+
+    // Show ASCII logo if always_show_logo is enabled
+    if config.always_show_logo {
+        println!(
+            r#"
+  _____         _           _         _  ____   __
+ / ____|       | |         | |       | |/ /\ \ / /
+| (___   ___  _| | ___   __| | ___   | ' /  \ V / 
+ \___ \ / _ \/ __|| |/ / | | |/ _ \  |  <    > <  
+ ____) | (_)|  (__| <| |_| | (_) |  | . \  / . \ 
+|_____/ \___/\___|_|\_\__,_|\___/   |_|\_\/_/ \_\
+
+sockudo-kv version 7.0.0 - Ready to accept connections
+"#
+        );
+    }
 
     if config.daemonize {
         println!(
@@ -623,9 +706,31 @@ where
                 loop {
                     match Parser::parse(&mut buf) {
                         Ok(Some(value)) => match Command::from_resp(value) {
-                            Ok(cmd) => {
+                            Ok(mut cmd) => {
                                 // Update last command timestamp
                                 client.touch();
+
+                                // Apply command renaming from config
+                                // rename_command maps original -> renamed (or empty to disable)
+                                let cmd_name_str = String::from_utf8_lossy(cmd.name()).to_uppercase();
+                                if let Some(renamed) = config.rename_command.get(&cmd_name_str) {
+                                    if renamed.is_empty() {
+                                        // Command is disabled
+                                        write_buf.extend_from_slice(b"-ERR unknown command '");
+                                        write_buf.extend_from_slice(cmd.name());
+                                        write_buf.extend_from_slice(b"', with args beginning with: ");
+                                        if !cmd.args.is_empty() {
+                                            write_buf.extend_from_slice(&cmd.args[0]);
+                                        }
+                                        write_buf.extend_from_slice(b"\r\n");
+                                        continue;
+                                    }
+                                    // Replace command name with renamed version
+                                    cmd = Command {
+                                        name: bytes::Bytes::from(renamed.as_bytes().to_vec()),
+                                        args: cmd.args,
+                                    };
+                                }
 
                                 let cmd_name = cmd.name();
 

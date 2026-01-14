@@ -385,6 +385,7 @@ fn is_server_command(cmd: &[u8]) -> bool {
     cmd.eq_ignore_ascii_case(b"ACL")
         || cmd.eq_ignore_ascii_case(b"COMMAND")
         || cmd.eq_ignore_ascii_case(b"CONFIG")
+        || cmd.eq_ignore_ascii_case(b"DEBUG")
         || cmd.eq_ignore_ascii_case(b"MEMORY")
         || cmd.eq_ignore_ascii_case(b"LATENCY")
         || cmd.eq_ignore_ascii_case(b"SLOWLOG")

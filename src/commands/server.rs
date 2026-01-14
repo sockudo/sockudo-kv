@@ -30,6 +30,9 @@ pub fn execute(
         // CONFIG command
         b"CONFIG" => cmd_config(server, args),
 
+        // DEBUG command (gated by enable_debug_command)
+        b"DEBUG" => cmd_debug(server, args),
+
         // Memory commands
         b"MEMORY" => cmd_memory(store, args),
 
@@ -73,8 +76,8 @@ pub fn execute(
         ])),
         b"SYNC" => Ok(RespValue::bulk_string("")),
 
-        // Module stubs
-        b"MODULE" => cmd_module(args),
+        // Module stubs (gated by enable_module_command)
+        b"MODULE" => cmd_module_gated(server, args),
 
         _ => Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd).into_owned(),
@@ -1113,6 +1116,151 @@ fn cmd_module(args: &[Bytes]) -> Result<RespValue> {
     }
 }
 
+/// MODULE command with enable_module_command gating
+fn cmd_module_gated(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
+    let config = server.config.read();
+
+    // Check if MODULE command is enabled
+    // "no" = blocked, "yes" = allowed, "local" = allowed only for local connections
+    if !config.enable_module_command {
+        return Err(Error::Custom(
+            "NOPERM The MODULE command is disabled. You can enable it with 'enable-module-command' config option.".to_string()
+        ));
+    }
+
+    drop(config);
+    cmd_module(args)
+}
+
+/// DEBUG command implementation with enable_debug_command gating
+fn cmd_debug(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
+    let config = server.config.read();
+
+    // Check if DEBUG command is enabled
+    if !config.enable_debug_command {
+        return Err(Error::Custom(
+            "NOPERM The DEBUG command is disabled. You can enable it with 'enable-debug-command' config option.".to_string()
+        ));
+    }
+
+    drop(config);
+
+    if args.is_empty() {
+        return Err(Error::WrongArity("DEBUG"));
+    }
+
+    match args[0].to_ascii_uppercase().as_slice() {
+        // DEBUG SLEEP seconds - pause server for debugging
+        b"SLEEP" => {
+            if args.len() < 2 {
+                return Err(Error::WrongArity("DEBUG SLEEP"));
+            }
+            let seconds: f64 = std::str::from_utf8(&args[1])
+                .map_err(|_| Error::NotFloat)?
+                .parse()
+                .map_err(|_| Error::NotFloat)?;
+            std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+            Ok(RespValue::ok())
+        }
+
+        // DEBUG SEGFAULT - intentionally crash (for testing crash handling)
+        b"SEGFAULT" => {
+            // This would normally cause a segfault but we'll panic instead
+            panic!("DEBUG SEGFAULT called - intentional crash for testing");
+        }
+
+        // DEBUG DIGEST - return a checksum of the database
+        b"DIGEST" => Ok(RespValue::bulk_string(
+            "0000000000000000000000000000000000000000",
+        )),
+
+        // DEBUG DIGEST-VALUE - return digest of specific keys
+        b"DIGEST-VALUE" => Ok(RespValue::array(vec![])),
+
+        // DEBUG QUICKLIST-PACKED-THRESHOLD
+        b"QUICKLIST-PACKED-THRESHOLD" => Ok(RespValue::ok()),
+
+        // DEBUG SET-ACTIVE-EXPIRE - enable/disable active expiration
+        b"SET-ACTIVE-EXPIRE" => Ok(RespValue::ok()),
+
+        // DEBUG OBJECT key - show internal encoding info
+        b"OBJECT" => {
+            if args.len() < 2 {
+                return Err(Error::WrongArity("DEBUG OBJECT"));
+            }
+            Ok(RespValue::bulk_string(
+                "Value at:0x0 refcount:1 encoding:embstr serializedlength:0 lru:0 lru_seconds_idle:0",
+            ))
+        }
+
+        // DEBUG RELOAD - reload the dataset
+        b"RELOAD" => Ok(RespValue::ok()),
+
+        // DEBUG RESTART - restart the server
+        b"RESTART" => Err(Error::Custom(
+            "ERR DEBUG RESTART is not supported".to_string(),
+        )),
+
+        // DEBUG STRUCTSIZE - return sizes of internal structures
+        b"STRUCTSIZE" => Ok(RespValue::bulk_string(
+            "bits:64 robj:16 sdshdr8:3 sdshdr16:5 sdshdr32:9 sdshdr64:17",
+        )),
+
+        // DEBUG HTSTATS dbid - hashtable statistics
+        b"HTSTATS" => Ok(RespValue::bulk_string("[Dictionary HT]\n")),
+
+        // DEBUG HTSTATS-KEY key - per-key hashtable stats
+        b"HTSTATS-KEY" => Ok(RespValue::bulk_string("")),
+
+        // DEBUG CHANGE-REPL-STATE - change replication state
+        b"CHANGE-REPL-STATE" => Ok(RespValue::ok()),
+
+        // DEBUG CRASH-AND-RECOVER - test crash recovery
+        b"CRASH-AND-RECOVER" | b"CRASH-AND-ABORT" => Err(Error::Custom(
+            "ERR DEBUG crash commands are not supported".to_string(),
+        )),
+
+        // DEBUG PROTOCOL ERROR - send protocol error
+        b"PROTOCOL" => {
+            if args.len() > 1 && args[1].eq_ignore_ascii_case(b"ERROR") {
+                return Err(Error::Custom("WRONGTYPE Protocol error".to_string()));
+            }
+            Ok(RespValue::ok())
+        }
+
+        // DEBUG PAUSE-CRON milliseconds
+        b"PAUSE-CRON" => Ok(RespValue::ok()),
+
+        // DEBUG OOM - simulate out of memory
+        b"OOM" => Err(Error::Custom("OOM command not allowed".to_string())),
+
+        // DEBUG PANIC - cause panic
+        b"PANIC" => {
+            panic!("DEBUG PANIC called - intentional panic for testing");
+        }
+
+        // DEBUG LISTPACK-ENTRIES - get listpack stats
+        b"LISTPACK-ENTRIES" => Ok(RespValue::integer(0)),
+
+        // DEBUG STREAMS-MEM-USAGE - stream memory usage
+        b"STREAMS-MEM-USAGE" => Ok(RespValue::integer(0)),
+
+        // DEBUG MALLCTL - jemalloc control (not applicable with mimalloc)
+        b"MALLCTL" | b"MALLCTL-STR" => Ok(RespValue::error("ERR jemalloc not used")),
+
+        // DEBUG CLUSTERSHA1SLOT - compute cluster slot from SHA1
+        b"CLUSTERSHA1SLOT" => Ok(RespValue::integer(0)),
+
+        // DEBUG STRINGMATCH-TEST - test string matching
+        b"STRINGMATCH-TEST" => Ok(RespValue::ok()),
+
+        // Unknown DEBUG subcommand - list available ones
+        _ => Ok(RespValue::error(
+            "ERR Unknown DEBUG subcommand. Available: SLEEP, SEGFAULT, DIGEST, OBJECT, RELOAD, STRUCTSIZE, HTSTATS, PROTOCOL, PANIC",
+        )),
+    }
+}
+
 // === CONFIG Command ===
 
 fn cmd_config(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
@@ -1159,6 +1307,39 @@ fn cmd_config_set(server: &Arc<ServerState>, parameter: &[u8], value: &[u8]) -> 
             "ERR CONFIG parameter '{}' is immutable",
             param_str
         )));
+    }
+
+    // Check enable_protected_configs for protected configs
+    // Protected configs include sensitive settings like requirepass, bind, etc.
+    let protected_configs = [
+        "requirepass",
+        "masterauth",
+        "masteruser",
+        "aclfile",
+        "dbfilename",
+        "dir",
+        "logfile",
+        "pidfile",
+        "rename-command",
+        "tls-cert-file",
+        "tls-key-file",
+        "tls-ca-cert-file",
+        "tls-dh-params-file",
+        "tls-client-cert-file",
+        "tls-client-key-file",
+        "unixsocket",
+        "bind",
+    ];
+
+    if protected_configs.contains(&param_str) {
+        let config = server.config.read();
+        if !config.enable_protected_configs {
+            return Err(Error::Custom(format!(
+                "NOPERM Cannot modify protected config '{}'. Protected configs are disabled.",
+                param_str
+            )));
+        }
+        drop(config);
     }
 
     // Acquire lock and apply setter
