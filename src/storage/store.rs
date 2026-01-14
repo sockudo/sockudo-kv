@@ -5,6 +5,57 @@ use super::dashtable::{DashTable, calculate_hash};
 use super::ops::search_ops::SearchIndex;
 use super::types::Entry;
 
+/// Encoding configuration thresholds (mirrors Redis/Dragonfly config options)
+/// Controls when to use compact encodings vs full data structures
+#[derive(Debug, Clone)]
+pub struct EncodingConfig {
+    /// Max entries in hash before using full DashTable (hash-max-listpack-entries)
+    pub hash_max_listpack_entries: usize,
+    /// Max value size in hash for listpack (hash-max-listpack-value)
+    pub hash_max_listpack_value: usize,
+    /// Max list size for single listpack node (list-max-listpack-size)
+    /// Negative values = element count limit, positive = byte size limit
+    pub list_max_listpack_size: i32,
+    /// List compression depth - how many nodes at ends stay uncompressed (list-compress-depth)
+    pub list_compress_depth: u32,
+    /// Max entries in set for intset encoding (set-max-intset-entries)
+    pub set_max_intset_entries: usize,
+    /// Max entries in set for listpack (set-max-listpack-entries)
+    pub set_max_listpack_entries: usize,
+    /// Max value size for listpack in set (set-max-listpack-value)
+    pub set_max_listpack_value: usize,
+    /// Max entries in zset for listpack (zset-max-listpack-entries)
+    pub zset_max_listpack_entries: usize,
+    /// Max value size for listpack in zset (zset-max-listpack-value)
+    pub zset_max_listpack_value: usize,
+    /// Max bytes for HyperLogLog sparse encoding (hll-sparse-max-bytes)
+    pub hll_sparse_max_bytes: usize,
+    /// Max bytes per stream radix tree node (stream-node-max-bytes)
+    pub stream_node_max_bytes: usize,
+    /// Max entries per stream radix tree node (stream-node-max-entries)
+    pub stream_node_max_entries: usize,
+}
+
+impl Default for EncodingConfig {
+    fn default() -> Self {
+        // Redis defaults
+        Self {
+            hash_max_listpack_entries: 512,
+            hash_max_listpack_value: 64,
+            list_max_listpack_size: -2, // Special: -2 = 8KB per node
+            list_compress_depth: 0,     // No compression
+            set_max_intset_entries: 512,
+            set_max_listpack_entries: 128,
+            set_max_listpack_value: 64,
+            zset_max_listpack_entries: 128,
+            zset_max_listpack_value: 64,
+            hll_sparse_max_bytes: 3000,
+            stream_node_max_bytes: 4096,
+            stream_node_max_entries: 100,
+        }
+    }
+}
+
 /// Lock-free key-value store backed by DashTable.
 /// Provides O(1) concurrent access with minimal contention.
 ///
@@ -18,6 +69,8 @@ pub struct Store {
     pub(crate) search_indexes: DashTable<(Bytes, SearchIndex)>,
     /// Search aliases: alias -> index_name
     pub(crate) search_aliases: DashTable<(Bytes, Bytes)>,
+    /// Encoding thresholds for data structure optimization
+    pub encoding: EncodingConfig,
 }
 
 impl Store {
@@ -46,7 +99,15 @@ impl Store {
             // Metadata maps rarely used, minimal 2 shards
             search_indexes: DashTable::with_shard_amount(2),
             search_aliases: DashTable::with_shard_amount(2),
+            encoding: EncodingConfig::default(),
         }
+    }
+
+    /// Create a new store with specified encoding config
+    pub fn with_encoding(encoding: EncodingConfig) -> Self {
+        let mut store = Self::with_capacity(0);
+        store.encoding = encoding;
+        store
     }
 
     // ==================== Core Generic Operations ====================

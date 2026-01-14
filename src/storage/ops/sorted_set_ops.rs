@@ -2,16 +2,10 @@ use bytes::Bytes;
 
 use crate::error::{Error, Result};
 use crate::storage::Store;
-use crate::storage::listpack::{LISTPACK_MAX_ENTRY_SIZE, LISTPACK_ZSET_MAX_ENTRIES, Listpack};
+use crate::storage::listpack::Listpack;
 use crate::storage::types::{DataType, Entry, SortedSetData};
 
 use std::sync::atomic::Ordering;
-
-/// Check if a member should use packed encoding
-#[inline]
-fn should_use_packed(member: &[u8]) -> bool {
-    member.len() <= LISTPACK_MAX_ENTRY_SIZE
-}
 
 /// Upgrade a SortedSetPacked to a full SortedSet
 #[inline]
@@ -47,8 +41,10 @@ impl Store {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     // Expired entry: create new
-                    let should_pack = members.len() < LISTPACK_ZSET_MAX_ENTRIES
-                        && members.iter().all(|(_, m)| should_use_packed(m));
+                    let max_entries = self.encoding.zset_max_listpack_entries;
+                    let max_value = self.encoding.zset_max_listpack_value;
+                    let should_pack = members.len() < max_entries
+                        && members.iter().all(|(_, m)| m.len() <= max_value);
 
                     if should_pack {
                         let mut lp = Listpack::with_capacity(members.len());
@@ -76,8 +72,10 @@ impl Store {
                 match &mut entry.data {
                     DataType::SortedSetPacked(lp) => {
                         // Check if we need to upgrade
-                        let needs_upgrade = members.iter().any(|(_, m)| !should_use_packed(m))
-                            || lp.len() + members.len() > LISTPACK_ZSET_MAX_ENTRIES;
+                        let max_entries = self.encoding.zset_max_listpack_entries;
+                        let max_value = self.encoding.zset_max_listpack_value;
+                        let needs_upgrade = members.iter().any(|(_, m)| m.len() > max_value)
+                            || lp.len() + members.len() > max_entries;
 
                         if needs_upgrade {
                             // Upgrade to full SortedSet
@@ -118,8 +116,10 @@ impl Store {
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
                 // New key: use packed if small enough
-                let should_pack = members.len() < LISTPACK_ZSET_MAX_ENTRIES
-                    && members.iter().all(|(_, m)| should_use_packed(m));
+                let max_entries = self.encoding.zset_max_listpack_entries;
+                let max_value = self.encoding.zset_max_listpack_value;
+                let should_pack = members.len() < max_entries
+                    && members.iter().all(|(_, m)| m.len() <= max_value);
 
                 if should_pack {
                     let mut lp = Listpack::with_capacity(members.len());
@@ -323,7 +323,8 @@ impl Store {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     // Create new packed
-                    if should_use_packed(&member) {
+                    let max_value = self.encoding.zset_max_listpack_value;
+                    if member.len() <= max_value {
                         let mut lp = Listpack::new();
                         lp.zinsert(&member, delta);
                         entry.data = DataType::SortedSetPacked(lp);
@@ -346,8 +347,10 @@ impl Store {
                         }
 
                         // Check if we need to upgrade
-                        if !should_use_packed(&member)
-                            || (!lp.contains_key(&member) && lp.zset_at_capacity())
+                        let max_value = self.encoding.zset_max_listpack_value;
+                        let max_entries = self.encoding.zset_max_listpack_entries;
+                        if member.len() > max_value
+                            || (!lp.contains_key(&member) && lp.len() >= max_entries)
                         {
                             let mut zset = upgrade_zset_packed_to_full(lp);
                             zset.insert(member, new_score);
@@ -373,7 +376,8 @@ impl Store {
                 result
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
-                if should_use_packed(&member) {
+                let max_value = self.encoding.zset_max_listpack_value;
+                if member.len() <= max_value {
                     let mut lp = Listpack::new();
                     lp.zinsert(&member, delta);
                     e.insert((key, Entry::new(DataType::SortedSetPacked(lp))));

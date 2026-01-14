@@ -1641,9 +1641,23 @@ fn parse_config_file(path: &Path, config: &mut ServerConfig) -> Result<(), Strin
             }
 
             "include" if !args.is_empty() => {
-                let include_path = PathBuf::from(&args[0]);
-                if include_path.exists() {
-                    parse_config_file(&include_path, config)?;
+                let pattern = &args[0];
+                // Check if pattern contains wildcards
+                if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+                    // Glob pattern - expand and include all matching files
+                    let mut matches = expand_glob_pattern(pattern);
+                    // Redis/Dragonfly: sort alphabetically
+                    matches.sort();
+                    for path in matches {
+                        parse_config_file(&path, config)?;
+                    }
+                    // Silently ignore if no matches (Redis behavior)
+                } else {
+                    // Plain path - include if exists
+                    let include_path = PathBuf::from(pattern);
+                    if include_path.exists() {
+                        parse_config_file(&include_path, config)?;
+                    }
                 }
             }
             _ => {
@@ -1808,6 +1822,177 @@ fn parse_triple_i32(args: &[String], field: &str) -> Result<(i32, i32, i32), Str
     let b = parse_i32(&args[1], field)?;
     let c = parse_i32(&args[2], field)?;
     Ok((a, b, c))
+}
+
+/// Expand a glob pattern to matching file paths (Redis/Dragonfly compatible)
+/// Supports: * (any chars), ? (single char), [abc] (char class)
+/// Returns empty Vec if pattern doesn't match any files (silent ignore behavior)
+fn expand_glob_pattern(pattern: &str) -> Vec<PathBuf> {
+    let path = Path::new(pattern);
+    let mut results = Vec::new();
+
+    // Split into directory and filename pattern
+    let (dir, file_pattern) = match (path.parent(), path.file_name()) {
+        (Some(d), Some(f)) => (d.to_path_buf(), f.to_string_lossy().to_string()),
+        (None, Some(f)) => (PathBuf::from("."), f.to_string_lossy().to_string()),
+        _ => return results,
+    };
+
+    // If directory itself contains wildcards, we need recursive expansion
+    let dir_str = dir.to_string_lossy();
+    if dir_str.contains('*') || dir_str.contains('?') || dir_str.contains('[') {
+        // Recursive case: expand directory pattern first
+        let expanded_dirs = expand_glob_pattern(&dir_str);
+        for expanded_dir in expanded_dirs {
+            if expanded_dir.is_dir() {
+                // Now expand file pattern in this directory
+                let sub_pattern = expanded_dir.join(&file_pattern);
+                results.extend(expand_glob_pattern(&sub_pattern.to_string_lossy()));
+            }
+        }
+        return results;
+    }
+
+    // Base case: directory is concrete, only filename has wildcards
+    if !dir.exists() || !dir.is_dir() {
+        return results;
+    }
+
+    // Read directory and match against pattern
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if glob_match(&file_pattern, &name) {
+                let path = entry.path();
+                if path.is_file() {
+                    results.push(path);
+                } else if path.is_dir() && file_pattern.contains('*') {
+                    // If pattern ends with *, also include directories for recursive patterns
+                    results.push(path);
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Simple glob pattern matching (Redis-compatible)
+/// Supports: * (any sequence), ? (single char), [abc] (char class), [!abc] (negated)
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    glob_match_impl(&pattern, &text)
+}
+
+fn glob_match_impl(pattern: &[char], text: &[char]) -> bool {
+    let mut p = 0;
+    let mut t = 0;
+    let mut star_p = None;
+    let mut star_t = 0;
+
+    while t < text.len() {
+        if p < pattern.len() {
+            match pattern[p] {
+                '?' => {
+                    // Match any single character
+                    p += 1;
+                    t += 1;
+                    continue;
+                }
+                '*' => {
+                    // Star: remember position for backtracking
+                    star_p = Some(p);
+                    star_t = t;
+                    p += 1;
+                    continue;
+                }
+                '[' => {
+                    // Character class
+                    if let Some((matched, end_p)) = match_char_class(&pattern[p..], text[t]) {
+                        if matched {
+                            p += end_p;
+                            t += 1;
+                            continue;
+                        }
+                    }
+                    // No match, try backtracking
+                }
+                c if c == text[t] => {
+                    p += 1;
+                    t += 1;
+                    continue;
+                }
+                _ => {
+                    // No match
+                }
+            }
+        }
+
+        // Try backtracking to last star
+        if let Some(sp) = star_p {
+            p = sp + 1;
+            star_t += 1;
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+
+    // Check remaining pattern is all stars
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+
+    p == pattern.len()
+}
+
+/// Match a character class [abc] or [!abc] or [a-z]
+/// Returns (matched, chars_consumed) or None if invalid
+fn match_char_class(pattern: &[char], c: char) -> Option<(bool, usize)> {
+    if pattern.is_empty() || pattern[0] != '[' {
+        return None;
+    }
+
+    let mut i = 1;
+    let negated = if i < pattern.len() && pattern[i] == '!' {
+        i += 1;
+        true
+    } else {
+        false
+    };
+
+    let mut matched = false;
+    let mut prev_char = None;
+
+    while i < pattern.len() && pattern[i] != ']' {
+        if pattern[i] == '-'
+            && prev_char.is_some()
+            && i + 1 < pattern.len()
+            && pattern[i + 1] != ']'
+        {
+            // Range: a-z
+            let start = prev_char.unwrap();
+            let end = pattern[i + 1];
+            if c >= start && c <= end {
+                matched = true;
+            }
+            i += 2;
+            prev_char = None;
+        } else {
+            if pattern[i] == c {
+                matched = true;
+            }
+            prev_char = Some(pattern[i]);
+            i += 1;
+        }
+    }
+
+    if i < pattern.len() && pattern[i] == ']' {
+        Some((if negated { !matched } else { matched }, i + 1))
+    } else {
+        None // Unclosed bracket
+    }
 }
 
 #[cfg(test)]

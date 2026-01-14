@@ -1,5 +1,5 @@
 use crate::storage::dashtable::{DashTable, calculate_hash};
-use crate::storage::listpack::{LISTPACK_HASH_MAX_ENTRIES, LISTPACK_MAX_ENTRY_SIZE, Listpack};
+use crate::storage::listpack::Listpack;
 use bytes::Bytes;
 
 use crate::error::{Error, Result};
@@ -7,12 +7,6 @@ use crate::storage::Store;
 use crate::storage::types::{DataType, Entry};
 
 use std::sync::atomic::Ordering;
-
-/// Check if a field-value pair should use packed encoding
-#[inline]
-fn should_use_packed(field: &[u8], value: &[u8]) -> bool {
-    field.len() <= LISTPACK_MAX_ENTRY_SIZE && value.len() <= LISTPACK_MAX_ENTRY_SIZE
-}
 
 /// Upgrade a HashPacked to a full Hash (DashTable)
 #[inline]
@@ -37,8 +31,12 @@ impl Store {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     // Expired entry: create new
-                    let should_pack = fields.len() < LISTPACK_HASH_MAX_ENTRIES
-                        && fields.iter().all(|(f, v)| should_use_packed(f, v));
+                    let max_entries = self.encoding.hash_max_listpack_entries;
+                    let max_value = self.encoding.hash_max_listpack_value;
+                    let should_pack = fields.len() < max_entries
+                        && fields
+                            .iter()
+                            .all(|(f, v)| f.len() <= max_value && v.len() <= max_value);
 
                     if should_pack {
                         let mut lp = Listpack::with_capacity(fields.len());
@@ -67,8 +65,12 @@ impl Store {
                         let mut new_fields = 0;
 
                         // Check if any field is too large or if we'll exceed capacity
-                        let needs_upgrade = fields.iter().any(|(f, v)| !should_use_packed(f, v))
-                            || lp.len() + fields.len() > LISTPACK_HASH_MAX_ENTRIES;
+                        let max_entries = self.encoding.hash_max_listpack_entries;
+                        let max_value = self.encoding.hash_max_listpack_value;
+                        let needs_upgrade = fields
+                            .iter()
+                            .any(|(f, v)| f.len() > max_value || v.len() > max_value)
+                            || lp.len() + fields.len() > max_entries;
 
                         if needs_upgrade {
                             // Upgrade to DashTable
@@ -120,8 +122,12 @@ impl Store {
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
                 // New key: use packed if small enough
-                let should_pack = fields.len() < LISTPACK_HASH_MAX_ENTRIES
-                    && fields.iter().all(|(f, v)| should_use_packed(f, v));
+                let max_entries = self.encoding.hash_max_listpack_entries;
+                let max_value = self.encoding.hash_max_listpack_value;
+                let should_pack = fields.len() < max_entries
+                    && fields
+                        .iter()
+                        .all(|(f, v)| f.len() <= max_value && v.len() <= max_value);
 
                 let count = fields.len();
                 if should_pack {
@@ -281,7 +287,8 @@ impl Store {
                 if entry.is_expired() {
                     // Create new packed hash with single field
                     let value_str = delta.to_string();
-                    if should_use_packed(&field, value_str.as_bytes()) {
+                    let max_value = self.encoding.hash_max_listpack_value;
+                    if field.len() <= max_value && value_str.len() <= max_value {
                         let mut lp = Listpack::new();
                         lp.insert(&field, value_str.as_bytes());
                         entry.data = DataType::HashPacked(lp);
@@ -311,8 +318,10 @@ impl Store {
                         let value_str = new_val.to_string();
 
                         // Check if we need to upgrade
-                        if !should_use_packed(&field, value_str.as_bytes())
-                            || (!lp.contains_key(&field) && lp.hash_at_capacity())
+                        let max_value = self.encoding.hash_max_listpack_value;
+                        let max_entries = self.encoding.hash_max_listpack_entries;
+                        if !(field.len() <= max_value && value_str.len() <= max_value)
+                            || (!lp.contains_key(&field) && lp.len() >= max_entries)
                         {
                             // Upgrade to DashTable
                             let hash = upgrade_hash_packed_to_dashtable(lp);
@@ -360,7 +369,8 @@ impl Store {
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
                 let value_str = delta.to_string();
-                if should_use_packed(&field, value_str.as_bytes()) {
+                let max_value = self.encoding.hash_max_listpack_value;
+                if field.len() <= max_value && value_str.len() <= max_value {
                     let mut lp = Listpack::new();
                     lp.insert(&field, value_str.as_bytes());
                     e.insert((key, Entry::new(DataType::HashPacked(lp))));
@@ -385,7 +395,8 @@ impl Store {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     let value_str = delta.to_string();
-                    if should_use_packed(&field, value_str.as_bytes()) {
+                    let max_value = self.encoding.hash_max_listpack_value;
+                    if field.len() <= max_value && value_str.len() <= max_value {
                         let mut lp = Listpack::new();
                         lp.insert(&field, value_str.as_bytes());
                         entry.data = DataType::HashPacked(lp);
@@ -418,8 +429,10 @@ impl Store {
                         let value_str = new_val.to_string();
 
                         // Check if we need to upgrade
-                        if !should_use_packed(&field, value_str.as_bytes())
-                            || (!lp.contains_key(&field) && lp.hash_at_capacity())
+                        let max_value = self.encoding.hash_max_listpack_value;
+                        let max_entries = self.encoding.hash_max_listpack_entries;
+                        if !(field.len() <= max_value && value_str.len() <= max_value)
+                            || (!lp.contains_key(&field) && lp.len() >= max_entries)
                         {
                             let hash = upgrade_hash_packed_to_dashtable(lp);
                             let h = calculate_hash(&field);
@@ -469,7 +482,8 @@ impl Store {
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
                 let value_str = delta.to_string();
-                if should_use_packed(&field, value_str.as_bytes()) {
+                let max_value = self.encoding.hash_max_listpack_value;
+                if field.len() <= max_value && value_str.len() <= max_value {
                     let mut lp = Listpack::new();
                     lp.insert(&field, value_str.as_bytes());
                     e.insert((key, Entry::new(DataType::HashPacked(lp))));
