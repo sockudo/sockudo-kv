@@ -32,9 +32,15 @@ pub struct ConnectedReplica {
     pub addr: SocketAddr,
     pub offset: AtomicI64,
     pub ack_offset: AtomicI64,
+    /// Last time we received an ACK from this replica (unix timestamp)
+    pub last_ack_time: AtomicU64,
     pub state: RwLock<ReplicaState>,
     pub capabilities: RwLock<Vec<String>>,
     pub tx: broadcast::Sender<Bytes>,
+    /// Announced IP (from REPLCONF ip-address)
+    pub announced_ip: RwLock<Option<String>>,
+    /// Announced port (from REPLCONF listening-port)
+    pub announced_port: RwLock<Option<u16>>,
 }
 
 /// Replica connection state
@@ -54,8 +60,8 @@ pub enum ReplicaState {
 pub struct ReplicationBacklog {
     /// Circular buffer of commands
     buffer: RwLock<VecDeque<Bytes>>,
-    /// Maximum size in bytes
-    max_size: usize,
+    /// Maximum size in bytes (atomic for runtime changes)
+    max_size: AtomicU64,
     /// Current size in bytes
     current_size: AtomicU64,
     /// Start offset in backlog
@@ -63,25 +69,35 @@ pub struct ReplicationBacklog {
 }
 
 impl ReplicationBacklog {
-    pub fn new(max_size: usize) -> Self {
+    pub fn new(max_size: u64) -> Self {
         Self {
             // Dragonfly-style: minimal initial allocation, grows on demand
             buffer: RwLock::new(VecDeque::with_capacity(64)),
-            max_size,
+            max_size: AtomicU64::new(max_size),
             current_size: AtomicU64::new(0),
             start_offset: AtomicI64::new(0),
         }
+    }
+
+    /// Get current max size
+    pub fn max_size(&self) -> u64 {
+        self.max_size.load(Ordering::Relaxed)
+    }
+
+    /// Resize the backlog (for runtime repl_backlog_size changes)
+    pub fn resize(&self, new_size: u64) {
+        self.max_size.store(new_size, Ordering::Relaxed);
+        // Trim if needed on next push
     }
 
     /// Add command to backlog
     pub fn push(&self, cmd: Bytes) {
         let cmd_len = cmd.len() as u64;
         let mut buffer = self.buffer.write();
+        let max = self.max_size.load(Ordering::Relaxed);
 
         // Trim old entries if exceeding max size
-        while self.current_size.load(Ordering::Relaxed) + cmd_len > self.max_size as u64
-            && !buffer.is_empty()
-        {
+        while self.current_size.load(Ordering::Relaxed) + cmd_len > max && !buffer.is_empty() {
             if let Some(old) = buffer.pop_front() {
                 self.current_size
                     .fetch_sub(old.len() as u64, Ordering::Relaxed);
@@ -149,6 +165,11 @@ pub struct ReplicationManager {
 
 impl ReplicationManager {
     pub fn new() -> Self {
+        Self::with_backlog_size(1024 * 1024) // 1MB default
+    }
+
+    /// Create with custom backlog size (for repl_backlog_size config)
+    pub fn with_backlog_size(backlog_size: u64) -> Self {
         // Dragonfly-style: smaller buffer, memory efficient
         let (cmd_tx, _) = broadcast::channel(1024);
 
@@ -160,7 +181,7 @@ impl ReplicationManager {
             second_repl_offset: AtomicI64::new(-1),
             replicas: DashMap::new(),
             next_replica_id: AtomicU64::new(1),
-            backlog: ReplicationBacklog::new(1024 * 1024), // 1MB default
+            backlog: ReplicationBacklog::new(backlog_size),
             master_host: RwLock::new(None),
             master_port: RwLock::new(None),
             master_link_status: AtomicBool::new(false),
@@ -204,9 +225,12 @@ impl ReplicationManager {
             addr,
             offset: AtomicI64::new(0),
             ack_offset: AtomicI64::new(0),
+            last_ack_time: AtomicU64::new(0),
             state: RwLock::new(ReplicaState::Handshake),
             capabilities: RwLock::new(Vec::new()),
             tx,
+            announced_ip: RwLock::new(None),
+            announced_port: RwLock::new(None),
         });
 
         self.replicas.insert(id, replica.clone());
@@ -216,6 +240,40 @@ impl ReplicationManager {
     /// Unregister a replica
     pub fn unregister_replica(&self, id: u64) {
         self.replicas.remove(&id);
+    }
+
+    /// Count replicas that have ACKed within max_lag_secs
+    /// Used for min_replicas_to_write quorum check
+    pub fn count_good_replicas(&self, max_lag_secs: u64) -> usize {
+        if max_lag_secs == 0 {
+            // No lag check, just count online replicas
+            return self
+                .replicas
+                .iter()
+                .filter(|r| *r.state.read() == ReplicaState::Online)
+                .count();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.replicas
+            .iter()
+            .filter(|r| {
+                // Must be online
+                if *r.state.read() != ReplicaState::Online {
+                    return false;
+                }
+                // Check lag time
+                let last_ack = r.last_ack_time.load(Ordering::Relaxed);
+                if last_ack == 0 {
+                    return false; // Never ACKed
+                }
+                now.saturating_sub(last_ack) <= max_lag_secs
+            })
+            .count()
     }
 
     /// Propagate command to all replicas
@@ -314,13 +372,38 @@ impl ReplicationManager {
                         ReplicaState::SendingRdb => "send_bulk",
                         _ => "wait_bgsave",
                     };
+
+                    // Use announced IP/port if available, else fall back to socket address
+                    let ip = replica
+                        .announced_ip
+                        .read()
+                        .clone()
+                        .unwrap_or_else(|| replica.addr.ip().to_string());
+                    let port = replica
+                        .announced_port
+                        .read()
+                        .unwrap_or_else(|| replica.addr.port());
+
+                    // Calculate lag in seconds
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let last_ack = replica.last_ack_time.load(Ordering::Relaxed);
+                    let lag = if last_ack > 0 {
+                        now.saturating_sub(last_ack)
+                    } else {
+                        0
+                    };
+
                     info.push_str(&format!(
-                        "slave{}:ip={},port={},state={},offset={},lag=0\r\n",
+                        "slave{}:ip={},port={},state={},offset={},lag={}\r\n",
                         i,
-                        replica.addr.ip(),
-                        replica.addr.port(),
+                        ip,
+                        port,
                         state,
-                        replica.ack_offset.load(Ordering::Relaxed)
+                        replica.ack_offset.load(Ordering::Relaxed),
+                        lag
                     ));
                 }
             }
@@ -350,7 +433,10 @@ impl ReplicationManager {
             self.second_repl_offset.load(Ordering::Relaxed)
         ));
         info.push_str("repl_backlog_active:1\r\n");
-        info.push_str(&format!("repl_backlog_size:{}\r\n", self.backlog.max_size));
+        info.push_str(&format!(
+            "repl_backlog_size:{}\r\n",
+            self.backlog.max_size()
+        ));
 
         info
     }

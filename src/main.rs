@@ -306,7 +306,9 @@ sockudo-kv version 7.0.0 - Ready to accept connections
         Arc::new(ClientManager::new())
     };
     let server_state = Arc::new(ServerState::new());
-    let replication = Arc::new(sockudo_kv::ReplicationManager::new());
+    let replication = Arc::new(sockudo_kv::ReplicationManager::with_backlog_size(
+        config.repl_backlog_size,
+    ));
 
     // Set cluster port from config
     server_state
@@ -487,6 +489,8 @@ sockudo-kv version 7.0.0 - Ready to accept connections
         }
     }
 
+    let config = Arc::new(config);
+
     // Handle replicaof
     if let Some((master_host, master_port)) = &config.replicaof {
         println!("Replicating from {}:{}", master_host, master_port);
@@ -496,6 +500,7 @@ sockudo-kv version 7.0.0 - Ready to accept connections
         let store_clone = multi_store.clone();
         let host = master_host.clone();
         let port = *master_port;
+        let config_clone = config.clone();
 
         let tls_config = if config.tls_replication {
             match sockudo_kv::tls::load_client_tls_config(
@@ -522,6 +527,7 @@ sockudo-kv version 7.0.0 - Ready to accept connections
                     &host,
                     port,
                     tls_config.clone(),
+                    config_clone.clone(),
                 )
                 .await
                 {
@@ -531,8 +537,6 @@ sockudo-kv version 7.0.0 - Ready to accept connections
             }
         });
     }
-
-    let config = Arc::new(config);
 
     // Spawn listener tasks
     let mut tasks = JoinSet::new();
@@ -711,7 +715,7 @@ async fn handle_client_inner<S>(
     client: &Arc<ClientState>,
     server_state: &Arc<ServerState>,
     cluster_state: &Arc<ClusterState>,
-    _replication: &Arc<sockudo_kv::ReplicationManager>,
+    replication: &Arc<sockudo_kv::ReplicationManager>,
     config: &Arc<ServerConfig>,
     sub_id: u64,
     mut rx: broadcast::Receiver<PubSubMessage>,
@@ -807,6 +811,50 @@ where
 
                                     if !is_allowed {
                                         write_buf.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
+                                        continue;
+                                    }
+                                }
+
+                                // Check replica_serve_stale_data - if we're a replica disconnected from master
+                                if !config.replica_serve_stale_data
+                                    && replication.role() == sockudo_kv::replication::ReplicationRole::Replica
+                                    && !replication.master_link_status.load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    // Only allow certain commands when disconnected from master
+                                    let is_allowed = cmd.is_command(b"INFO")
+                                        || cmd.is_command(b"REPLICAOF")
+                                        || cmd.is_command(b"SLAVEOF")
+                                        || cmd.is_command(b"AUTH")
+                                        || cmd.is_command(b"HELLO")
+                                        || cmd.is_command(b"PING")
+                                        || cmd.is_command(b"SHUTDOWN")
+                                        || cmd.is_command(b"DEBUG")
+                                        || cmd.is_command(b"COMMAND")
+                                        || cmd.is_command(b"CONFIG");
+
+                                    if !is_allowed {
+                                        write_buf.extend_from_slice(b"-MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n");
+                                        continue;
+                                    }
+                                }
+
+                                // Check replica_read_only - reject writes on replicas
+                                if config.replica_read_only
+                                    && replication.role() == sockudo_kv::replication::ReplicationRole::Replica
+                                    && is_write_command(cmd_name)
+                                {
+                                    write_buf.extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");
+                                    continue;
+                                }
+
+                                // Check min_replicas_to_write - quorum for writes
+                                if config.min_replicas_to_write > 0
+                                    && replication.is_master()
+                                    && is_write_command(cmd_name)
+                                {
+                                    let good_replicas = replication.count_good_replicas(config.min_replicas_max_lag);
+                                    if good_replicas < config.min_replicas_to_write as usize {
+                                        write_buf.extend_from_slice(b"-NOREPLICAS Not enough good replicas to write.\r\n");
                                         continue;
                                     }
                                 }

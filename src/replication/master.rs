@@ -92,7 +92,24 @@ pub fn handle_replconf(
         let opt = args[i].to_ascii_uppercase();
         match opt.as_slice() {
             b"LISTENING-PORT" => {
-                // Replica's listening port - we don't need to track this
+                // Replica's listening port - store for replica_announce_port
+                if i + 1 < args.len() {
+                    if let Ok(port) = std::str::from_utf8(&args[i + 1])
+                        .ok()
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .ok_or("invalid port")
+                    {
+                        *replica.announced_port.write() = Some(port);
+                    }
+                }
+                i += 2;
+            }
+            b"IP-ADDRESS" => {
+                // Replica's announced IP address
+                if i + 1 < args.len() {
+                    let ip = String::from_utf8_lossy(&args[i + 1]).to_string();
+                    *replica.announced_ip.write() = Some(ip);
+                }
                 i += 2;
             }
             b"CAPA" => {
@@ -114,6 +131,14 @@ pub fn handle_replconf(
                     replica
                         .ack_offset
                         .store(offset, std::sync::atomic::Ordering::Relaxed);
+                    // Update last ACK time for lag tracking
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    replica
+                        .last_ack_time
+                        .store(now, std::sync::atomic::Ordering::Relaxed);
                 }
                 i += 2;
             }
