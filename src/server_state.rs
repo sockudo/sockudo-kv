@@ -7,7 +7,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cluster_state::ClusterState;
@@ -256,6 +256,27 @@ pub struct ServerState {
     pub databases: AtomicUsize,
     pub maxmemory: AtomicU64,
     pub maxmemory_policy: RwLock<String>,
+    /// Number of keys to sample for eviction (default 5)
+    pub maxmemory_samples: AtomicUsize,
+    /// Eviction aggressiveness 0-100 (default 10)
+    pub maxmemory_eviction_tenacity: AtomicU32,
+    /// Active expiration scan intensity 1-10 (default 1)
+    pub active_expire_effort: AtomicU32,
+
+    // === Lazy Free Config ===
+    /// Use async delete during eviction
+    pub lazyfree_lazy_eviction: AtomicBool,
+    /// Use async delete on key expiration
+    pub lazyfree_lazy_expire: AtomicBool,
+    /// Use async delete for RENAME/MOVE overwrites
+    pub lazyfree_lazy_server_del: AtomicBool,
+    /// Use async FLUSHDB/FLUSHALL on replicas
+    pub replica_lazy_flush: AtomicBool,
+    /// Make DEL behave like UNLINK (async)
+    pub lazyfree_lazy_user_del: AtomicBool,
+    /// Use async FLUSHDB/FLUSHALL by default
+    pub lazyfree_lazy_user_flush: AtomicBool,
+
     pub config: RwLock<ServerConfig>,
 
     // === Cluster ===
@@ -308,6 +329,17 @@ impl ServerState {
             databases: AtomicUsize::new(16),
             maxmemory: AtomicU64::new(0),
             maxmemory_policy: RwLock::new("noeviction".to_string()),
+            maxmemory_samples: AtomicUsize::new(5),
+            maxmemory_eviction_tenacity: AtomicU32::new(10),
+            active_expire_effort: AtomicU32::new(1),
+
+            lazyfree_lazy_eviction: AtomicBool::new(false),
+            lazyfree_lazy_expire: AtomicBool::new(false),
+            lazyfree_lazy_server_del: AtomicBool::new(false),
+            replica_lazy_flush: AtomicBool::new(false),
+            lazyfree_lazy_user_del: AtomicBool::new(false),
+            lazyfree_lazy_user_flush: AtomicBool::new(false),
+
             config: RwLock::new(ServerConfig::default()),
             cluster: Arc::new(ClusterState::new()),
 

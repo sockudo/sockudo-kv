@@ -339,6 +339,46 @@ sockudo-kv version 7.0.0 - Ready to accept connections
         std::sync::atomic::Ordering::Relaxed,
     );
 
+    // Apply memory eviction configuration
+    server_state.maxmemory_samples.store(
+        config.maxmemory_samples,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.maxmemory_eviction_tenacity.store(
+        config.maxmemory_eviction_tenacity,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.active_expire_effort.store(
+        config.active_expire_effort,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // Apply lazy free configuration
+    server_state.lazyfree_lazy_eviction.store(
+        config.lazyfree_lazy_eviction,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.lazyfree_lazy_expire.store(
+        config.lazyfree_lazy_expire,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.lazyfree_lazy_server_del.store(
+        config.lazyfree_lazy_server_del,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.replica_lazy_flush.store(
+        config.replica_lazy_flush,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.lazyfree_lazy_user_del.store(
+        config.lazyfree_lazy_user_del,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.lazyfree_lazy_user_flush.store(
+        config.lazyfree_lazy_user_flush,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     // Apply ACL log configuration
     server_state
         .acl_log_max_len

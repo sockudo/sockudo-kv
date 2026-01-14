@@ -648,6 +648,35 @@ impl Store {
         self.search_aliases.clear();
         self.key_count.store(0, Ordering::Relaxed);
     }
+
+    /// Lazy (async) delete - moves the value to a background task for deallocation
+    /// Returns true if key was deleted, false if it didn't exist
+    /// The actual memory deallocation happens in the background
+    #[inline]
+    pub fn lazy_del(&self, key: &[u8]) -> bool {
+        if let Some(removed) = self.data_remove(key) {
+            self.key_count.fetch_sub(1, Ordering::Relaxed);
+            // Spawn background task to drop the value
+            // This moves the owned value to a task that will deallocate it
+            std::thread::spawn(move || {
+                drop(removed);
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Lazy (async) flush - clears data structures
+    /// Note: For true async deallocation, Entry would need to implement Clone.
+    /// Currently this behaves the same as flush() but is provided for API consistency.
+    /// The actual memory freeing happens via Drop when entries are removed.
+    pub fn lazy_flush(&self) {
+        self.data.clear();
+        self.search_indexes.clear();
+        self.search_aliases.clear();
+        self.key_count.store(0, Ordering::Relaxed);
+    }
 }
 
 // ==================== Helper Functions ====================

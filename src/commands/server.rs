@@ -3,6 +3,8 @@
 //! Implements ACL, COMMAND, CONFIG, MEMORY, LATENCY, SLOWLOG, and server management commands.
 
 use bytes::Bytes;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
 use crate::config_table::{CONFIG_TABLE, ConfigFlags, find_config, matches_pattern};
@@ -185,7 +187,7 @@ fn cmd_acl(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
                 .collect();
             Ok(RespValue::array(users))
         }
-        b"LOAD" => Ok(RespValue::ok()),
+        b"LOAD" => cmd_acl_load(server),
         b"LOG" => {
             if args.len() > 1 && args[1].eq_ignore_ascii_case(b"RESET") {
                 server.reset_acl_log();
@@ -205,27 +207,36 @@ fn cmd_acl(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
             let resp: Vec<RespValue> = entries.iter().map(format_acl_log_entry).collect();
             Ok(RespValue::array(resp))
         }
-        b"SAVE" => Ok(RespValue::ok()),
+        b"SAVE" => cmd_acl_save(server),
         b"SETUSER" => {
             if args.len() < 2 {
                 return Err(Error::WrongArity("ACL SETUSER"));
             }
             let name = args[1].clone();
 
-            // Insert default if not exists
-            server
-                .acl_users
-                .entry(name.clone())
-                .or_insert_with(|| AclUser {
-                    name: name.clone(),
-                    enabled: false,
-                    passwords: Vec::new(),
-                    nopass: false,
-                    commands: AclCommandRules::default(),
-                    keys: Vec::new(),
-                    channels: Vec::new(),
-                    selectors: Vec::new(),
-                });
+            // Insert default if not exists, respecting acl_pubsub_default config
+            let is_new_user = !server.acl_users.contains_key(&name);
+            if is_new_user {
+                let acl_pubsub_default = server.config.read().acl_pubsub_default.clone();
+                let default_channels = if acl_pubsub_default.eq_ignore_ascii_case("allchannels") {
+                    vec![Bytes::from_static(b"*")]
+                } else {
+                    Vec::new() // resetchannels - no channels by default
+                };
+                server.acl_users.insert(
+                    name.clone(),
+                    AclUser {
+                        name: name.clone(),
+                        enabled: false,
+                        passwords: Vec::new(),
+                        nopass: false,
+                        commands: AclCommandRules::default(),
+                        keys: Vec::new(),
+                        channels: default_channels,
+                        selectors: Vec::new(),
+                    },
+                );
+            }
 
             // Now get mutable reference and apply rules
             if let Some(mut user) = server.acl_users.get_mut(&name) {
@@ -372,6 +383,214 @@ fn apply_acl_rule(user: &mut AclUser, rule: &str) -> Result<()> {
             .denied
             .push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
         _ => {}
+    }
+    Ok(())
+}
+
+/// ACL LOAD - Reload ACL rules from the configured aclfile
+/// Follows all-or-nothing semantics: if any line is invalid, the entire load fails
+fn cmd_acl_load(server: &Arc<ServerState>) -> Result<RespValue> {
+    let aclfile = {
+        let config = server.config.read();
+        config.aclfile.clone()
+    };
+
+    let aclfile = match aclfile {
+        Some(path) if !path.is_empty() => path,
+        _ => {
+            return Err(Error::Custom(
+                "ERR This Redis instance is not configured to use an ACL file. You may want to specify users via the ACL SETUSER command and then issue a CONFIG REWRITE (if you are using a Redis configuration file) in order to store users in the config file.".to_string()
+            ));
+        }
+    };
+
+    // Read and parse the file
+    let file = fs::File::open(&aclfile)
+        .map_err(|e| Error::Custom(format!("ERR Error loading ACL from file: {}", e)))?;
+
+    let reader = BufReader::new(file);
+    let mut parsed_users: Vec<AclUser> = Vec::new();
+    let acl_pubsub_default = server.config.read().acl_pubsub_default.clone();
+
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let line = line_result.map_err(|e| {
+            Error::Custom(format!(
+                "ERR Error reading ACL file line {}: {}",
+                line_num + 1,
+                e
+            ))
+        })?;
+
+        let trimmed = line.trim();
+
+        // Skip empty lines and comments
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Parse the ACL line
+        let user = parse_acl_line(trimmed, &acl_pubsub_default).map_err(|e| {
+            Error::Custom(format!(
+                "ERR Error parsing ACL file line {}: {}",
+                line_num + 1,
+                e
+            ))
+        })?;
+
+        parsed_users.push(user);
+    }
+
+    // All-or-nothing: only apply if all lines parsed successfully
+    // Clear existing users (except we need to keep default if not in file)
+    server.acl_users.clear();
+
+    // Add parsed users
+    for user in parsed_users {
+        server.acl_users.insert(user.name.clone(), user);
+    }
+
+    // Ensure default user exists
+    if !server.acl_users.contains_key(b"default".as_slice()) {
+        server
+            .acl_users
+            .insert(Bytes::from_static(b"default"), AclUser::default_user());
+    }
+
+    Ok(RespValue::ok())
+}
+
+/// ACL SAVE - Save current ACL rules to the configured aclfile
+fn cmd_acl_save(server: &Arc<ServerState>) -> Result<RespValue> {
+    let aclfile = {
+        let config = server.config.read();
+        config.aclfile.clone()
+    };
+
+    let aclfile = match aclfile {
+        Some(path) if !path.is_empty() => path,
+        _ => {
+            return Err(Error::Custom(
+                "ERR This Redis instance is not configured to use an ACL file. You may want to specify users via the ACL SETUSER command and then issue a CONFIG REWRITE.".to_string()
+            ));
+        }
+    };
+
+    // Collect all user rules
+    let mut lines: Vec<String> = Vec::new();
+    for entry in server.acl_users.iter() {
+        lines.push(entry.value().format_rules());
+    }
+
+    // Write to file
+    let mut file = fs::File::create(&aclfile)
+        .map_err(|e| Error::Custom(format!("ERR Error saving ACL to file: {}", e)))?;
+
+    for line in lines {
+        writeln!(file, "{}", line)
+            .map_err(|e| Error::Custom(format!("ERR Error writing to ACL file: {}", e)))?;
+    }
+
+    Ok(RespValue::ok())
+}
+
+/// Parse a single ACL line in the format: user <username> <rule1> <rule2> ...
+fn parse_acl_line(line: &str, acl_pubsub_default: &str) -> std::result::Result<AclUser, String> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+
+    if parts.len() < 2 {
+        return Err("Invalid ACL line format".to_string());
+    }
+
+    if !parts[0].eq_ignore_ascii_case("user") {
+        return Err(format!("Expected 'user' keyword, got '{}'", parts[0]));
+    }
+
+    let username = parts[1];
+
+    // Create user with default channels based on acl_pubsub_default
+    let default_channels = if acl_pubsub_default.eq_ignore_ascii_case("allchannels") {
+        vec![Bytes::from_static(b"*")]
+    } else {
+        Vec::new()
+    };
+
+    let mut user = AclUser {
+        name: Bytes::copy_from_slice(username.as_bytes()),
+        enabled: false,
+        passwords: Vec::new(),
+        nopass: false,
+        commands: AclCommandRules::default(),
+        keys: Vec::new(),
+        channels: default_channels,
+        selectors: Vec::new(),
+    };
+
+    // Apply each rule
+    for rule in &parts[2..] {
+        apply_acl_rule_internal(&mut user, rule)?;
+    }
+
+    Ok(user)
+}
+
+/// Internal ACL rule application (returns Result<(), String> for parsing)
+fn apply_acl_rule_internal(user: &mut AclUser, rule: &str) -> std::result::Result<(), String> {
+    match rule.to_lowercase().as_str() {
+        "on" => user.enabled = true,
+        "off" => user.enabled = false,
+        "nopass" => user.nopass = true,
+        "resetpass" => {
+            user.passwords.clear();
+            user.nopass = false;
+        }
+        "allkeys" | "~*" => user.keys = vec![Bytes::from_static(b"*")],
+        "resetkeys" => user.keys.clear(),
+        "allchannels" | "&*" => user.channels = vec![Bytes::from_static(b"*")],
+        "resetchannels" => user.channels.clear(),
+        "allcommands" | "+@all" => user.commands.allow_all = true,
+        "nocommands" | "-@all" => user.commands.allow_all = false,
+        "reset" => {
+            // Reset to initial state
+            user.enabled = false;
+            user.passwords.clear();
+            user.nopass = false;
+            user.commands = AclCommandRules::default();
+            user.keys.clear();
+            user.channels.clear();
+            user.selectors.clear();
+        }
+        r if r.starts_with('>') => user
+            .passwords
+            .push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
+        r if r.starts_with('#') => {
+            // Hashed password (hex-encoded SHA256)
+            let hash_str = &r[1..];
+            if let Ok(hash) = hex::decode(hash_str) {
+                user.passwords.push(Bytes::from(hash));
+            }
+        }
+        r if r.starts_with('<') => user.passwords.retain(|p| p.as_ref() != &r.as_bytes()[1..]),
+        r if r.starts_with("~") => user.keys.push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
+        r if r.starts_with("&") => user
+            .channels
+            .push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
+        r if r.starts_with("+@") => user
+            .commands
+            .allowed_cats
+            .push(Bytes::copy_from_slice(&r.as_bytes()[2..])),
+        r if r.starts_with("-@") => user
+            .commands
+            .denied_cats
+            .push(Bytes::copy_from_slice(&r.as_bytes()[2..])),
+        r if r.starts_with('+') => user
+            .commands
+            .allowed
+            .push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
+        r if r.starts_with('-') => user
+            .commands
+            .denied
+            .push(Bytes::copy_from_slice(&r.as_bytes()[1..])),
+        _ => {} // Ignore unknown rules for forward compatibility
     }
     Ok(())
 }

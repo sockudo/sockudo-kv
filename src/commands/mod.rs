@@ -145,7 +145,14 @@ impl Dispatcher {
 
         // Generic commands
         if cmd.is_command(b"DEL") {
-            return cmd_del(store, args);
+            // Check if lazyfree_lazy_user_del is enabled
+            let use_lazy = server
+                .map(|s| {
+                    s.lazyfree_lazy_user_del
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .unwrap_or(false);
+            return cmd_del(store, args, use_lazy);
         }
         if cmd.is_command(b"EXISTS") {
             return cmd_exists(store, args);
@@ -172,7 +179,18 @@ impl Dispatcher {
             return Ok(RespValue::integer(store.len() as i64));
         }
         if cmd.is_command(b"FLUSHDB") || cmd.is_command(b"FLUSHALL") {
-            store.flush();
+            // Check if lazyfree_lazy_user_flush is enabled
+            let use_lazy = server
+                .map(|s| {
+                    s.lazyfree_lazy_user_flush
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .unwrap_or(false);
+            if use_lazy {
+                store.lazy_flush();
+            } else {
+                store.flush();
+            }
             return Ok(RespValue::ok());
         }
 
@@ -280,11 +298,17 @@ impl Dispatcher {
     }
 }
 
-fn cmd_del(store: &Store, args: &[Bytes]) -> Result<RespValue> {
+fn cmd_del(store: &Store, args: &[Bytes], use_lazy: bool) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::WrongArity("DEL"));
     }
-    let count: i64 = args.iter().map(|k| if store.del(k) { 1 } else { 0 }).sum();
+    let count: i64 = if use_lazy {
+        args.iter()
+            .map(|k| if store.lazy_del(k) { 1 } else { 0 })
+            .sum()
+    } else {
+        args.iter().map(|k| if store.del(k) { 1 } else { 0 }).sum()
+    };
     Ok(RespValue::integer(count))
 }
 

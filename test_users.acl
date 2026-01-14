@@ -1,0 +1,2 @@
+user default on nopass +@all ~* &*
+user testuser on #70617373776f7264 +@all ~keys:*
