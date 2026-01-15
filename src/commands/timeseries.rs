@@ -131,7 +131,8 @@ fn cmd_ts_create(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     Ok(RespValue::ok())
 }
 
-/// TS.ADD key timestamp value [options...]
+/// TS.ADD key timestamp value [RETENTION retentionPeriod] [ENCODING [COMPRESSED|UNCOMPRESSED]]
+/// [CHUNK_SIZE size] [ON_DUPLICATE policy] [LABELS label value ...]
 fn cmd_ts_add(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.len() < 3 {
         return Err(Error::WrongArity("TS.ADD"));
@@ -145,9 +146,58 @@ fn cmd_ts_add(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     };
     let value = parse_float(&args[2])?;
 
-    // TODO: Parse additional options (RETENTION, LABELS, etc.)
+    // Parse additional options
+    let mut retention: Option<i64> = None;
+    let mut on_duplicate: Option<DuplicatePolicy> = None;
+    let mut labels: Option<Vec<(String, String)>> = None;
 
-    let result = store.ts_add(key, timestamp, value)?;
+    let mut i = 3;
+    while i < args.len() {
+        let opt = &args[i];
+        if eq_ignore_ascii_case(opt, b"RETENTION") {
+            i += 1;
+            if i >= args.len() {
+                return Err(Error::Syntax);
+            }
+            retention = Some(parse_int(&args[i])?);
+        } else if eq_ignore_ascii_case(opt, b"ENCODING") {
+            i += 1; // Skip encoding value (we don't use it, always compressed internally)
+        } else if eq_ignore_ascii_case(opt, b"CHUNK_SIZE") {
+            i += 1; // Skip chunk size value (we use fixed internal chunking)
+        } else if eq_ignore_ascii_case(opt, b"ON_DUPLICATE") {
+            i += 1;
+            if i >= args.len() {
+                return Err(Error::Syntax);
+            }
+            on_duplicate = Some(DuplicatePolicy::from_bytes(&args[i]).ok_or(Error::Syntax)?);
+        } else if eq_ignore_ascii_case(opt, b"LABELS") {
+            i += 1;
+            let mut new_labels = Vec::new();
+            while i + 1 < args.len() {
+                // Check if next token is another option keyword
+                if eq_ignore_ascii_case(&args[i], b"RETENTION")
+                    || eq_ignore_ascii_case(&args[i], b"ENCODING")
+                    || eq_ignore_ascii_case(&args[i], b"CHUNK_SIZE")
+                    || eq_ignore_ascii_case(&args[i], b"ON_DUPLICATE")
+                {
+                    break;
+                }
+                let label = String::from_utf8_lossy(&args[i]).into_owned();
+                let value = String::from_utf8_lossy(&args[i + 1]).into_owned();
+                new_labels.push((label, value));
+                i += 2;
+            }
+            labels = Some(new_labels);
+            continue; // Don't increment i again
+        } else {
+            return Err(Error::Syntax);
+        }
+        i += 1;
+    }
+
+    // Use ts_add_with_options if any options are provided, else use simple ts_add
+    let result =
+        store.ts_add_with_options(key, timestamp, value, retention, on_duplicate, labels)?;
     Ok(RespValue::integer(result))
 }
 

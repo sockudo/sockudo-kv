@@ -215,6 +215,136 @@ impl AclUser {
 
         parts.join(" ")
     }
+
+    /// Check if user can execute a command (DragonflyDB-style efficient checking)
+    /// Returns true if the command is allowed, false otherwise.
+    ///
+    /// Permission checking order (short-circuit):
+    /// 1. If allow_all is true and command is not explicitly denied -> allowed
+    /// 2. Check explicit command denials (-command) -> denied if matched
+    /// 3. Check explicit command allowances (+command) -> allowed if matched
+    /// 4. Check category denials (-@category) -> denied if command in denied category
+    /// 5. Check category allowances (+@category) -> allowed if command in allowed category
+    /// 6. Default: denied
+    pub fn can_execute_command(&self, command: &[u8]) -> bool {
+        let cmd_upper = command.to_ascii_uppercase();
+
+        // Check explicit denials first (highest priority)
+        for denied in &self.commands.denied {
+            if denied.as_ref().eq_ignore_ascii_case(&cmd_upper) {
+                return false;
+            }
+        }
+
+        // If allow_all is set, command is allowed (unless explicitly denied above)
+        if self.commands.allow_all {
+            return true;
+        }
+
+        // Check explicit command allowances
+        for allowed in &self.commands.allowed {
+            if allowed.as_ref().eq_ignore_ascii_case(&cmd_upper) {
+                return true;
+            }
+        }
+
+        // Check denied categories
+        let cmd_str = String::from_utf8_lossy(&cmd_upper);
+        for denied_cat in &self.commands.denied_cats {
+            let cat_str = String::from_utf8_lossy(denied_cat);
+            let commands_in_cat = get_commands_in_category(&cat_str);
+            if commands_in_cat
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&cmd_str))
+            {
+                return false;
+            }
+        }
+
+        // Check allowed categories
+        for allowed_cat in &self.commands.allowed_cats {
+            let cat_str = String::from_utf8_lossy(allowed_cat);
+            let commands_in_cat = get_commands_in_category(&cat_str);
+            if commands_in_cat
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&cmd_str))
+            {
+                return true;
+            }
+        }
+
+        // Not allowed by default
+        false
+    }
+
+    /// Check if user can access a key pattern
+    /// Uses glob-style pattern matching similar to Redis/DragonflyDB
+    pub fn can_access_key(&self, key: &[u8]) -> bool {
+        // User has no key restrictions (allkeys)
+        if self.keys.is_empty() {
+            return false;
+        }
+
+        for pattern in &self.keys {
+            if pattern.as_ref() == b"*" {
+                return true;
+            }
+            if glob_match(pattern, key) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if user can access a channel pattern
+    pub fn can_access_channel(&self, channel: &[u8]) -> bool {
+        if self.channels.is_empty() {
+            return false;
+        }
+
+        for pattern in &self.channels {
+            if pattern.as_ref() == b"*" {
+                return true;
+            }
+            if glob_match(pattern, channel) {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+/// Simple glob pattern matching (supports * and ? wildcards)
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    let mut p_idx = 0;
+    let mut t_idx = 0;
+    let mut star_idx: Option<usize> = None;
+    let mut match_idx = 0;
+
+    while t_idx < text.len() {
+        if p_idx < pattern.len() && (pattern[p_idx] == b'?' || pattern[p_idx] == text[t_idx]) {
+            p_idx += 1;
+            t_idx += 1;
+        } else if p_idx < pattern.len() && pattern[p_idx] == b'*' {
+            star_idx = Some(p_idx);
+            match_idx = t_idx;
+            p_idx += 1;
+        } else if let Some(star) = star_idx {
+            p_idx = star + 1;
+            match_idx += 1;
+            t_idx = match_idx;
+        } else {
+            return false;
+        }
+    }
+
+    while p_idx < pattern.len() && pattern[p_idx] == b'*' {
+        p_idx += 1;
+    }
+
+    p_idx == pattern.len()
 }
 
 /// Global server state

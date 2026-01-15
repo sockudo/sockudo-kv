@@ -183,7 +183,9 @@ impl PersistenceManager {
 /// Spawn background task for auto-save checking
 pub fn spawn_persistence_task(
     persistence: Arc<PersistenceManager>,
-    _store: Arc<MultiStore>,
+    store: Arc<MultiStore>,
+    config: Arc<crate::config::ServerConfig>,
+    server_state: Arc<crate::server_state::ServerState>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -193,24 +195,83 @@ pub fn spawn_persistence_task(
 
             if persistence.should_save() {
                 let persistence = Arc::clone(&persistence);
+                let store = Arc::clone(&store);
+                let config = Arc::clone(&config);
+                let server_state = Arc::clone(&server_state);
 
                 tokio::spawn(async move {
                     persistence.start_bgsave();
 
-                    // TODO: Actual RDB save implementation
-                    // The RDB serialization would be handled by the rdb module
-                    // For now, just mark as successful
-                    let success = true;
+                    // Generate RDB data using existing implementation
+                    use crate::replication::rdb::{RdbConfig, generate_rdb_with_config};
+
+                    let rdb_config = RdbConfig {
+                        compression: config.rdbcompression,
+                        checksum: config.rdbchecksum,
+                    };
+
+                    let rdb_data = generate_rdb_with_config(&store, rdb_config);
+                    let rdb_path = std::path::Path::new(&config.dir).join(&config.dbfilename);
+
+                    let success = match save_rdb_file(
+                        &rdb_path,
+                        &rdb_data,
+                        config.rdb_save_incremental_fsync,
+                    ) {
+                        Ok(_) => {
+                            server_state.last_save_time.store(
+                                server_state.now_unix(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            server_state
+                                .last_bgsave_status
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!("BGSAVE error: {}", e);
+                            server_state
+                                .last_bgsave_status
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            false
+                        }
+                    };
 
                     persistence.finish_bgsave(success);
-
-                    if !success {
-                        eprintln!("BGSAVE error");
-                    }
                 });
             }
         }
     })
+}
+
+/// Save RDB data to file with optional incremental fsync
+fn save_rdb_file(
+    path: &std::path::Path,
+    data: &[u8],
+    incremental_fsync: bool,
+) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+
+    if !incremental_fsync {
+        file.write_all(data)?;
+        return Ok(());
+    }
+
+    // Incremental fsync every 4MB (like Redis)
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+    for chunk in data.chunks(CHUNK_SIZE) {
+        file.write_all(chunk)?;
+        file.sync_data()?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -140,17 +140,46 @@ fn cmd_acl(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
             let command = &args[2];
 
             // Check if user exists
-            if !server.acl_users.contains_key(username.as_ref()) {
+            let user = match server.get_acl_user(username) {
+                Some(u) => u,
+                None => {
+                    return Ok(RespValue::error(&format!(
+                        "ERR User '{}' not found",
+                        String::from_utf8_lossy(username)
+                    )));
+                }
+            };
+
+            // Check if user is enabled
+            if !user.enabled {
                 return Ok(RespValue::error(&format!(
-                    "ERR User '{}' not found",
+                    "NOPERM User {} is disabled",
                     String::from_utf8_lossy(username)
                 )));
             }
 
-            // In our simplified ACL, users can run all commands
-            // Return OK indicating the command would be allowed
-            // TODO: Add actual command permission checking when full ACL is implemented
-            let _cmd_upper = command.to_ascii_uppercase();
+            // Check command permission using DragonflyDB-style algorithm
+            if !user.can_execute_command(command) {
+                return Ok(RespValue::error(&format!(
+                    "NOPERM User {} has no permissions to run the '{}' command",
+                    String::from_utf8_lossy(username),
+                    String::from_utf8_lossy(command).to_uppercase()
+                )));
+            }
+
+            // Check key access if command has key arguments
+            // For commands that take keys as arguments, check key permissions
+            if args.len() > 3 {
+                let key = &args[3];
+                if !user.can_access_key(key) {
+                    return Ok(RespValue::error(&format!(
+                        "NOPERM User {} has no permissions to access key '{}'",
+                        String::from_utf8_lossy(username),
+                        String::from_utf8_lossy(key)
+                    )));
+                }
+            }
+
             Ok(RespValue::ok())
         }
         b"GENPASS" => {

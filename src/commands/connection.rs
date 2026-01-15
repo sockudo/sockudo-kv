@@ -247,7 +247,7 @@ fn cmd_client(
             Ok(ConnectionResult::Response(RespValue::ok()))
         }
 
-        b"UNBLOCK" => cmd_client_unblock(subargs),
+        b"UNBLOCK" => cmd_client_unblock(manager, subargs),
 
         _ => Err(Error::Custom(format!(
             "ERR unknown subcommand '{}'. Try CLIENT HELP.",
@@ -651,19 +651,37 @@ fn format_tracking_info(tracking: &TrackingState) -> RespValue {
 }
 
 /// CLIENT UNBLOCK client-id [TIMEOUT|ERROR]
-fn cmd_client_unblock(args: &[Bytes]) -> Result<ConnectionResult> {
+fn cmd_client_unblock(manager: &Arc<ClientManager>, args: &[Bytes]) -> Result<ConnectionResult> {
     if args.is_empty() {
         return Err(Error::WrongArity("CLIENT UNBLOCK"));
     }
 
-    let _client_id: u64 = std::str::from_utf8(&args[0])
+    let client_id: u64 = std::str::from_utf8(&args[0])
         .map_err(|_| Error::NotInteger)?
         .parse()
         .map_err(|_| Error::NotInteger)?;
 
-    // TODO: Implement actual unblocking when we have blocking commands
-    // For now, return 0 (no client was unblocked)
-    Ok(ConnectionResult::Response(RespValue::integer(0)))
+    // Parse optional TIMEOUT|ERROR mode
+    let _error_mode = if args.len() > 1 {
+        args[1].eq_ignore_ascii_case(b"ERROR")
+    } else {
+        false
+    };
+
+    // Look up the client
+    match manager.get_client(client_id) {
+        Some(_client) => {
+            // Client exists - check if blocked and unblock
+            // Full blocking command implementation would set a blocked flag
+            // and use a channel/notify to wake the client
+            // For now, return 0 as blocking commands aren't fully implemented
+            Ok(ConnectionResult::Response(RespValue::integer(0)))
+        }
+        None => {
+            // Client doesn't exist
+            Ok(ConnectionResult::Response(RespValue::integer(0)))
+        }
+    }
 }
 
 // ==================== HELLO Command ====================

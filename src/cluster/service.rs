@@ -4,7 +4,7 @@
 //! 1. Batch gossip slot updates (no per-slot locks)
 //! 2. O(1) node lookup using IP:Port index
 //! 3. Pre-allocated buffers
-//! 4. Connection pooling (TODO: persistent connections)
+//! 4. Connection pooling for persistent connections
 //!
 //! Handles:
 //! 1. Cluster Bus Server (accepting connections from other nodes)
@@ -58,12 +58,23 @@ impl ClusterStream {
     }
 }
 
+/// Pooled cluster connection with last-used timestamp
+struct PooledConnection {
+    stream: ClusterStream,
+    last_used: std::time::Instant,
+}
+
+/// Connection pool for cluster bus connections
+type ConnectionPool = dashmap::DashMap<String, PooledConnection>;
+
 /// Cluster Service
 pub struct ClusterService {
     server: Arc<ServerState>,
     shutdown: Arc<Notify>,
     tls_acceptor: Option<TlsAcceptor>,
     tls_client_config: Option<Arc<ClientConfig>>,
+    /// Connection pool for persistent connections to other nodes
+    connection_pool: ConnectionPool,
 }
 
 impl ClusterService {
@@ -77,6 +88,7 @@ impl ClusterService {
             shutdown: Arc::new(Notify::new()),
             tls_acceptor,
             tls_client_config,
+            connection_pool: ConnectionPool::new(),
         }
     }
 
@@ -393,7 +405,7 @@ impl ClusterService {
         }
     }
 
-    /// Send PING to a node with reusable buffers
+    /// Send PING to a node with reusable buffers and connection pooling
     async fn send_ping(
         &self,
         target: &crate::cluster_state::ClusterNode,
@@ -402,44 +414,51 @@ impl ClusterService {
     ) {
         let addr = format!("{}:{}", target.ip, target.cport);
 
-        let tcp_stream = match TcpStream::connect(&addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                debug!("Failed to connect to {}: {}", addr, e);
-                // Mark node as potentially failing
-                target.link_state.store(0, Ordering::Relaxed);
-                return;
-            }
-        };
+        // Try to get an existing connection from the pool
+        let mut pooled_conn = self.connection_pool.remove(&addr);
 
-        let mut stream = if let Some(config) = &self.tls_client_config {
-            let connector = TlsConnector::from(config.clone());
-            let domain = match rustls::pki_types::ServerName::try_from(target.ip.as_str()) {
-                Ok(n) => n.to_owned(),
-                Err(_) => {
-                    // Fallback/DNS issue? If IP is used as name it might fail depending on cert
-                    // For now assume valid or use a dummy if we don't verify hostname strictly?
-                    // Rustls usually requires valid DNS name.
-                    // If we are connecting by IP, we might need a workaround or expect cert to have IP SAN.
-                    // Let's assume valid.
-                    // If invalid, log and fail.
-                    warn!("Invalid DNS name for node {}", target.ip);
+        // Check if connection is stale (> 30 seconds old) - if so, drop it
+        if let Some((_, ref conn)) = pooled_conn {
+            if conn.last_used.elapsed() > Duration::from_secs(30) {
+                pooled_conn = None;
+            }
+        }
+
+        // Create new connection if needed
+        let mut stream = if let Some((_, conn)) = pooled_conn {
+            conn.stream
+        } else {
+            let tcp_stream = match TcpStream::connect(&addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("Failed to connect to {}: {}", addr, e);
+                    target.link_state.store(0, Ordering::Relaxed);
                     return;
                 }
             };
 
-            match connector.connect(domain, tcp_stream).await {
-                Ok(tls_stream) => ClusterStream::ClientTls(tls_stream),
-                Err(e) => {
-                    warn!("Cluster TLS handshake to {} failed: {}", addr, e);
-                    return;
+            if let Some(config) = &self.tls_client_config {
+                let connector = TlsConnector::from(config.clone());
+                let domain = match rustls::pki_types::ServerName::try_from(target.ip.as_str()) {
+                    Ok(n) => n.to_owned(),
+                    Err(_) => {
+                        warn!("Invalid DNS name for node {}", target.ip);
+                        return;
+                    }
+                };
+
+                match connector.connect(domain, tcp_stream).await {
+                    Ok(tls_stream) => ClusterStream::ClientTls(tls_stream),
+                    Err(e) => {
+                        warn!("Cluster TLS handshake to {} failed: {}", addr, e);
+                        return;
+                    }
                 }
+            } else {
+                ClusterStream::Tcp(tcp_stream)
             }
-        } else {
-            ClusterStream::Tcp(tcp_stream)
         };
 
-        // ... usage of stream ...
         // Build and send PING
         ping_buf.clear();
         let ping = self.build_ping();
@@ -447,6 +466,7 @@ impl ClusterService {
 
         if let Err(e) = stream.write_all(ping_buf).await {
             warn!("Failed to send PING to {}: {}", addr, e);
+            // Don't return connection to pool on error
             return;
         }
 
@@ -471,22 +491,39 @@ impl ClusterService {
 
         // Wait for PONG with timeout
         resp_buf.clear();
-        match tokio::time::timeout(Duration::from_millis(500), stream.read_buf(resp_buf)).await {
-            Ok(Ok(n)) if n > 0 => {
-                // Process PONG
-                let peer_ip = target.ip.clone();
-                self.process_packet(resp_buf, &mut stream, &peer_ip).await;
-            }
-            Ok(Ok(_)) => {
-                // EOF
-                debug!("Connection closed by {}", addr);
-            }
-            Ok(Err(e)) => {
-                warn!("Read error from {}: {}", addr, e);
-            }
-            Err(_) => {
-                debug!("Timeout waiting for PONG from {}", addr);
-            }
+        let connection_ok =
+            match tokio::time::timeout(Duration::from_millis(500), stream.read_buf(resp_buf)).await
+            {
+                Ok(Ok(n)) if n > 0 => {
+                    // Process PONG
+                    let peer_ip = target.ip.clone();
+                    self.process_packet(resp_buf, &mut stream, &peer_ip).await;
+                    true
+                }
+                Ok(Ok(_)) => {
+                    // EOF - connection closed
+                    debug!("Connection closed by {}", addr);
+                    false
+                }
+                Ok(Err(e)) => {
+                    warn!("Read error from {}: {}", addr, e);
+                    false
+                }
+                Err(_) => {
+                    debug!("Timeout waiting for PONG from {}", addr);
+                    false
+                }
+            };
+
+        // Return connection to pool if still healthy
+        if connection_ok {
+            self.connection_pool.insert(
+                addr,
+                PooledConnection {
+                    stream,
+                    last_used: std::time::Instant::now(),
+                },
+            );
         }
 
         // Remove link

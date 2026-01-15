@@ -83,6 +83,67 @@ impl Store {
         }
     }
 
+    /// TS.ADD key timestamp value [RETENTION retentionPeriod] [ON_DUPLICATE policy] [LABELS label value ...]
+    /// Extended version with options for auto-created series
+    pub fn ts_add_with_options(
+        &self,
+        key: Bytes,
+        timestamp: i64,
+        value: f64,
+        retention: Option<i64>,
+        on_duplicate: Option<DuplicatePolicy>,
+        labels: Option<Vec<(String, String)>>,
+    ) -> Result<i64> {
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                match &mut entry.data {
+                    DataType::TimeSeries(ts) => {
+                        // Apply on_duplicate policy for this sample if specified
+                        let prev_policy = ts.duplicate_policy;
+                        if let Some(policy) = on_duplicate {
+                            ts.duplicate_policy = policy;
+                        }
+                        let result = ts.add(timestamp, value).map_err(Error::Other);
+                        // Restore original policy
+                        if on_duplicate.is_some() {
+                            ts.duplicate_policy = prev_policy;
+                        }
+                        if result.is_ok() {
+                            entry.bump_version();
+                        }
+                        result.map(|_| timestamp)
+                    }
+                    _ => Err(Error::WrongType),
+                }
+            }
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                // Create new time series with options
+                let mut ts = TimeSeries::new();
+                if let Some(r) = retention {
+                    ts.retention_ms = r;
+                }
+                if let Some(policy) = on_duplicate {
+                    ts.duplicate_policy = policy;
+                }
+                if let Some(new_labels) = labels {
+                    for (label, lvalue) in new_labels {
+                        let index_key = format!("{}={}", label, lvalue);
+                        LABEL_INDEX
+                            .entry(index_key)
+                            .or_default()
+                            .insert(key.clone());
+                        ts.labels.insert(label, lvalue);
+                    }
+                }
+                ts.add(timestamp, value).map_err(Error::Other)?;
+                e.insert((key, Entry::new(DataType::TimeSeries(Box::new(ts)))));
+                self.key_count.fetch_add(1, Ordering::Relaxed);
+                Ok(timestamp)
+            }
+        }
+    }
+
     /// TS.MADD key timestamp value [key timestamp value ...]
     pub fn ts_madd(&self, samples: Vec<(Bytes, i64, f64)>) -> Vec<Result<i64>> {
         samples

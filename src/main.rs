@@ -1272,18 +1272,44 @@ async fn handle_tls_client(
     replication: Arc<sockudo_kv::ReplicationManager>,
     config: Arc<ServerConfig>,
 ) -> std::io::Result<()> {
-    let (stream, _conn) = socket.get_ref();
+    let (stream, conn) = socket.get_ref();
     stream.set_nodelay(true)?;
     if config.tcp_keepalive > 0 {
         let _ = apply_tcp_keepalive(stream, config.tcp_keepalive);
     }
 
     let (sub_id, rx) = pubsub.register();
-    let require_auth = config.requirepass.is_some();
 
-    // TODO: Implement tls_auth_clients_user mapping here if x509 parsing supported
+    // TLS client auth user mapping: extract username from client certificate
+    let (require_auth, cert_username) =
+        if let Some(ref auth_user_config) = config.tls_auth_clients_user {
+            // Get client certificate from TLS connection
+            let client_cert = conn.peer_certificates().and_then(|certs| certs.first());
+
+            // Extract username from certificate CN
+            let username = sockudo_kv::tls::get_username_from_client_cert(
+                Some(auth_user_config.as_str()),
+                client_cert,
+            );
+
+            if username.is_some() {
+                // Certificate auth successful - no password required
+                (false, username)
+            } else {
+                // No valid cert or CN extraction failed - require normal auth
+                (config.requirepass.is_some(), None)
+            }
+        } else {
+            (config.requirepass.is_some(), None)
+        };
 
     let client = clients.register_with_auth(addr, sub_id, require_auth);
+
+    // If we got a username from the certificate, set it and mark as authenticated
+    if let Some(ref username) = cert_username {
+        client.set_authenticated(true);
+        *client.user.write() = bytes::Bytes::from(username.clone());
+    }
 
     let result = handle_client_inner(
         &mut socket,
