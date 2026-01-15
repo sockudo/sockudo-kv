@@ -76,6 +76,68 @@ pub fn set_process_title(_title: &str) {
     // Not supported on this platform
 }
 
+/// Daemonize the process (fork to background)
+///
+/// This performs the standard Unix daemon dance:
+/// 1. Fork and exit parent
+/// 2. Create new session (setsid)
+/// 3. Fork again and exit parent
+/// 4. Change directory to /
+/// 5. Redirect stdin/stdout/stderr to /dev/null
+#[cfg(unix)]
+pub fn daemonize() -> Result<(), String> {
+    use std::fs::File;
+    use std::os::unix::io::AsRawFd;
+
+    // First fork
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err("First fork failed".to_string());
+    }
+    if pid > 0 {
+        // Parent exits
+        std::process::exit(0);
+    }
+
+    // Create new session
+    if unsafe { libc::setsid() } < 0 {
+        return Err("setsid failed".to_string());
+    }
+
+    // Second fork to prevent acquiring a controlling terminal
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err("Second fork failed".to_string());
+    }
+    if pid > 0 {
+        // First child exits
+        std::process::exit(0);
+    }
+
+    // Change working directory to /
+    let _ = std::env::set_current_dir("/");
+
+    // Set file mode creation mask
+    unsafe { libc::umask(0) };
+
+    // Redirect stdin, stdout, stderr to /dev/null
+    if let Ok(dev_null) = File::open("/dev/null") {
+        let null_fd = dev_null.as_raw_fd();
+        unsafe {
+            libc::dup2(null_fd, 0); // stdin
+            libc::dup2(null_fd, 1); // stdout
+            libc::dup2(null_fd, 2); // stderr
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn daemonize() -> Result<(), String> {
+    Err("Daemonizing is not supported on this platform. Use a service manager instead.".to_string())
+}
+
 /// Apply process title template with variable substitution
 /// Supports: {title}, {port}, {config-file}
 pub fn format_process_title(template: &str, port: u16, config_file: &str) -> String {

@@ -135,22 +135,37 @@ sockudo-kv version 7.0.0 - Ready to accept connections
         );
     }
 
+    // Daemonize if configured (must happen before any async work)
     if config.daemonize {
-        println!(
-            "WARNING: daemonize yes is specified but not fully supported in this build. Running in foreground."
-        );
-    }
-
-    if !config.pidfile.is_empty()
-        && let Err(e) = std::fs::write(&config.pidfile, std::process::id().to_string())
-    {
-        eprintln!("Failed to write pidfile {}: {}", config.pidfile, e);
+        match sockudo_kv::process_mgmt::daemonize() {
+            Ok(()) => {
+                // After daemonizing, write the new PID
+                if !config.pidfile.is_empty() {
+                    if let Err(e) = std::fs::write(&config.pidfile, std::process::id().to_string())
+                    {
+                        eprintln!("Failed to write pidfile {}: {}", config.pidfile, e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to daemonize: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if !config.pidfile.is_empty() {
+        // Write PID file for non-daemon mode
+        if let Err(e) = std::fs::write(&config.pidfile, std::process::id().to_string()) {
+            eprintln!("Failed to write pidfile {}: {}", config.pidfile, e);
+        }
     }
 
     println!(
         "Starting sockudo-kv with config: port={}, bound to {:?}",
         config.port, config.bind
     );
+
+    // Apply Linux-specific kernel tuning (OOM score, THP)
+    sockudo_kv::kernel_tuning::apply_kernel_tuning(&config);
 
     // Bind TCP listeners using socket2 for proper configuration
     let mut listeners = Vec::new();
@@ -310,6 +325,13 @@ sockudo-kv version 7.0.0 - Ready to accept connections
         config.repl_backlog_size,
     ));
 
+    // Initialize keyspace notifications
+    let keyspace_notifier = Arc::new(sockudo_kv::keyspace_notify::KeyspaceNotifier::new(
+        &config.notify_keyspace_events,
+        pubsub.clone(),
+    ));
+    server_state.set_keyspace_notifier(keyspace_notifier.clone());
+
     // Set cluster port from config
     server_state
         .cluster
@@ -398,6 +420,97 @@ sockudo-kv version 7.0.0 - Ready to accept connections
     server_state
         .aof_enabled
         .store(config.appendonly, std::sync::atomic::Ordering::Relaxed);
+    server_state.aof_rewrite_incremental_fsync.store(
+        config.aof_rewrite_incremental_fsync,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // Apply LFU configuration
+    server_state
+        .lfu_log_factor
+        .store(config.lfu_log_factor, std::sync::atomic::Ordering::Relaxed);
+    server_state
+        .lfu_decay_time
+        .store(config.lfu_decay_time, std::sync::atomic::Ordering::Relaxed);
+
+    // Apply cron/background task configuration
+    server_state
+        .hz
+        .store(config.hz, std::sync::atomic::Ordering::Relaxed);
+    server_state
+        .dynamic_hz
+        .store(config.dynamic_hz, std::sync::atomic::Ordering::Relaxed);
+    server_state
+        .activerehashing
+        .store(config.activerehashing, std::sync::atomic::Ordering::Relaxed);
+
+    // Apply latency tracking configuration
+    server_state.latency_tracking.store(
+        config.latency_tracking,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // Apply active defragmentation configuration
+    server_state
+        .activedefrag
+        .store(config.activedefrag, std::sync::atomic::Ordering::Relaxed);
+    server_state.active_defrag_ignore_bytes.store(
+        config.active_defrag_ignore_bytes,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.active_defrag_threshold_lower.store(
+        config.active_defrag_threshold_lower,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.active_defrag_threshold_upper.store(
+        config.active_defrag_threshold_upper,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.active_defrag_cycle_min.store(
+        config.active_defrag_cycle_min,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.active_defrag_cycle_max.store(
+        config.active_defrag_cycle_max,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.active_defrag_max_scan_fields.store(
+        config.active_defrag_max_scan_fields,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // Apply Lua configuration
+    server_state
+        .lua_time_limit
+        .store(config.lua_time_limit, std::sync::atomic::Ordering::Relaxed);
+
+    // Apply shutdown configuration
+    server_state.shutdown_timeout.store(
+        config.shutdown_timeout,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // Apply tracking table limit
+    server_state.tracking_table_max_keys.store(
+        config.tracking_table_max_keys as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // Apply client limits
+    server_state.client_query_buffer_limit.store(
+        config.client_query_buffer_limit,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    server_state.proto_max_bulk_len.store(
+        config.proto_max_bulk_len,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // Apply connection rate limit
+    server_state.max_new_connections_per_cycle.store(
+        config.max_new_connections_per_cycle,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Apply maxclients limit
     clients.set_maxclients(config.maxclients);
@@ -504,6 +617,9 @@ sockudo-kv version 7.0.0 - Ready to accept connections
     tokio::spawn(async move {
         cs.start().await;
     });
+
+    // Start background cron task (active expiration, rehashing, etc.)
+    sockudo_kv::cron::start_cron(server_state.clone(), multi_store.clone(), clients.clone());
 
     // Load RDB if exists
     let rdb_path = Path::new(&config.dir).join(&config.dbfilename);

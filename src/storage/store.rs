@@ -228,6 +228,35 @@ impl Store {
         }
     }
 
+    /// Sample random keys and delete expired ones
+    /// Used by the background cron task for active expiration
+    /// Returns the count of expired keys that were deleted
+    pub fn expire_random_keys(&self, samples: usize, use_lazy: bool) -> usize {
+        let mut expired_count = 0;
+        let len = self.data.len();
+        if len == 0 {
+            return 0;
+        }
+
+        // Sample random keys and check for expiration
+        for _ in 0..samples {
+            let skip = fastrand::usize(0..len.max(1));
+            if let Some(entry) = self.data.iter().nth(skip) {
+                if entry.1.is_expired() {
+                    let key = entry.0.clone();
+                    if use_lazy {
+                        self.lazy_del(&key);
+                    } else {
+                        self.del(&key);
+                    }
+                    expired_count += 1;
+                }
+            }
+        }
+
+        expired_count
+    }
+
     // ==================== DashTable Helpers ====================
 
     #[inline]

@@ -496,7 +496,9 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "10",
         getter: int_getter!(hz),
         setter: int_setter!(hz, u32),
-        applier: None,
+        applier: Some(|s, c| {
+            s.hz.store(c.hz, std::sync::atomic::Ordering::Relaxed);
+        }),
     },
     // === Lazy Free ===
     ConfigEntry {
@@ -548,7 +550,10 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "no",
         getter: bool_getter!(activedefrag),
         setter: bool_setter!(activedefrag),
-        applier: None,
+        applier: Some(|s, c| {
+            s.activedefrag
+                .store(c.activedefrag, std::sync::atomic::Ordering::Relaxed);
+        }),
     },
     // === LFU ===
     ConfigEntry {
@@ -559,7 +564,10 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "10",
         getter: int_getter!(lfu_log_factor),
         setter: int_setter!(lfu_log_factor, u32),
-        applier: None,
+        applier: Some(|s, c| {
+            s.lfu_log_factor
+                .store(c.lfu_log_factor, std::sync::atomic::Ordering::Relaxed);
+        }),
     },
     ConfigEntry {
         name: "lfu-decay-time",
@@ -569,7 +577,10 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "1",
         getter: int_getter!(lfu_decay_time),
         setter: int_setter!(lfu_decay_time, u32),
-        applier: None,
+        applier: Some(|s, c| {
+            s.lfu_decay_time
+                .store(c.lfu_decay_time, std::sync::atomic::Ordering::Relaxed);
+        }),
     },
     // === Replication ===
     ConfigEntry {
@@ -1013,7 +1024,10 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "yes",
         getter: bool_getter!(dynamic_hz),
         setter: bool_setter!(dynamic_hz),
-        applier: None,
+        applier: Some(|s, c| {
+            s.dynamic_hz
+                .store(c.dynamic_hz, std::sync::atomic::Ordering::Relaxed);
+        }),
     },
     ConfigEntry {
         name: "activerehashing",
@@ -1023,7 +1037,10 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "yes",
         getter: bool_getter!(activerehashing),
         setter: bool_setter!(activerehashing),
-        applier: None,
+        applier: Some(|s, c| {
+            s.activerehashing
+                .store(c.activerehashing, std::sync::atomic::Ordering::Relaxed);
+        }),
     },
     // === Security ===
     ConfigEntry {
@@ -1240,7 +1257,12 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "yes",
         getter: bool_getter!(aof_rewrite_incremental_fsync),
         setter: bool_setter!(aof_rewrite_incremental_fsync),
-        applier: None,
+        applier: Some(|s, c| {
+            s.aof_rewrite_incremental_fsync.store(
+                c.aof_rewrite_incremental_fsync,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }),
     },
     ConfigEntry {
         name: "rdb-save-incremental-fsync",
@@ -1594,7 +1616,12 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "1073741824",
         getter: int_getter!(client_query_buffer_limit),
         setter: int_setter!(client_query_buffer_limit, u64),
-        applier: None,
+        applier: Some(|s, c| {
+            s.client_query_buffer_limit.store(
+                c.client_query_buffer_limit,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }),
     },
     ConfigEntry {
         name: "proto-max-bulk-len",
@@ -1604,7 +1631,10 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "536870912",
         getter: int_getter!(proto_max_bulk_len),
         setter: int_setter!(proto_max_bulk_len, u64),
-        applier: None,
+        applier: Some(|s, c| {
+            s.proto_max_bulk_len
+                .store(c.proto_max_bulk_len, std::sync::atomic::Ordering::Relaxed);
+        }),
     },
     // === Kernel/Threading ===
     ConfigEntry {
@@ -1759,7 +1789,12 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "10",
         getter: int_getter!(max_new_connections_per_cycle),
         setter: int_setter!(max_new_connections_per_cycle, u32),
-        applier: None,
+        applier: Some(|s, c| {
+            s.max_new_connections_per_cycle.store(
+                c.max_new_connections_per_cycle,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }),
     },
     ConfigEntry {
         name: "max-new-tls-connections-per-cycle",

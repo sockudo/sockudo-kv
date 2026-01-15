@@ -1,1 +1,0 @@
-ACL SETUSER testuser on >password ~keys:* +@all

@@ -126,6 +126,61 @@ maxmemory 4gb
 maxmemory-policy allkeys-lru
 ```
 
+## Configuration Features
+
+### ✅ Fully Implemented
+
+| Category | Options |
+|----------|---------|
+| **Network** | `bind`, `port`, `tcp-backlog`, `tcp-keepalive`, `unixsocket`, `timeout` |
+| **Security** | `requirepass`, `protected-mode`, `acl-file`, `rename-command` |
+| **Persistence** | `save`, `appendonly`, `appendfilename`, `appendfsync`, `rdbcompression`, `rdbchecksum`, `aof-rewrite-incremental-fsync` |
+| **Replication** | `replicaof`, `masterauth`, `replica-read-only`, `repl-backlog-size`, `repl-timeout` |
+| **Memory** | `maxmemory`, `maxmemory-policy`, `maxmemory-samples`, `active-expire-effort` |
+| **Lazy Free** | `lazyfree-lazy-eviction`, `lazyfree-lazy-expire`, `lazyfree-lazy-server-del` |
+| **Limits** | `maxclients`, `client-query-buffer-limit`, `proto-max-bulk-len` |
+| **LFU Eviction** | `lfu-log-factor`, `lfu-decay-time` |
+| **Background Tasks** | `hz`, `dynamic-hz`, `activerehashing` |
+| **Latency** | `latency-tracking`, `latency-tracking-info-percentiles`, `slowlog-*` |
+| **Defrag** | `activedefrag`, `active-defrag-*` thresholds |
+| **TLS** | `tls-port`, `tls-cert-file`, `tls-key-file`, `tls-ca-cert-file`, `tls-auth-clients` |
+| **Cluster** | `cluster-enabled`, `cluster-config-file`, `cluster-node-timeout`, `cluster-require-full-coverage` |
+| **Pub/Sub** | `notify-keyspace-events` |
+| **Scripting** | `lua-time-limit` |
+| **Shutdown** | `shutdown-timeout` |
+| **Process Mgmt** | `daemonize` (Unix), `supervised` (systemd/upstart/auto) |
+| **Connection Rate** | `max-new-connections-per-cycle` |
+| **Encoding** | `hash-max-listpack-*`, `list-max-listpack-*`, `set-max-*`, `zset-max-*` |
+
+### ✅ Linux-Specific (under `#[cfg(target_os = "linux")]`)
+
+| Option | Description |
+|--------|-------------|
+| `oom-score-adj` | OOM killer score adjustment (`no`, `yes`, `relative`, `absolute`) |
+| `oom-score-adj-values` | OOM score values for master/replica/bgsave |
+| `disable-thp` | Disable Transparent Huge Pages via sysfs + prctl |
+| `socket-mark-id` | SO_MARK for outgoing connections |
+
+### ⚠️ Parsed but No-Op (Compatibility)
+
+| Option | Reason |
+|--------|--------|
+| `io-threads` | Tokio async runtime manages threading |
+| `io-threads-do-reads` | Tokio manages I/O |
+| `server-cpulist` | Tokio manages CPU affinity |
+| `bio-cpulist` | Background I/O handled by Tokio |
+| `jemalloc-bg-thread` | Uses mimalloc, not jemalloc |
+| `ignore-warnings` | Parsed for compatibility |
+
+### ❌ Not Implemented
+
+| Option | Reason |
+|--------|--------|
+| `loadmodule` | Module system API not implemented |
+| `sentinel` | Sentinel mode not implemented |
+| `debug` | Command partially implemented (some subcommands missing) |
+
+
 ## Architecture
 
 ```

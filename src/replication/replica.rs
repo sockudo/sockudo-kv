@@ -172,6 +172,11 @@ pub async fn connect_to_master(
         // Clear existing data and load RDB
         multi_store.flush_all();
         load_rdb(&rdb_data, &multi_store)?;
+
+        // Cleanup temporary RDB files if configured
+        if config.rdb_del_sync_files {
+            cleanup_temp_rdb_files();
+        }
     } else if response_str.starts_with("CONTINUE") {
         // Partial sync - parse new offset if provided
         let parts: Vec<&str> = response_str.split_whitespace().collect();
@@ -395,4 +400,31 @@ pub fn disconnect_from_master(repl: &ReplicationManager) {
     repl.master_link_status.store(false, Ordering::Relaxed);
     *repl.master_host.write() = None;
     *repl.master_port.write() = None;
+}
+
+/// Cleanup temporary RDB files used for synchronization
+fn cleanup_temp_rdb_files() {
+    // Best effort cleanup without glob dependency
+    match std::fs::read_dir(".") {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if let Ok(file_type) = entry.file_type() {
+                    if file_type.is_file() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name.starts_with("temp-") && name.ends_with(".rdb") {
+                                if let Err(e) = std::fs::remove_file(entry.path()) {
+                                    eprintln!("Failed to remove temp RDB file {:?}: {}", name, e);
+                                } else {
+                                    println!("Removed temp RDB file: {}", name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to read directory for cleanup: {}", e);
+        }
+    }
 }

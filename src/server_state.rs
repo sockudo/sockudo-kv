@@ -12,6 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cluster_state::ClusterState;
 use crate::config::ServerConfig;
+use crate::keyspace_notify::KeyspaceNotifier;
 use std::sync::Arc;
 
 /// Maximum slow log entries (default 128)
@@ -240,6 +241,8 @@ pub struct ServerState {
     pub aof_enabled: AtomicBool,
     pub rdb_bgsave_in_progress: AtomicBool,
     pub aof_rewrite_in_progress: AtomicBool,
+    /// Use incremental fsync during AOF rewrite
+    pub aof_rewrite_incremental_fsync: AtomicBool,
 
     // === Statistics ===
     pub start_time: Instant,
@@ -287,6 +290,64 @@ pub struct ServerState {
     pub tracking_table: DashMap<Bytes, Vec<u64>>,
     /// Max keys in tracking table
     pub tracking_table_max_keys: AtomicUsize,
+
+    // === LFU Configuration ===
+    /// LFU logarithmic factor (default 10)
+    pub lfu_log_factor: AtomicU32,
+    /// LFU decay time in minutes (default 1)
+    pub lfu_decay_time: AtomicU32,
+
+    // === Cron/Background Task Configuration ===
+    /// Cron frequency in Hz (default 10)
+    pub hz: AtomicU32,
+    /// Dynamic hz adjustment based on client count
+    pub dynamic_hz: AtomicBool,
+    /// Enable incremental rehashing in background
+    pub activerehashing: AtomicBool,
+
+    // === Latency Tracking ===
+    /// Enable latency tracking for commands
+    pub latency_tracking: AtomicBool,
+
+    // === Active Defragmentation ===
+    /// Enable active defragmentation
+    pub activedefrag: AtomicBool,
+    /// Minimum fragmentation bytes to start defrag
+    pub active_defrag_ignore_bytes: AtomicU64,
+    /// Lower fragmentation threshold percentage
+    pub active_defrag_threshold_lower: AtomicU32,
+    /// Upper fragmentation threshold percentage
+    pub active_defrag_threshold_upper: AtomicU32,
+    /// Minimum CPU percentage for defrag
+    pub active_defrag_cycle_min: AtomicU32,
+    /// Maximum CPU percentage for defrag
+    pub active_defrag_cycle_max: AtomicU32,
+    /// Max fields to scan per defrag cycle
+    pub active_defrag_max_scan_fields: AtomicU32,
+
+    // === Lua ===
+    /// Lua script time limit in milliseconds
+    pub lua_time_limit: AtomicU64,
+
+    // === Shutdown ===
+    /// Shutdown timeout in seconds for replica sync
+    pub shutdown_timeout: AtomicU64,
+
+    // === Client Limits ===
+    /// Maximum client query buffer size in bytes (default 1GB)
+    pub client_query_buffer_limit: AtomicU64,
+    /// Maximum bulk string length in protocol (default 512MB)
+    pub proto_max_bulk_len: AtomicU64,
+
+    // === Connection Rate Limiting ===
+    /// Max new connections per cron cycle
+    pub max_new_connections_per_cycle: AtomicU32,
+    /// Counter for connections this cycle
+    pub connections_this_cycle: AtomicU32,
+
+    // === Keyspace Notifications ===
+    /// Keyspace notification emitter (initialized after PubSub)
+    pub keyspace_notifier: RwLock<Option<Arc<KeyspaceNotifier>>>,
 }
 
 impl ServerState {
@@ -315,6 +376,7 @@ impl ServerState {
             aof_enabled: AtomicBool::new(false),
             rdb_bgsave_in_progress: AtomicBool::new(false),
             aof_rewrite_in_progress: AtomicBool::new(false),
+            aof_rewrite_incremental_fsync: AtomicBool::new(true),
 
             start_time: Instant::now(),
             start_time_unix: now,
@@ -345,6 +407,44 @@ impl ServerState {
 
             tracking_table: DashMap::new(),
             tracking_table_max_keys: AtomicUsize::new(1_000_000), // Default 1M
+
+            // LFU defaults
+            lfu_log_factor: AtomicU32::new(10),
+            lfu_decay_time: AtomicU32::new(1),
+
+            // Cron defaults
+            hz: AtomicU32::new(10),
+            dynamic_hz: AtomicBool::new(true),
+            activerehashing: AtomicBool::new(true),
+
+            // Latency tracking default
+            latency_tracking: AtomicBool::new(true),
+
+            // Active defrag defaults
+            activedefrag: AtomicBool::new(false),
+            active_defrag_ignore_bytes: AtomicU64::new(100 * 1024 * 1024), // 100MB
+            active_defrag_threshold_lower: AtomicU32::new(10),
+            active_defrag_threshold_upper: AtomicU32::new(100),
+            active_defrag_cycle_min: AtomicU32::new(1),
+            active_defrag_cycle_max: AtomicU32::new(25),
+            active_defrag_max_scan_fields: AtomicU32::new(1000),
+
+            // Lua default
+            lua_time_limit: AtomicU64::new(5000),
+
+            // Shutdown default
+            shutdown_timeout: AtomicU64::new(10),
+
+            // Client limits
+            client_query_buffer_limit: AtomicU64::new(1024 * 1024 * 1024), // 1GB
+            proto_max_bulk_len: AtomicU64::new(512 * 1024 * 1024),         // 512MB
+
+            // Connection rate limiting
+            max_new_connections_per_cycle: AtomicU32::new(10),
+            connections_this_cycle: AtomicU32::new(0),
+
+            // Keyspace notifications (initialized after PubSub is created)
+            keyspace_notifier: RwLock::new(None),
         };
 
         // Create default user
@@ -416,6 +516,10 @@ impl ServerState {
 
     /// Record latency for an event
     pub fn record_latency(&self, event: &[u8], latency_ms: u64) {
+        // Check if latency tracking is enabled
+        if !self.latency_tracking.load(Ordering::Relaxed) {
+            return;
+        }
         let threshold = self.latency_threshold_ms.load(Ordering::Relaxed);
         if threshold == 0 || latency_ms < threshold {
             return;
@@ -645,6 +749,23 @@ impl ServerState {
 
         // Insert new key
         self.tracking_table.entry(key).or_default().push(client_id);
+    }
+
+    // === Keyspace Notifications ===
+
+    /// Set the keyspace notifier (called after PubSub is created)
+    pub fn set_keyspace_notifier(&self, notifier: Arc<KeyspaceNotifier>) {
+        *self.keyspace_notifier.write() = Some(notifier);
+    }
+
+    /// Update keyspace notifier config (for CONFIG SET)
+    pub fn update_keyspace_notifier(&self, config: &str, pubsub: Arc<crate::PubSub>) {
+        *self.keyspace_notifier.write() = Some(Arc::new(KeyspaceNotifier::new(config, pubsub)));
+    }
+
+    /// Get the keyspace notifier if enabled
+    pub fn get_keyspace_notifier(&self) -> Option<Arc<KeyspaceNotifier>> {
+        self.keyspace_notifier.read().clone()
     }
 }
 

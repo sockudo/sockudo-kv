@@ -906,13 +906,14 @@ impl Entry {
 
     /// Increment LFU counter using probabilistic increment (Redis algorithm)
     /// Counter grows logarithmically to prevent saturation
+    /// lfu_log_factor controls how slowly the counter grows (higher = slower)
     #[inline]
-    pub fn increment_lfu(&self) {
+    pub fn increment_lfu(&self, lfu_log_factor: u32) {
         let counter = self.lfu_counter.load(Ordering::Relaxed);
         if counter < 255 {
-            // Probabilistic increment: P = 1/(counter-LFU_INIT_VAL+1)
+            // Probabilistic increment: P = 1/(counter * lfu_log_factor + 1)
             let base_val = counter.saturating_sub(5) as u32;
-            let p = 1.0 / ((base_val as f64) + 1.0);
+            let p = 1.0 / ((base_val as f64) * (lfu_log_factor as f64) + 1.0);
             if fastrand::f64() < p {
                 let _ = self.lfu_counter.compare_exchange(
                     counter,
