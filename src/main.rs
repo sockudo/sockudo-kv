@@ -122,16 +122,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Show ASCII logo if always_show_logo is enabled
     if config.always_show_logo {
         println!(
-            r#"
-  _____         _           _         _  ____   __
- / ____|       | |         | |       | |/ /\ \ / /
-| (___   ___  _| | ___   __| | ___   | ' /  \ V / 
- \___ \ / _ \/ __|| |/ / | | |/ _ \  |  <    > <  
- ____) | (_)|  (__| <| |_| | (_) |  | . \  / . \ 
-|_____/ \___/\___|_|\_\__,_|\___/   |_|\_\/_/ \_\
+            r"
+ ____             _               _              _  ____     __
+/ ___|  ___   ___| | ___   _   __| | ___        | |/ /\ \   / /
+\___ \ / _ \ / __| |/ / | | | / _` |/ _ \  _____| ' /  \ \ / / 
+ ___) | (_) | (__|   <| |_| || (_| | (_) ||_____| . \   \ V /  
+|____/ \___/ \___|_|\_\\__,_| \__,_|\___/       |_|\_\   \_/   
 
-sockudo-kv version 7.0.0 - Ready to accept connections
-"#
+sockudo-kv v7.0.0 - High-performance Redis-compatible server
+"
         );
     }
 

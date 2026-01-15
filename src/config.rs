@@ -293,6 +293,24 @@ pub struct ServerConfig {
     pub active_defrag_max_scan_fields: u32,
 }
 
+/// Get platform-appropriate default pidfile path
+fn default_pidfile() -> String {
+    #[cfg(windows)]
+    {
+        // On Windows, use TEMP directory
+        if let Some(temp) = std::env::var_os("TEMP") {
+            let path = std::path::Path::new(&temp).join("sockudo_6379.pid");
+            return path.to_string_lossy().to_string();
+        }
+        // Fallback to current directory
+        "sockudo_6379.pid".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "/var/run/redis_6379.pid".to_string()
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -337,7 +355,7 @@ impl Default for ServerConfig {
             supervised: "no".to_string(),
             loglevel: "notice".to_string(),
             logfile: "".to_string(),
-            pidfile: "/var/run/redis_6379.pid".to_string(),
+            pidfile: default_pidfile(),
             crash_log_enabled: true,
             crash_memcheck_enabled: true,
             always_show_logo: true, // Redis default is actually dependent on TTY but usually yes/no in conf
