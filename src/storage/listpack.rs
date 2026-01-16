@@ -231,23 +231,96 @@ impl Listpack {
     /// Returns true if new member, false if updated.
     pub fn zinsert(&mut self, member: &[u8], score: f64) -> bool {
         let score_bytes = score.to_le_bytes();
+        let mut updated = false;
 
-        if let Some((_key_start, value_start, _value_end)) = self.find_key(member) {
-            // Update existing score (always 8 bytes)
-            self.data[value_start..value_start + 8].copy_from_slice(&score_bytes);
-            false
-        } else {
-            // New member: append in sorted order
-            // For simplicity, we append at end. zrange will sort.
-            write_varint(&mut self.data, member.len() as u64);
-            self.data.extend_from_slice(member);
-            write_varint(&mut self.data, 8); // Score is always 8 bytes
-            self.data.extend_from_slice(&score_bytes);
+        // Check for existence and remove if necessary (simplest way to handle updates while maintaining order)
+        if let Some((_k_start, val_start, _)) = self.find_key(member) {
+            let existing_score_bytes: [u8; 8] = self.data[val_start..val_start + 8]
+                .try_into()
+                .unwrap_or([0; 8]);
+            let existing_score = f64::from_le_bytes(existing_score_bytes);
 
-            self.count += 1;
-            self.update_count();
-            true
+            // If strictly equal, do nothing
+            if (existing_score - score).abs() < f64::EPSILON {
+                return false;
+            }
+
+            // Remove old entry
+            self.zremove(member);
+            updated = true;
         }
+
+        // Find insertion point
+        let mut insert_pos = 2; // Start after count
+        let mut current_pos = 2;
+        let mut found = false;
+
+        for _ in 0..self.count {
+            if current_pos >= self.data.len() {
+                break;
+            }
+
+            let entry_start = current_pos;
+
+            // Read member
+            let (mem_len, mem_start) = match read_varint(&self.data, current_pos) {
+                Some(v) => v,
+                None => break,
+            };
+            let mem_end = mem_start + mem_len as usize;
+
+            if mem_end > self.data.len() {
+                break;
+            }
+            let current_member = &self.data[mem_start..mem_end];
+
+            // Read score
+            let (score_len, score_start) = match read_varint(&self.data, mem_end) {
+                Some(v) => v,
+                None => break,
+            };
+            // Score should be 8 bytes
+            let score_end = score_start + score_len as usize;
+            if score_end > self.data.len() {
+                break;
+            }
+
+            let current_score_bytes: [u8; 8] = self.data[score_start..score_end]
+                .try_into()
+                .unwrap_or([0; 8]);
+            let current_score = f64::from_le_bytes(current_score_bytes);
+
+            // Compare: insert before if current > new OR (current == new AND current_mem > new_mem)
+            if current_score > score {
+                insert_pos = entry_start;
+                found = true;
+                break;
+            } else if (current_score - score).abs() < f64::EPSILON && current_member > member {
+                insert_pos = entry_start;
+                found = true;
+                break;
+            }
+
+            current_pos = score_end;
+        }
+
+        if !found {
+            insert_pos = self.data.len();
+        }
+
+        // Construct new entry
+        let mut new_entry = Vec::with_capacity(member.len() + 20);
+        write_varint(&mut new_entry, member.len() as u64);
+        new_entry.extend_from_slice(member);
+        write_varint(&mut new_entry, 8);
+        new_entry.extend_from_slice(&score_bytes);
+
+        // Insert
+        self.data.splice(insert_pos..insert_pos, new_entry);
+        self.count += 1;
+        self.update_count();
+
+        !updated
     }
 
     /// Get score for a member
@@ -284,26 +357,14 @@ impl Listpack {
     }
 
     /// Get all members sorted by score
+    /// Get all members sorted by score
     pub fn zrange_sorted(&self) -> Vec<(Bytes, f64)> {
-        let mut entries: Vec<(Bytes, f64)> = self.ziter().collect();
-        entries.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        entries
+        self.ziter().collect()
     }
 
     /// Get rank of a member (0-indexed, sorted by score ascending)
     pub fn zrank(&self, member: &[u8]) -> Option<usize> {
-        let target_score = self.zscore(member)?;
-        let target_member = member;
-
-        let sorted = self.zrange_sorted();
-        sorted.iter().position(|(m, s)| {
-            (*s == target_score || (*s - target_score).abs() < f64::EPSILON)
-                && m.as_ref() == target_member
-        })
+        self.ziter().position(|(m, _)| m.as_ref() == member)
     }
 
     // ==================== Conversion Methods ====================

@@ -29,6 +29,244 @@ fn parse_float(b: &[u8]) -> Result<f64> {
         .map_err(|_| Error::NotFloat)
 }
 
+/// Parse a schema field definition from args starting at index `i`
+fn parse_schema_field(args: &[Bytes], i: &mut usize) -> Result<SchemaField> {
+    if *i >= args.len() {
+        return Err(Error::Syntax);
+    }
+
+    let field_name = args[*i].clone();
+    *i += 1;
+
+    // Check for AS alias
+    let mut alias = None;
+    if *i < args.len() && eq_ignore_ascii_case(&args[*i], b"AS") {
+        *i += 1;
+        if *i >= args.len() {
+            return Err(Error::Syntax);
+        }
+        alias = Some(args[*i].clone());
+        *i += 1;
+    }
+
+    if *i >= args.len() {
+        return Err(Error::Syntax);
+    }
+
+    // Parse field type
+    let type_arg = args[*i].to_ascii_uppercase();
+    *i += 1;
+
+    let field_type = match type_arg.as_slice() {
+        b"TEXT" => {
+            let mut weight = 1.0;
+            let mut nostem = false;
+            let mut sortable = false;
+            let mut noindex = false;
+            let mut phonetic = None;
+
+            while *i < args.len() {
+                let opt = args[*i].to_ascii_uppercase();
+                match opt.as_slice() {
+                    b"WEIGHT" => {
+                        *i += 1;
+                        if *i < args.len() {
+                            weight = parse_float(&args[*i]).unwrap_or(1.0);
+                            *i += 1;
+                        }
+                    }
+                    b"NOSTEM" => {
+                        nostem = true;
+                        *i += 1;
+                    }
+                    b"SORTABLE" => {
+                        sortable = true;
+                        *i += 1;
+                    }
+                    b"UNF" => {
+                        *i += 1;
+                    } // Skip UNF
+                    b"NOINDEX" => {
+                        noindex = true;
+                        *i += 1;
+                    }
+                    b"PHONETIC" => {
+                        *i += 1;
+                        if *i < args.len() {
+                            phonetic = Some(String::from_utf8_lossy(&args[*i]).into_owned());
+                            *i += 1;
+                        }
+                    }
+                    b"WITHSUFFIXTRIE" => {
+                        *i += 1;
+                    }
+                    _ => break,
+                }
+            }
+
+            FieldType::Text {
+                weight,
+                nostem,
+                phonetic,
+                sortable,
+                noindex,
+            }
+        }
+        b"TAG" => {
+            let mut separator = ',';
+            let mut casesensitive = false;
+            let mut sortable = false;
+            let mut noindex = false;
+
+            while *i < args.len() {
+                let opt = args[*i].to_ascii_uppercase();
+                match opt.as_slice() {
+                    b"SEPARATOR" => {
+                        *i += 1;
+                        if *i < args.len() && !args[*i].is_empty() {
+                            separator = args[*i][0] as char;
+                            *i += 1;
+                        }
+                    }
+                    b"CASESENSITIVE" => {
+                        casesensitive = true;
+                        *i += 1;
+                    }
+                    b"SORTABLE" => {
+                        sortable = true;
+                        *i += 1;
+                    }
+                    b"UNF" => {
+                        *i += 1;
+                    }
+                    b"NOINDEX" => {
+                        noindex = true;
+                        *i += 1;
+                    }
+                    b"WITHSUFFIXTRIE" => {
+                        *i += 1;
+                    }
+                    _ => break,
+                }
+            }
+
+            FieldType::Tag {
+                separator,
+                casesensitive,
+                sortable,
+                noindex,
+            }
+        }
+        b"NUMERIC" => {
+            let mut sortable = false;
+            let mut noindex = false;
+
+            while *i < args.len() {
+                let opt = args[*i].to_ascii_uppercase();
+                match opt.as_slice() {
+                    b"SORTABLE" => {
+                        sortable = true;
+                        *i += 1;
+                    }
+                    b"UNF" => {
+                        *i += 1;
+                    }
+                    b"NOINDEX" => {
+                        noindex = true;
+                        *i += 1;
+                    }
+                    _ => break,
+                }
+            }
+
+            FieldType::Numeric { sortable, noindex }
+        }
+        b"GEO" => {
+            let mut sortable = false;
+            let mut noindex = false;
+
+            while *i < args.len() {
+                let opt = args[*i].to_ascii_uppercase();
+                match opt.as_slice() {
+                    b"SORTABLE" => {
+                        sortable = true;
+                        *i += 1;
+                    }
+                    b"NOINDEX" => {
+                        noindex = true;
+                        *i += 1;
+                    }
+                    _ => break,
+                }
+            }
+
+            FieldType::Geo { sortable, noindex }
+        }
+        b"VECTOR" => {
+            // VECTOR FLAT|HNSW dim DIM distance_metric DISTANCE_METRIC ...
+            let mut algorithm = VectorAlgorithm::Flat;
+            let mut dim = 128;
+            let mut distance_metric = DistanceMetric::L2;
+            let mut initial_cap = 1000;
+
+            while *i < args.len() {
+                let opt = args[*i].to_ascii_uppercase();
+                match opt.as_slice() {
+                    b"FLAT" => {
+                        algorithm = VectorAlgorithm::Flat;
+                        *i += 1;
+                    }
+                    b"HNSW" => {
+                        algorithm = VectorAlgorithm::Hnsw;
+                        *i += 1;
+                    }
+                    b"DIM" => {
+                        *i += 1;
+                        if *i < args.len() {
+                            dim = parse_int(&args[*i]).unwrap_or(128) as usize;
+                            *i += 1;
+                        }
+                    }
+                    b"DISTANCE_METRIC" => {
+                        *i += 1;
+                        if *i < args.len() {
+                            distance_metric =
+                                DistanceMetric::from_bytes(&args[*i]).unwrap_or(DistanceMetric::L2);
+                            *i += 1;
+                        }
+                    }
+                    b"INITIAL_CAP" => {
+                        *i += 1;
+                        if *i < args.len() {
+                            initial_cap = parse_int(&args[*i]).unwrap_or(1000) as usize;
+                            *i += 1;
+                        }
+                    }
+                    b"TYPE" | b"M" | b"EF_CONSTRUCTION" | b"EF_RUNTIME" | b"EPSILON" => {
+                        // Skip HNSW-specific params
+                        *i += 2;
+                    }
+                    _ => break,
+                }
+            }
+
+            FieldType::Vector {
+                algorithm,
+                dim,
+                distance_metric,
+                initial_cap,
+            }
+        }
+        _ => return Err(Error::Syntax),
+    };
+
+    Ok(SchemaField {
+        name: field_name,
+        alias,
+        field_type,
+    })
+}
+
 /// Execute search commands (FT.* commands)
 pub fn execute(store: &Store, cmd: &[u8], args: &[Bytes]) -> Result<RespValue> {
     // All FT commands start with "FT."
@@ -142,236 +380,8 @@ fn cmd_ft_create(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 
     // Parse SCHEMA
     while i < args.len() {
-        let field_name = args[i].clone();
-        i += 1;
-
-        // Check for AS alias
-        let mut alias = None;
-        if i < args.len() && eq_ignore_ascii_case(&args[i], b"AS") {
-            i += 1;
-            if i >= args.len() {
-                return Err(Error::Syntax);
-            }
-            alias = Some(args[i].clone());
-            i += 1;
-        }
-
-        if i >= args.len() {
-            return Err(Error::Syntax);
-        }
-
-        // Parse field type
-        let type_arg = args[i].to_ascii_uppercase();
-        i += 1;
-
-        let field_type = match type_arg.as_slice() {
-            b"TEXT" => {
-                let mut weight = 1.0;
-                let mut nostem = false;
-                let mut sortable = false;
-                let mut noindex = false;
-                let mut phonetic = None;
-
-                while i < args.len() {
-                    let opt = args[i].to_ascii_uppercase();
-                    match opt.as_slice() {
-                        b"WEIGHT" => {
-                            i += 1;
-                            if i < args.len() {
-                                weight = parse_float(&args[i]).unwrap_or(1.0);
-                                i += 1;
-                            }
-                        }
-                        b"NOSTEM" => {
-                            nostem = true;
-                            i += 1;
-                        }
-                        b"SORTABLE" => {
-                            sortable = true;
-                            i += 1;
-                        }
-                        b"UNF" => {
-                            i += 1;
-                        } // Skip UNF
-                        b"NOINDEX" => {
-                            noindex = true;
-                            i += 1;
-                        }
-                        b"PHONETIC" => {
-                            i += 1;
-                            if i < args.len() {
-                                phonetic = Some(String::from_utf8_lossy(&args[i]).into_owned());
-                                i += 1;
-                            }
-                        }
-                        b"WITHSUFFIXTRIE" => {
-                            i += 1;
-                        }
-                        _ => break,
-                    }
-                }
-
-                FieldType::Text {
-                    weight,
-                    nostem,
-                    phonetic,
-                    sortable,
-                    noindex,
-                }
-            }
-            b"TAG" => {
-                let mut separator = ',';
-                let mut casesensitive = false;
-                let mut sortable = false;
-                let mut noindex = false;
-
-                while i < args.len() {
-                    let opt = args[i].to_ascii_uppercase();
-                    match opt.as_slice() {
-                        b"SEPARATOR" => {
-                            i += 1;
-                            if i < args.len() && !args[i].is_empty() {
-                                separator = args[i][0] as char;
-                                i += 1;
-                            }
-                        }
-                        b"CASESENSITIVE" => {
-                            casesensitive = true;
-                            i += 1;
-                        }
-                        b"SORTABLE" => {
-                            sortable = true;
-                            i += 1;
-                        }
-                        b"UNF" => {
-                            i += 1;
-                        }
-                        b"NOINDEX" => {
-                            noindex = true;
-                            i += 1;
-                        }
-                        b"WITHSUFFIXTRIE" => {
-                            i += 1;
-                        }
-                        _ => break,
-                    }
-                }
-
-                FieldType::Tag {
-                    separator,
-                    casesensitive,
-                    sortable,
-                    noindex,
-                }
-            }
-            b"NUMERIC" => {
-                let mut sortable = false;
-                let mut noindex = false;
-
-                while i < args.len() {
-                    let opt = args[i].to_ascii_uppercase();
-                    match opt.as_slice() {
-                        b"SORTABLE" => {
-                            sortable = true;
-                            i += 1;
-                        }
-                        b"UNF" => {
-                            i += 1;
-                        }
-                        b"NOINDEX" => {
-                            noindex = true;
-                            i += 1;
-                        }
-                        _ => break,
-                    }
-                }
-
-                FieldType::Numeric { sortable, noindex }
-            }
-            b"GEO" => {
-                let mut sortable = false;
-                let mut noindex = false;
-
-                while i < args.len() {
-                    let opt = args[i].to_ascii_uppercase();
-                    match opt.as_slice() {
-                        b"SORTABLE" => {
-                            sortable = true;
-                            i += 1;
-                        }
-                        b"NOINDEX" => {
-                            noindex = true;
-                            i += 1;
-                        }
-                        _ => break,
-                    }
-                }
-
-                FieldType::Geo { sortable, noindex }
-            }
-            b"VECTOR" => {
-                // VECTOR FLAT|HNSW dim DIM distance_metric DISTANCE_METRIC ...
-                let mut algorithm = VectorAlgorithm::Flat;
-                let mut dim = 128;
-                let mut distance_metric = DistanceMetric::L2;
-                let mut initial_cap = 1000;
-
-                while i < args.len() {
-                    let opt = args[i].to_ascii_uppercase();
-                    match opt.as_slice() {
-                        b"FLAT" => {
-                            algorithm = VectorAlgorithm::Flat;
-                            i += 1;
-                        }
-                        b"HNSW" => {
-                            algorithm = VectorAlgorithm::Hnsw;
-                            i += 1;
-                        }
-                        b"DIM" => {
-                            i += 1;
-                            if i < args.len() {
-                                dim = parse_int(&args[i]).unwrap_or(128) as usize;
-                                i += 1;
-                            }
-                        }
-                        b"DISTANCE_METRIC" => {
-                            i += 1;
-                            if i < args.len() {
-                                distance_metric = DistanceMetric::from_bytes(&args[i])
-                                    .unwrap_or(DistanceMetric::L2);
-                                i += 1;
-                            }
-                        }
-                        b"INITIAL_CAP" => {
-                            i += 1;
-                            if i < args.len() {
-                                initial_cap = parse_int(&args[i]).unwrap_or(1000) as usize;
-                                i += 1;
-                            }
-                        }
-                        b"TYPE" | b"M" | b"EF_CONSTRUCTION" | b"EF_RUNTIME" | b"EPSILON" => {
-                            // Skip HNSW-specific params
-                            i += 2;
-                        }
-                        _ => break,
-                    }
-                }
-
-                FieldType::Vector {
-                    algorithm,
-                    dim,
-                    distance_metric,
-                    initial_cap,
-                }
-            }
-            _ => return Err(Error::Syntax),
-        };
-
-        schema.push(SchemaField {
-            name: field_name,
-            alias,
-            field_type,
-        });
+        let field = parse_schema_field(args, &mut i)?;
+        schema.push(field);
     }
 
     if schema.is_empty() {
@@ -771,11 +781,44 @@ fn cmd_ft_aliasupdate(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 }
 
 /// FT.ALTER index [SKIPINITIALSCAN] SCHEMA ADD field options
-fn cmd_ft_alter(_store: &Store, args: &[Bytes]) -> Result<RespValue> {
-    if args.is_empty() {
+fn cmd_ft_alter(store: &Store, args: &[Bytes]) -> Result<RespValue> {
+    if args.len() < 2 {
         return Err(Error::WrongArity("FT.ALTER"));
     }
-    // Simplified: just acknowledge the command
+
+    let index_name = &args[0];
+    let mut i = 1;
+    let mut skip_initial_scan = false;
+
+    if i < args.len() && eq_ignore_ascii_case(&args[i], b"SKIPINITIALSCAN") {
+        skip_initial_scan = true;
+        i += 1;
+    }
+
+    if i >= args.len() || !eq_ignore_ascii_case(&args[i], b"SCHEMA") {
+        return Err(Error::Syntax);
+    }
+    i += 1;
+
+    if i >= args.len() || !eq_ignore_ascii_case(&args[i], b"ADD") {
+        return Err(Error::Syntax);
+    }
+    i += 1;
+
+    // Parse new fields
+    let mut schema = Vec::new();
+    while i < args.len() {
+        let field = parse_schema_field(args, &mut i)?;
+        schema.push(field);
+    }
+
+    if schema.is_empty() {
+        return Err(Error::Custom(
+            "Must specify at least one field to add".into(),
+        ));
+    }
+
+    store.ft_alter(index_name, skip_initial_scan, schema)?;
     Ok(RespValue::ok())
 }
 

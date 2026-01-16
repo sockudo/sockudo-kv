@@ -343,13 +343,7 @@ sockudo-kv v7.0.0 - High-performance Redis-compatible server
         config.databases,
     ));
     let pubsub = Arc::new(PubSub::new());
-    let clients = if let Some(pass) = &config.requirepass {
-        Arc::new(ClientManager::with_password(bytes::Bytes::from(
-            pass.clone(),
-        )))
-    } else {
-        Arc::new(ClientManager::new())
-    };
+    let clients = Arc::new(ClientManager::new());
     let server_state = Arc::new(ServerState::new());
     let replication = Arc::new(sockudo_kv::ReplicationManager::with_backlog_size(
         config.repl_backlog_size,
@@ -988,7 +982,7 @@ where
                                 }
 
                                 // Check authentication
-                                if clients.requires_auth() && !client.is_authenticated() {
+                                if config.requirepass.is_some() && !client.is_authenticated() {
                                     let is_allowed = cmd.is_command(b"AUTH")
                                         || cmd.is_command(b"HELLO")
                                         || cmd.is_command(b"QUIT");
@@ -1083,7 +1077,7 @@ where
                                     );
                                 } else if is_connection_command(cmd_name) {
                                     // Handle connection commands
-                                    match connection::execute(client, clients, cmd_name, &cmd.args) {
+                                    match connection::execute(client, clients, server_state, cmd_name, &cmd.args) {
                                         Ok(ConnectionResult::Response(response)) => {
                                             if client.should_reply() {
                                                 response.write_to(&mut write_buf);
@@ -1197,7 +1191,7 @@ where
                                     } else if is_cluster_command(cmd_name) {
                                         // Handle cluster commands (CLUSTER, ASKING, READONLY, READWRITE)
                                         let store = multi_store.db(client.current_db());
-                                        match cluster_cmd::execute(cluster_state, client, &store, cmd_name, &cmd.args) {
+                                        match cluster_cmd::execute(cluster_state, client, clients, replication, &store, cmd_name, &cmd.args) {
                                             Ok(response) => {
                                                 if client.should_reply() {
                                                     response.write_to(&mut write_buf);

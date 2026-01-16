@@ -665,6 +665,10 @@ pub struct ClusterState {
     pub enabled: AtomicBool,
     /// Cluster state OK flag
     pub state_ok: AtomicBool,
+    /// My role (master/replica)
+    pub my_role: AtomicU8,
+    /// My master ID (if replica)
+    pub my_master_id: RwLock<Option<Bytes>>,
     /// Slots owned by this node (lock-free)
     pub slots: SlotBitmap,
     /// All known nodes (node_id -> node)
@@ -727,6 +731,8 @@ impl ClusterState {
             config_epoch: AtomicU64::new(0),
             enabled: AtomicBool::new(false),
             state_ok: AtomicBool::new(false),
+            my_role: AtomicU8::new(NodeRole::Master as u8),
+            my_master_id: RwLock::new(None),
             slots: SlotBitmap::new(),
             nodes: DashMap::new(),
             node_index_counter: AtomicU32::new(2), // 0=none, 1=self, 2+=others
@@ -808,12 +814,27 @@ impl ClusterState {
             .collect::<Vec<_>>()
             .join(" ");
 
+        let role = self.my_role.load(Ordering::Relaxed);
+        let (role_str, master_id_str) = if role == NodeRole::Master as u8 {
+            ("myself,master", "-".to_string())
+        } else {
+            let mid = self.my_master_id.read();
+            let m_str = if let Some(ref id) = *mid {
+                String::from_utf8_lossy(id).into_owned()
+            } else {
+                "-".to_string()
+            };
+            ("myself,slave", m_str)
+        };
+
         output.push_str(&format!(
-            "{} {}:{}@{} myself,master - 0 0 {} connected{}\n",
+            "{} {}:{}@{} {} {} 0 0 {} connected{}\n",
             String::from_utf8_lossy(&self.my_id),
             my_ip,
             my_port,
             my_port + 10000,
+            role_str,
+            master_id_str,
             self.config_epoch.load(Ordering::Relaxed),
             if slots_str.is_empty() {
                 "".to_string()
@@ -829,6 +850,24 @@ impl ClusterState {
         }
 
         output
+    }
+
+    /// Set this node as a replica of another node (myself)
+    pub fn become_replica(&self, master_id: &Bytes) {
+        // Update role
+        self.my_role
+            .store(NodeRole::Replica as u8, Ordering::Relaxed);
+
+        // Update master ID
+        *self.my_master_id.write() = Some(master_id.clone());
+
+        // Use helper to update internal node flags if possible, or just the global state
+        // In a full implementation, we would also:
+        // 1. Disconnect clients if needed
+        // 2. Start replication loop
+        // 3. Clear our slots (replicas don't own slots)
+        self.slots.clear_all();
+        self.slot_owners.clear_all();
     }
 
     // =========================================================================

@@ -163,6 +163,21 @@ impl Store {
         }
     }
 
+    /// Get last generated ID of a stream
+    #[inline]
+    pub fn xlastid(&self, key: &[u8]) -> Option<StreamId> {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    None
+                } else {
+                    entry_ref.1.data.as_stream().map(|s| s.last_id)
+                }
+            }
+            None => None,
+        }
+    }
+
     /// XDEL - Delete entries by ID
     /// Returns number of deleted entries
     #[inline]

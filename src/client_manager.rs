@@ -86,10 +86,6 @@ pub struct ClientManager {
     pause_write_only: AtomicBool,
     /// Server start time
     start_time: Instant,
-    /// Server password (None = no auth required)
-    password: Option<Bytes>,
-    /// Default password (for AUTH without username)
-    default_password: Option<Bytes>,
     /// Maximum number of clients (0 = unlimited)
     maxclients: AtomicU32,
 }
@@ -104,53 +100,14 @@ impl ClientManager {
             pause_until: AtomicU64::new(0),
             pause_write_only: AtomicBool::new(false),
             start_time: Instant::now(),
-            password: None,
-            default_password: None,
             maxclients: AtomicU32::new(0),
         }
-    }
-
-    /// Create manager with password
-    pub fn with_password(password: Bytes) -> Self {
-        Self {
-            clients: DashMap::with_capacity(1024),
-            next_id: AtomicU64::new(1),
-            paused: AtomicBool::new(false),
-            pause_until: AtomicU64::new(0),
-            pause_write_only: AtomicBool::new(false),
-            start_time: Instant::now(),
-            password: Some(password.clone()),
-            default_password: Some(password),
-            maxclients: AtomicU32::new(0),
-        }
-    }
-
-    /// Check if authentication is required
-    #[inline]
-    pub fn requires_auth(&self) -> bool {
-        self.password.is_some()
-    }
-
-    /// Validate password
-    #[inline]
-    pub fn validate_password(&self, password: &[u8]) -> bool {
-        match &self.default_password {
-            Some(p) => p.as_ref() == password,
-            None => true, // No password set = always valid
-        }
-    }
-
-    /// Validate username and password
-    #[inline]
-    pub fn validate_credentials(&self, _username: &[u8], password: &[u8]) -> bool {
-        // For now, only support default user
-        self.validate_password(password)
     }
 
     /// Register a new client
     /// Returns the client ID and shared state
     pub fn register(&self, addr: SocketAddr, sub_id: u64) -> Arc<ClientState> {
-        self.register_with_auth(addr, sub_id, self.requires_auth())
+        self.register_with_auth(addr, sub_id, false)
     }
 
     /// Register a new client with explicit auth requirement
@@ -352,14 +309,5 @@ mod tests {
 
         manager.unpause();
         assert!(!manager.is_paused());
-    }
-
-    #[test]
-    fn test_password_validation() {
-        let manager = ClientManager::with_password(Bytes::from_static(b"secret"));
-
-        assert!(manager.requires_auth());
-        assert!(manager.validate_password(b"secret"));
-        assert!(!manager.validate_password(b"wrong"));
     }
 }

@@ -1,4 +1,4 @@
-use crate::storage::dashtable::{DashTable, calculate_hash};
+use crate::storage::dashtable::{DashTable, Entry, calculate_hash};
 use bytes::Bytes;
 use dashmap::DashMap;
 use roaring::RoaringBitmap;
@@ -697,6 +697,52 @@ impl Store {
             |kv| calculate_hash(&kv.0),
         );
         Ok(())
+    }
+
+    /// Alter an existing search index
+    pub fn ft_alter(
+        &self,
+        index_name: &[u8],
+        _skip_initial_scan: bool,
+        schema_fields: Vec<SchemaField>,
+    ) -> Result<()> {
+        let indexes = self.search_indexes();
+        let h = calculate_hash(index_name);
+
+        match indexes.entry(h, |kv| kv.0 == index_name, |kv| calculate_hash(&kv.0)) {
+            Entry::Occupied(mut entry) => {
+                let index = &mut entry.get_mut().1;
+
+                for new_field in schema_fields {
+                    // Check name collision
+                    if index.schema.iter().any(|f| f.name == new_field.name) {
+                        return Err(Error::Custom(
+                            format!(
+                                "Duplicate field name: {}",
+                                String::from_utf8_lossy(&new_field.name)
+                            )
+                            .into(),
+                        ));
+                    }
+                    // Check alias collision
+                    if let Some(ref alias) = new_field.alias {
+                        if index.schema.iter().any(|f| f.alias.as_ref() == Some(alias)) {
+                            return Err(Error::Custom(
+                                format!(
+                                    "Duplicate field alias: {}",
+                                    String::from_utf8_lossy(alias)
+                                )
+                                .into(),
+                            ));
+                        }
+                    }
+
+                    index.schema.push(new_field);
+                }
+                Ok(())
+            }
+            Entry::Vacant(_) => Err(Error::Custom("Unknown Index name".into())),
+        }
     }
 
     /// Drop a search index

@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -274,6 +275,31 @@ impl AclUser {
         }
 
         // Not allowed by default
+        false
+    }
+
+    /// Validate password against user passwords
+    pub fn validate_password(&self, password: &[u8]) -> bool {
+        if self.nopass {
+            return true;
+        }
+
+        if self.passwords.is_empty() {
+            return false;
+        }
+
+        // Hash the input password using SHA256
+        let mut hasher = Sha256::new();
+        hasher.update(password);
+        let current_hash = hasher.finalize();
+
+        // Check against all stored password hashes
+        for stored_hash in &self.passwords {
+            if stored_hash.as_ref() == current_hash.as_slice() {
+                return true;
+            }
+        }
+
         false
     }
 

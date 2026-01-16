@@ -12,6 +12,7 @@ use crate::client::{ClientState, ClientType, ReplyMode, TrackingState};
 use crate::client_manager::{ClientManager, KillFilter};
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
+use crate::server_state::ServerState;
 
 /// Number of databases (Redis default)
 pub const NUM_DATABASES: u16 = 16;
@@ -31,6 +32,7 @@ pub enum ConnectionResult {
 pub fn execute(
     client: &Arc<ClientState>,
     manager: &Arc<ClientManager>,
+    server_state: &Arc<ServerState>,
     cmd: &[u8],
     args: &[Bytes],
 ) -> Result<ConnectionResult> {
@@ -40,9 +42,9 @@ pub fn execute(
         b"QUIT" => Ok(ConnectionResult::Quit(RespValue::ok())),
         b"RESET" => Ok(ConnectionResult::Response(cmd_reset(client))),
         b"SELECT" => cmd_select(client, args).map(ConnectionResult::Response),
-        b"AUTH" => cmd_auth(client, manager, args).map(ConnectionResult::Response),
+        b"AUTH" => cmd_auth(client, server_state, args).map(ConnectionResult::Response),
         b"CLIENT" => cmd_client(client, manager, args),
-        b"HELLO" => cmd_hello(client, manager, args).map(ConnectionResult::Response),
+        b"HELLO" => cmd_hello(client, manager, server_state, args).map(ConnectionResult::Response),
         _ => Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd).into_owned(),
         )),
@@ -103,7 +105,7 @@ fn cmd_select(client: &Arc<ClientState>, args: &[Bytes]) -> Result<RespValue> {
 /// AUTH [username] password
 fn cmd_auth(
     client: &Arc<ClientState>,
-    manager: &Arc<ClientManager>,
+    server_state: &Arc<ServerState>,
     args: &[Bytes],
 ) -> Result<RespValue> {
     if args.is_empty() || args.len() > 2 {
@@ -116,12 +118,32 @@ fn cmd_auth(
         (Some(&args[0]), &args[1])
     };
 
-    let valid = match username {
-        Some(user) => manager.validate_credentials(user, password),
-        None => manager.validate_password(password),
+    // Authenticate against ACL
+    let user_valid = match username {
+        Some(u) => {
+            if let Some(acl_user) = server_state.get_acl_user(u) {
+                acl_user.validate_password(password)
+            } else {
+                false // User not found
+            }
+        }
+        None => {
+            // AUTH <password> => authenticate as default user
+            if let Some(acl_user) = server_state.get_acl_user(b"default") {
+                acl_user.validate_password(password)
+            } else {
+                false // Should typically not happen if default user exists
+            }
+        }
     };
 
-    if valid {
+    if user_valid {
+        // Set authenticated user in client state
+        // If username was None, it's "default"
+        let authed_user = username
+            .cloned()
+            .unwrap_or_else(|| Bytes::from_static(b"default"));
+        *client.user.write() = authed_user;
         client.set_authenticated(true);
         Ok(RespValue::ok())
     } else {
@@ -686,17 +708,16 @@ fn cmd_client_unblock(manager: &Arc<ClientManager>, args: &[Bytes]) -> Result<Co
 
 // ==================== HELLO Command ====================
 
-/// HELLO [protover [AUTH username password] [SETNAME clientname]]
+/// HELLO [protover] [AUTH username password] [SETNAME name]
 fn cmd_hello(
     client: &Arc<ClientState>,
-    manager: &Arc<ClientManager>,
+    _manager: &Arc<ClientManager>,
+    server_state: &Arc<ServerState>,
     args: &[Bytes],
 ) -> Result<RespValue> {
     let mut protover: i64 = 2; // Default to RESP2
-
     let mut i = 0;
 
-    // Parse protocol version
     if !args.is_empty() {
         protover = std::str::from_utf8(&args[0])
             .map_err(|_| Error::NotInteger)?
@@ -721,12 +742,21 @@ fn cmd_hello(
                 let username = &args[i + 1];
                 let password = &args[i + 2];
 
-                if !manager.validate_credentials(username, password) {
+                // Auth with ACL
+                if let Some(acl_user) = server_state.get_acl_user(username) {
+                    if !acl_user.validate_password(password) {
+                        return Err(Error::Custom(
+                            "WRONGPASS invalid username-password pair".to_string(),
+                        ));
+                    }
+                } else {
                     return Err(Error::Custom(
                         "WRONGPASS invalid username-password pair".to_string(),
                     ));
                 }
+
                 client.set_authenticated(true);
+                *client.user.write() = username.clone();
                 i += 3;
             }
             b"SETNAME" => {
@@ -766,17 +796,18 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    fn make_test_client() -> (Arc<ClientState>, Arc<ClientManager>) {
+    fn make_test_client() -> (Arc<ClientState>, Arc<ClientManager>, Arc<ServerState>) {
         let manager = Arc::new(ClientManager::new());
+        let server_state = Arc::new(ServerState::new());
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
         let client = manager.register(addr, 1);
-        (client, manager)
+        (client, manager, server_state)
     }
 
     #[test]
     fn test_ping() {
-        let (client, manager) = make_test_client();
-        let result = execute(&client, &manager, b"PING", &[]).unwrap();
+        let (client, manager, server_state) = make_test_client();
+        let result = execute(&client, &manager, &server_state, b"PING", &[]).unwrap();
         match result {
             ConnectionResult::Response(r) => {
                 assert!(matches!(r, RespValue::SimpleString(_)));
@@ -787,8 +818,15 @@ mod tests {
 
     #[test]
     fn test_echo() {
-        let (client, manager) = make_test_client();
-        let result = execute(&client, &manager, b"ECHO", &[Bytes::from_static(b"hello")]).unwrap();
+        let (client, manager, server_state) = make_test_client();
+        let result = execute(
+            &client,
+            &manager,
+            &server_state,
+            b"ECHO",
+            &[Bytes::from_static(b"hello")],
+        )
+        .unwrap();
         match result {
             ConnectionResult::Response(r) => {
                 assert!(matches!(r, RespValue::BulkString(_)));
@@ -799,19 +837,39 @@ mod tests {
 
     #[test]
     fn test_select() {
-        let (client, manager) = make_test_client();
-        execute(&client, &manager, b"SELECT", &[Bytes::from_static(b"5")]).unwrap();
+        let (client, manager, server_state) = make_test_client();
+        execute(
+            &client,
+            &manager,
+            &server_state,
+            b"SELECT",
+            &[Bytes::from_static(b"5")],
+        )
+        .unwrap();
         assert_eq!(client.db(), 5);
 
         // Out of range
-        let err = execute(&client, &manager, b"SELECT", &[Bytes::from_static(b"20")]);
+        let err = execute(
+            &client,
+            &manager,
+            &server_state,
+            b"SELECT",
+            &[Bytes::from_static(b"20")],
+        );
         assert!(err.is_err());
     }
 
     #[test]
     fn test_client_id() {
-        let (client, manager) = make_test_client();
-        let result = execute(&client, &manager, b"CLIENT", &[Bytes::from_static(b"ID")]).unwrap();
+        let (client, manager, server_state) = make_test_client();
+        let result = execute(
+            &client,
+            &manager,
+            &server_state,
+            b"CLIENT",
+            &[Bytes::from_static(b"ID")],
+        )
+        .unwrap();
         match result {
             ConnectionResult::Response(RespValue::Integer(id)) => {
                 assert_eq!(id, client.id as i64);
@@ -822,11 +880,12 @@ mod tests {
 
     #[test]
     fn test_client_setname_getname() {
-        let (client, manager) = make_test_client();
+        let (client, manager, server_state) = make_test_client();
 
         execute(
             &client,
             &manager,
+            &server_state,
             b"CLIENT",
             &[Bytes::from_static(b"SETNAME"), Bytes::from_static(b"test")],
         )
@@ -835,6 +894,7 @@ mod tests {
         let result = execute(
             &client,
             &manager,
+            &server_state,
             b"CLIENT",
             &[Bytes::from_static(b"GETNAME")],
         )

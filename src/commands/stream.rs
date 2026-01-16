@@ -355,14 +355,10 @@ fn cmd_xread(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     let mut ids = Vec::with_capacity(num_streams);
     for (i, id_arg) in id_bytes.iter().enumerate() {
         if id_arg.as_ref() == b"$" {
-            // Get current last ID
-            let last_id = store.xlen(&keys[i]);
-            if last_id == 0 {
-                ids.push(StreamId::ZERO);
-            } else {
-                // This is a simplification - ideally we'd get the actual last ID
-                ids.push(StreamId::MAX);
-            }
+            // Get current last ID (or ZERO if not exists)
+            // Ideally should follow XREAD spec: if stream empty, use 0-0, else use last_id
+            let last_id = store.xlastid(&keys[i]).unwrap_or(StreamId::ZERO);
+            ids.push(last_id);
         } else {
             ids.push(parse_id(id_arg)?);
         }

@@ -7,15 +7,19 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 use crate::client::ClientState;
+use crate::client_manager::ClientManager;
 use crate::cluster_state::{CLUSTER_SLOTS, ClusterState, SlotState, key_hash_slot};
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
+use crate::replication::ReplicationManager;
 use crate::storage::Store;
 
 /// Execute a cluster command
 pub fn execute(
     cluster: &Arc<ClusterState>,
     client: &Arc<ClientState>,
+    client_manager: &Arc<ClientManager>,
+    replication: &Arc<ReplicationManager>,
     store: &Store,
     cmd: &[u8],
     args: &[Bytes],
@@ -37,7 +41,7 @@ pub fn execute(
 
     // CLUSTER subcommands
     if cmd.eq_ignore_ascii_case(b"CLUSTER") {
-        return cmd_cluster(cluster, client, store, args);
+        return cmd_cluster(cluster, client, client_manager, replication, store, args);
     }
 
     Err(Error::UnknownCommand(
@@ -72,7 +76,9 @@ fn cmd_readwrite(client: &Arc<ClientState>) -> Result<RespValue> {
 /// CLUSTER subcommands dispatcher
 fn cmd_cluster(
     cluster: &Arc<ClusterState>,
-    _client: &Arc<ClientState>,
+    client: &Arc<ClientState>,
+    client_manager: &Arc<ClientManager>,
+    replication: &Arc<ReplicationManager>,
     store: &Store,
     args: &[Bytes],
 ) -> Result<RespValue> {
@@ -176,7 +182,13 @@ fn cmd_cluster(
                 return cmd_cluster_replicas(cluster, subargs);
             }
             if subcmd.eq_ignore_ascii_case(b"REPLICATE") {
-                return cmd_cluster_replicate(cluster, subargs);
+                return cmd_cluster_replicate(
+                    cluster,
+                    client,
+                    client_manager,
+                    replication,
+                    subargs,
+                );
             }
             if subcmd.eq_ignore_ascii_case(b"RESET") {
                 return cmd_cluster_reset(cluster, subargs);
@@ -564,7 +576,13 @@ fn cmd_cluster_replicas(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<R
 }
 
 /// CLUSTER REPLICATE node-id - O(1)
-fn cmd_cluster_replicate(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<RespValue> {
+fn cmd_cluster_replicate(
+    cluster: &Arc<ClusterState>,
+    client: &Arc<ClientState>,
+    client_manager: &Arc<ClientManager>,
+    replication: &Arc<ReplicationManager>,
+    args: &[Bytes],
+) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::WrongArity("CLUSTER REPLICATE"));
     }
@@ -577,18 +595,26 @@ fn cmd_cluster_replicate(cluster: &Arc<ClusterState>, args: &[Bytes]) -> Result<
     }
 
     // Check if master exists in cluster
-    if !cluster.nodes.contains_key(master_id) {
+    let (ip, port) = if let Some(node) = cluster.nodes.get(master_id) {
+        (node.ip.clone(), node.port)
+    } else {
         return Err(Error::Custom("ERR Unknown node".to_string()));
-    }
+    };
 
-    // For this node itself (not in nodes map), we need to update our own state
-    // This is a simplification - in real Redis, we'd update global state differently
-    // For now, return OK since the master is valid
+    // 1. Update our own role and state
+    cluster.become_replica(master_id);
 
-    // Note: In a full implementation, we'd need to:
-    // 1. Stop serving writes
-    // 2. Connect to master for replication
-    // 3. Update our own role in cluster state
+    // 2. Start replication loop
+    replication.set_replica_of(Some(ip), Some(port));
+
+    // 3. Disconnect other clients (write safety)
+    // Kill all clients except ourselves command connection
+    use crate::client_manager::KillFilter;
+    let filter = KillFilter {
+        skipme: true,
+        ..Default::default()
+    };
+    client_manager.kill_clients(&filter, client.id);
 
     Ok(RespValue::ok())
 }
