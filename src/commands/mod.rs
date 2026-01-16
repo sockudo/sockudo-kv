@@ -1,3 +1,7 @@
+//! Redis command implementations
+//!
+//! This module contains all Redis-compatible command implementations organized by category.
+
 pub mod bitmap;
 pub mod cluster;
 pub mod connection;
@@ -5,27 +9,35 @@ pub mod generic;
 pub mod geo;
 pub mod hash;
 pub mod hyperloglog;
-pub mod json;
 pub mod list;
 pub mod pubsub;
 pub mod scripting;
-pub mod search;
 pub mod server;
 pub mod set;
 pub mod sorted_set;
 pub mod stream;
 pub mod string;
-pub mod timeseries;
 pub mod transaction;
-pub mod vector;
 
-use bytes::Bytes;
-use std::sync::Arc;
+// Optional modules (enabled via Cargo features)
+#[cfg(feature = "json")]
+pub mod json;
+
+#[cfg(feature = "search")]
+pub mod search;
+
+#[cfg(feature = "timeseries")]
+pub mod timeseries;
+
+#[cfg(feature = "vector")]
+pub mod vector;
 
 use crate::error::{Error, Result};
 use crate::protocol::{Command, RespValue};
 use crate::server_state::ServerState;
 use crate::storage::Store;
+use bytes::Bytes;
+use std::sync::Arc;
 
 /// Command dispatcher - routes commands to appropriate handlers
 pub struct Dispatcher;
@@ -273,16 +285,19 @@ impl Dispatcher {
         }
 
         // JSON commands (check if starts with JSON.)
+        #[cfg(feature = "json")]
         if cmd_name.len() > 5 && cmd_name[..5].eq_ignore_ascii_case(b"JSON.") {
             return json::execute(store, cmd_name, args);
         }
 
         // TimeSeries commands (check if starts with TS.)
+        #[cfg(feature = "timeseries")]
         if cmd_name.len() > 3 && cmd_name[..3].eq_ignore_ascii_case(b"TS.") {
             return timeseries::execute(store, cmd_name, args);
         }
 
         // Search commands (check if starts with FT.)
+        #[cfg(feature = "search")]
         if cmd_name.len() > 3 && cmd_name[..3].eq_ignore_ascii_case(b"FT.") {
             return search::execute(store, cmd_name, args);
         }
@@ -311,6 +326,7 @@ impl Dispatcher {
         }
 
         // Vector commands (VADD, VCARD, VDIM, VEMB, VGETATTR, VINFO, VISMEMBER, VLINKS, VRANDMEMBER, VRANGE, VREM, VSETATTR, VSIM)
+        #[cfg(feature = "vector")]
         if !cmd_name.is_empty() && (cmd_name[0] == b'V' || cmd_name[0] == b'v') {
             match vector::execute(store, cmd_name, args) {
                 Ok(resp) => return Ok(resp),

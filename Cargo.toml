@@ -2,6 +2,32 @@
 name = "sockudo-kv"
 version = "1.0.0"
 edition = "2024"
+authors = ["Radu Diaconu <radu@sockudo.io>"]
+description = "A high-performance Redis-compatible key-value store"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sockudo/sockudo-kv"
+
+# Binary targets
+# Following Redis model: both binaries use the same code and check argv[0]
+[[bin]]
+name = "sockudo-kv"
+path = "src/main.rs"
+
+[[bin]]
+name = "sockudo-kv-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "sockudo-kv-sentinel"
+path = "src/main.rs"
+
+[features]
+default = ["search", "json", "timeseries", "vector"]
+# Optional modules (like Redis modules)
+search = []     # RediSearch-like full-text search
+json = []       # RedisJSON-like JSON operations
+timeseries = [] # RedisTimeSeries-like time-series data
+vector = []     # Vector similarity search
 
 [dependencies]
 tokio = { version = "1", features = [
@@ -12,6 +38,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "signal",
+    "process",
 ] }
 clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
@@ -65,3 +92,4 @@ opt-level = 1
 
 [dev-dependencies]
 sweep-bptree = "0.4.0"
+tempfile = "3.24.0"

@@ -46,6 +46,37 @@ const WRITE_BUF_SIZE: usize = 64 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Check if running in sentinel mode (Redis approach)
+    // 1. Check if binary name contains "sentinel"
+    // 2. Check if --sentinel flag is present
+    // 3. Check if first arg is sentinel.conf
+
+    let args: Vec<String> = std::env::args().collect();
+    let program_name = args.get(0).map(|s| s.as_str()).unwrap_or("");
+    let is_sentinel_binary = program_name.contains("sentinel");
+    let has_sentinel_flag = args.iter().any(|arg| arg == "--sentinel");
+
+    // Determine sentinel mode
+    let sentinel_mode = is_sentinel_binary || has_sentinel_flag;
+
+    if sentinel_mode {
+        // Get config file (default to sentinel.conf)
+        let config_path = args
+            .get(1)
+            .filter(|arg| !arg.starts_with("--"))
+            .map(|s| s.as_str())
+            .unwrap_or("sentinel.conf");
+
+        println!("Running in Sentinel mode");
+        return sockudo_kv::sentinel_main::start_sentinel(Path::new(config_path)).await;
+    }
+
+    // Normal Redis server mode
+    start_server().await
+}
+
+/// Main server startup function
+pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
     let config = sockudo_kv::cli::Cli::load_config().unwrap_or_else(|e| {
         eprintln!("Error loading config: {}", e);
         std::process::exit(1);
