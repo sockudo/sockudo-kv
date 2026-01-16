@@ -1534,6 +1534,7 @@ dependencies = [
  "hex",
  "itertools",
  "itoa",
+ "libc",
  "log",
  "lru",
  "memchr",

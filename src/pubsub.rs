@@ -8,11 +8,10 @@
 
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
-use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 
-use crate::glob_trie::GlobTrie;
+use crate::glob_trie::DashGlobTrie;
 
 /// Message types for Pub/Sub
 #[derive(Clone, Debug)]
@@ -77,7 +76,7 @@ pub struct PubSub {
     /// sharded channel -> set of subscriber IDs
     sharded_channels: DashMap<Bytes, DashSet<u64>>,
     /// pattern -> set of subscriber IDs
-    patterns: RwLock<GlobTrie<DashSet<u64>>>,
+    patterns: DashGlobTrie<DashSet<u64>>,
     /// subscriber ID -> Subscriber
     subscribers: DashMap<u64, Subscriber>,
     /// Next subscriber ID
@@ -89,7 +88,7 @@ impl PubSub {
         Self {
             channels: DashMap::new(),
             sharded_channels: DashMap::new(),
-            patterns: RwLock::new(GlobTrie::new()),
+            patterns: DashGlobTrie::new(),
             subscribers: DashMap::new(),
             next_id: AtomicU64::new(1),
         }
@@ -120,12 +119,11 @@ impl PubSub {
             }
             // Remove from all patterns
             for pattern in sub.patterns.iter() {
-                let mut patterns = self.patterns.write();
                 #[allow(clippy::explicit_auto_deref)]
-                if let Some(subs) = patterns.get_mut(&*pattern) {
+                if let Some(subs) = self.patterns.get_mut(&*pattern) {
                     subs.remove(&id);
                     if subs.is_empty() {
-                        patterns.remove(&*pattern);
+                        self.patterns.remove(&*pattern);
                     }
                 }
             }
@@ -195,7 +193,6 @@ impl PubSub {
 
                 // Add subscriber to pattern's set
                 self.patterns
-                    .write()
                     .insert(pattern.clone(), DashSet::new)
                     .insert(id);
 
@@ -222,11 +219,10 @@ impl PubSub {
                 sub.patterns.remove(&pattern);
 
                 // Remove subscriber from pattern's set
-                let mut patterns = self.patterns.write();
-                if let Some(subs) = patterns.get_mut(&pattern) {
+                if let Some(subs) = self.patterns.get_mut(&pattern) {
                     subs.remove(&id);
                     if subs.is_empty() {
-                        patterns.remove(&pattern);
+                        self.patterns.remove(&pattern);
                     }
                 }
 
@@ -261,8 +257,7 @@ impl PubSub {
         }
 
         // Deliver to pattern subscribers
-        let patterns = self.patterns.read();
-        let matches = patterns.matches(channel);
+        let matches = self.patterns.matches(channel);
 
         for (pat, subs) in matches {
             for sub_id in subs.iter() {
@@ -294,14 +289,11 @@ impl PubSub {
             return true;
         }
 
-        // Check pattern matches
-        // Note: This acquires a read lock on patterns, so it's not strictly wait-free but efficient
-        let patterns = self.patterns.read();
         // Since we don't have an "any_match" API in GlobTrie yet, we rely on matches() check or existence
         // For keyspace events, meaningful patterns are typically `__key*` or `*`
         // If we have ANY patterns, we assume yes to be safe/simple, OR we check properly.
         // Let's check properly:
-        !patterns.matches(channel).is_empty()
+        !self.patterns.matches(channel).is_empty()
     }
 
     /// Subscribe to sharded channels
@@ -416,7 +408,7 @@ impl PubSub {
 
     /// Get number of unique patterns
     pub fn numpat(&self) -> usize {
-        self.patterns.read().len()
+        self.patterns.len()
     }
 
     /// Check if subscriber is in pubsub mode
@@ -548,5 +540,48 @@ mod tests {
         assert!(!pattern_matches(b"h[ae]llo", b"hillo"));
         assert!(pattern_matches(b"news.*", b"news.sports"));
         assert!(pattern_matches(b"user.[0-9]*", b"user.123"));
+    }
+
+    #[test]
+    fn test_pubsub_publish_message_single_subscriber() {
+        let pubsub = PubSub::new();
+        let (id, mut rx) = pubsub.register();
+        let counts = pubsub.subscribe(id, &[Bytes::from_static(b"chan")]);
+        assert_eq!(counts, vec![1]);
+
+        let sent = pubsub.publish(b"chan", Bytes::from_static(b"hello"));
+        assert_eq!(sent, 1);
+
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            PubSubMessage::Message { channel, message } => {
+                assert_eq!(channel, Bytes::from_static(b"chan"));
+                assert_eq!(message, Bytes::from_static(b"hello"));
+            }
+            _ => panic!("unexpected message type"),
+        }
+    }
+
+    #[test]
+    fn test_pubsub_publish_message_multiple_subscribers() {
+        let pubsub = PubSub::new();
+        let (id1, mut rx1) = pubsub.register();
+        let (id2, mut rx2) = pubsub.register();
+        pubsub.subscribe(id1, &[Bytes::from_static(b"chan")]);
+        pubsub.subscribe(id2, &[Bytes::from_static(b"chan")]);
+
+        let sent = pubsub.publish(b"chan", Bytes::from_static(b"hi"));
+        assert_eq!(sent, 2);
+
+        for rx in [&mut rx1, &mut rx2] {
+            let msg = rx.try_recv().unwrap();
+            match msg {
+                PubSubMessage::Message { channel, message } => {
+                    assert_eq!(channel, Bytes::from_static(b"chan"));
+                    assert_eq!(message, Bytes::from_static(b"hi"));
+                }
+                _ => panic!("unexpected message type"),
+            }
+        }
     }
 }

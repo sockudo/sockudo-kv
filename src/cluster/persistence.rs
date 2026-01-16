@@ -2,10 +2,10 @@
 //!
 //! Saves and loads cluster state to/from the nodes.conf file.
 //! Format is Redis-compatible:
-//! ```
-//! <node-id> <ip:port@cport> <flags> <master-id|-0> <ping-sent> <pong-recv> <config-epoch> <link-state> <slot>...
+//! `
+//!  <node-id> <ip:port@cport> <flags> <master-id|-0> <ping-sent> <pong-recv> <config-epoch> <link-state> <slot>...
 //! vars currentEpoch <epoch> lastVoteEpoch 0
-//! ```
+//! `
 
 use bytes::Bytes;
 use log::info;

@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use parking_lot::{RwLock, RwLockWriteGuard, lock_api::MappedRwLockWriteGuard};
 use std::collections::HashMap;
 
 /// A node in the GlobTrie
@@ -349,5 +350,55 @@ impl<V> GlobTrie<V> {
 
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+}
+
+pub struct DashGlobTrie<V>(RwLock<GlobTrie<V>>);
+
+impl<V> DashGlobTrie<V> {
+    pub fn new() -> Self {
+        Self(RwLock::new(GlobTrie::new()))
+    }
+
+    pub fn insert(
+        &self,
+        pattern: Bytes,
+        default_val: impl FnOnce() -> V,
+    ) -> MappedRwLockWriteGuard<'_, parking_lot::RawRwLock, V> {
+        RwLockWriteGuard::map(self.0.write(), |t| t.insert(pattern, default_val))
+    }
+
+    pub fn remove(&self, pattern: &[u8]) -> Option<V> {
+        self.0.write().remove(pattern)
+    }
+
+    pub fn matches(&self, text: &[u8]) -> Vec<(Bytes, V)>
+    where
+        V: Clone,
+    {
+        let guard = self.0.read();
+        guard
+            .matches(text)
+            .into_iter()
+            .map(|(pat, val)| (pat.clone(), val.clone()))
+            .collect()
+    }
+
+    pub fn get_mut(
+        &self,
+        pattern: &[u8],
+    ) -> Option<MappedRwLockWriteGuard<'_, parking_lot::RawRwLock, V>> {
+        let mut guard = self.0.write();
+        if guard.get_mut(pattern).is_some() {
+            Some(RwLockWriteGuard::map(guard, |t| {
+                t.get_mut(pattern).unwrap()
+            }))
+        } else {
+            None
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.read().len()
     }
 }
