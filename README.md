@@ -177,7 +177,6 @@ maxmemory-policy allkeys-lru
 | Option | Reason |
 |--------|--------|
 | `loadmodule` | Module system API not implemented |
-| `sentinel` | Sentinel mode not implemented |
 | `debug` | Command partially implemented (some subcommands missing) |
 
 
