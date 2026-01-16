@@ -188,6 +188,7 @@ impl Store {
             }
             DataType::HashPacked(lp) => DataType::HashPacked(lp.clone()),
             DataType::SortedSetPacked(lp) => DataType::SortedSetPacked(lp.clone()),
+            DataType::BloomFilter(bf) => DataType::BloomFilter(bf.clone()),
         };
 
         let new_entry = Entry::new(cloned_data);
@@ -441,6 +442,7 @@ impl Store {
             DataType::Json(_) => 7,
             DataType::TimeSeries(_) => 8,
             DataType::VectorSet(_) => 9,
+            DataType::BloomFilter(_) => 10,
         };
         data.push(type_byte);
 
@@ -507,6 +509,11 @@ impl Store {
                     data.extend_from_slice(&member);
                     data.extend_from_slice(&score.to_le_bytes());
                 }
+            }
+            DataType::BloomFilter(bf) => {
+                let bytes = bf.to_bytes();
+                write_varint(&mut data, bytes.len() as u64);
+                data.extend_from_slice(&bytes);
             }
             _ => {}
         }
@@ -616,6 +623,18 @@ impl Store {
                     hash.insert_unique(h, (k, v), |kv| calculate_hash(&kv.0));
                 }
                 DataType::Hash(hash)
+            }
+            10 => {
+                // Bloom Filter
+                let (len, new_pos) = read_varint(data, pos).map_err(|e| e.to_string())?;
+                pos = new_pos;
+                if pos + len as usize > data_len - 8 {
+                    return Err("ERR invalid bloom filter length".into());
+                }
+                let bf_data = &data[pos..pos + len as usize];
+                let bf = crate::storage::bloomfilter::ScalableBloomFilter::from_bytes(bf_data)
+                    .ok_or("ERR invalid bloom filter data")?;
+                DataType::BloomFilter(Box::new(bf))
             }
             _ => return Err("ERR unsupported data type for restore".into()),
         };

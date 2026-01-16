@@ -5,6 +5,7 @@
 //! for a specific Redis data type.
 
 pub mod bitmap_ops;
+pub mod bloom_ops;
 pub mod generic_ops;
 pub mod geo_ops;
 pub mod hash_ops;

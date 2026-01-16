@@ -36,6 +36,8 @@ pub enum DataType {
     TimeSeries(Box<super::timeseries::TimeSeries>),
     /// VectorSet - HNSW-based vector similarity search
     VectorSet(Box<VectorSetData>),
+    /// BloomFilter - probabilistic set membership
+    BloomFilter(Box<super::bloomfilter::ScalableBloomFilter>),
 }
 
 impl std::fmt::Debug for DataType {
@@ -54,6 +56,7 @@ impl std::fmt::Debug for DataType {
             DataType::Json(j) => f.debug_tuple("Json").field(j).finish(),
             DataType::TimeSeries(ts) => f.debug_tuple("TimeSeries").field(ts).finish(),
             DataType::VectorSet(v) => f.debug_tuple("VectorSet").field(v).finish(),
+            DataType::BloomFilter(bf) => f.debug_tuple("BloomFilter").field(bf).finish(),
         }
     }
 }
@@ -73,6 +76,7 @@ impl DataType {
             DataType::Json(_) => "ReJSON-RL",
             DataType::TimeSeries(_) => "TSDB-TYPE",
             DataType::VectorSet(_) => "vectorset",
+            DataType::BloomFilter(_) => "MBbloom--",
         }
     }
 
@@ -272,6 +276,22 @@ impl DataType {
     pub fn as_vectorset_mut(&mut self) -> Option<&mut VectorSetData> {
         match self {
             DataType::VectorSet(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_bloomfilter(&self) -> Option<&super::bloomfilter::ScalableBloomFilter> {
+        match self {
+            DataType::BloomFilter(bf) => Some(bf),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_bloomfilter_mut(&mut self) -> Option<&mut super::bloomfilter::ScalableBloomFilter> {
+        match self {
+            DataType::BloomFilter(bf) => Some(bf),
             _ => None,
         }
     }

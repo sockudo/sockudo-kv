@@ -24,6 +24,9 @@ pub mod quicklist;
 // Ultra-high-performance TimeSeries with Gorilla compression
 pub mod timeseries;
 
+// Ultra-high-performance Bloom Filter
+pub mod bloomfilter;
+
 // Import all operation modules - each adds methods to Store via impl blocks
 pub mod eviction;
 pub mod ops;

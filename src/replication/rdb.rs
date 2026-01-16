@@ -225,7 +225,10 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
             write_string(rdb, &Bytes::from(json_str));
         }
         // Stream, TimeSeries, VectorSet - serialize as minimal representation
-        DataType::Stream(_) | DataType::TimeSeries(_) | DataType::VectorSet(_) => {
+        DataType::Stream(_)
+        | DataType::TimeSeries(_)
+        | DataType::VectorSet(_)
+        | DataType::BloomFilter(_) => {
             // Skip complex types for now - they need special handling
             // or implement simplified representation
         }

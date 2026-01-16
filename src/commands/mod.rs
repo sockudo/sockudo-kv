@@ -32,6 +32,8 @@ pub mod timeseries;
 #[cfg(feature = "vector")]
 pub mod vector;
 
+pub mod bloom;
+
 use crate::error::{Error, Result};
 use crate::protocol::{Command, RespValue};
 use crate::server_state::ServerState;
@@ -335,6 +337,11 @@ impl Dispatcher {
             }
         }
 
+        // Bloom Filter
+        if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"BF.") {
+            return bloom::execute(store, cmd_name, args);
+        }
+
         Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd_name).into_owned(),
         ))
@@ -491,7 +498,8 @@ fn is_write_command(cmd: &[u8]) -> bool {
         | "HSETNX" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "ZADD" | "ZREM" | "ZINCRBY"
         | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZPOPMAX" | "ZPOPMIN" | "FLUSHDB"
         | "FLUSHALL" | "RESTORE" | "RENAME" | "RENAMENX" | "APPEND" | "INCR" | "DECR"
-        | "INCRBY" | "DECRBY" | "INCRBYFLOAT" => true,
+        | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "BF.RESERVE" | "BF.ADD" | "BF.MADD"
+        | "BF.INSERT" | "BF.LOADCHUNK" => true,
         _ => false,
     }
 }
