@@ -50,6 +50,7 @@ pub mod topk;
 
 use crate::error::{Error, Result};
 use crate::protocol::{Command, RespValue};
+use crate::replication::ReplicationManager;
 use crate::server_state::ServerState;
 use crate::storage::{MultiStore, Store};
 use bytes::Bytes;
@@ -65,9 +66,10 @@ impl Dispatcher {
         multi_store: &Arc<MultiStore>,
         store: &Store,
         server: &Arc<ServerState>,
+        replication: Option<&Arc<ReplicationManager>>,
         cmd: Command,
     ) -> RespValue {
-        match Self::execute_inner(Some(multi_store), store, Some(server), &cmd) {
+        match Self::execute_inner(Some(multi_store), store, Some(server), replication, &cmd) {
             Ok(resp) => resp,
             Err(e) => RespValue::error(&e.to_string()),
         }
@@ -77,7 +79,7 @@ impl Dispatcher {
     /// Server-specific commands will return an error in this mode
     #[inline]
     pub fn execute_basic(store: &Store, cmd: Command) -> RespValue {
-        match Self::execute_inner(None, store, None, &cmd) {
+        match Self::execute_inner(None, store, None, None, &cmd) {
             Ok(resp) => resp,
             Err(e) => RespValue::error(&e.to_string()),
         }
@@ -87,6 +89,7 @@ impl Dispatcher {
         multi_store: Option<&Arc<MultiStore>>,
         store: &Store,
         server: Option<&Arc<ServerState>>,
+        replication: Option<&Arc<ReplicationManager>>,
         cmd: &Command,
     ) -> Result<RespValue> {
         let args = &cmd.args;
@@ -265,130 +268,218 @@ impl Dispatcher {
         // Try each command module
         // Only continue to next module if it returns UnknownCommand
         // Other errors (WrongArity, Syntax, etc.) should be returned immediately
-        let cmd_name = cmd.name();
+        // Normalize command name to uppercase for module dispatch
+        let raw_name = cmd.name();
+        let cmd_name_owned;
+        let cmd_name = if raw_name.iter().all(|b| !b.is_ascii_lowercase()) {
+            raw_name
+        } else {
+            cmd_name_owned = raw_name.to_ascii_uppercase();
+            &cmd_name_owned
+        };
 
-        match string::execute(store, cmd_name, args) {
-            Ok(resp) => return Ok(resp),
-            Err(Error::UnknownCommand(_)) => {}
-            Err(e) => return Err(e),
-        }
-        match list::execute(store, cmd_name, args) {
-            Ok(resp) => return Ok(resp),
-            Err(Error::UnknownCommand(_)) => {}
-            Err(e) => return Err(e),
-        }
-        match hash::execute(store, cmd_name, args) {
-            Ok(resp) => return Ok(resp),
-            Err(Error::UnknownCommand(_)) => {}
-            Err(e) => return Err(e),
-        }
-        match set::execute(store, cmd_name, args) {
-            Ok(resp) => return Ok(resp),
-            Err(Error::UnknownCommand(_)) => {}
-            Err(e) => return Err(e),
-        }
-        match sorted_set::execute(store, cmd_name, args) {
-            Ok(resp) => return Ok(resp),
-            Err(Error::UnknownCommand(_)) => {}
-            Err(e) => return Err(e),
-        }
-        match hyperloglog::execute(store, cmd_name, args) {
-            Ok(resp) => return Ok(resp),
-            Err(Error::UnknownCommand(_)) => {}
-            Err(e) => return Err(e),
-        }
-
-        // Bitmap commands (SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP, BITFIELD, BITFIELD_RO)
-        if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"BIT")
-            || cmd_name.eq_ignore_ascii_case(b"SETBIT")
-            || cmd_name.eq_ignore_ascii_case(b"GETBIT")
-        {
-            return bitmap::execute(store, cmd_name, args);
-        }
-
-        // JSON commands (check if starts with JSON.)
-        #[cfg(feature = "json")]
-        if cmd_name.len() > 5 && cmd_name[..5].eq_ignore_ascii_case(b"JSON.") {
-            return json::execute(store, cmd_name, args);
-        }
-
-        // TimeSeries commands (check if starts with TS.)
-        #[cfg(feature = "timeseries")]
-        if cmd_name.len() > 3 && cmd_name[..3].eq_ignore_ascii_case(b"TS.") {
-            return timeseries::execute(store, cmd_name, args);
-        }
-
-        // Search commands (check if starts with FT.)
-        #[cfg(feature = "search")]
-        if cmd_name.len() > 3 && cmd_name[..3].eq_ignore_ascii_case(b"FT.") {
-            return search::execute(store, cmd_name, args);
-        }
-
-        // Geo commands (check if starts with GEO)
-        if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"GEO") {
-            return geo::execute(store, cmd_name, args);
-        }
-
-        // Stream commands (check if starts with X)
-        if !cmd_name.is_empty() && (cmd_name[0] == b'X' || cmd_name[0] == b'x') {
-            return stream::execute(store, cmd_name, args);
-        }
-
-        // Scripting commands (EVAL, EVALSHA, SCRIPT, FUNCTION, FCALL)
-        if cmd_name.eq_ignore_ascii_case(b"EVAL")
-            || cmd_name.eq_ignore_ascii_case(b"EVAL_RO")
-            || cmd_name.eq_ignore_ascii_case(b"EVALSHA")
-            || cmd_name.eq_ignore_ascii_case(b"EVALSHA_RO")
-            || cmd_name.eq_ignore_ascii_case(b"SCRIPT")
-            || cmd_name.eq_ignore_ascii_case(b"FUNCTION")
-            || cmd_name.eq_ignore_ascii_case(b"FCALL")
-            || cmd_name.eq_ignore_ascii_case(b"FCALL_RO")
-        {
-            return scripting::execute(store, cmd_name, args);
-        }
-
-        // Vector commands (VADD, VCARD, VDIM, VEMB, VGETATTR, VINFO, VISMEMBER, VLINKS, VRANDMEMBER, VRANGE, VREM, VSETATTR, VSIM)
-        #[cfg(feature = "vector")]
-        if !cmd_name.is_empty() && (cmd_name[0] == b'V' || cmd_name[0] == b'v') {
-            match vector::execute(store, cmd_name, args) {
+        // Helper to execute specific modules
+        let execute_module = || -> Result<RespValue> {
+            match string::execute(store, cmd_name, args) {
                 Ok(resp) => return Ok(resp),
                 Err(Error::UnknownCommand(_)) => {}
                 Err(e) => return Err(e),
             }
+            match list::execute(store, cmd_name, args) {
+                Ok(resp) => return Ok(resp),
+                Err(Error::UnknownCommand(_)) => {}
+                Err(e) => return Err(e),
+            }
+            match hash::execute(store, cmd_name, args) {
+                Ok(resp) => return Ok(resp),
+                Err(Error::UnknownCommand(_)) => {}
+                Err(e) => return Err(e),
+            }
+            match set::execute(store, cmd_name, args) {
+                Ok(resp) => return Ok(resp),
+                Err(Error::UnknownCommand(_)) => {}
+                Err(e) => return Err(e),
+            }
+            match sorted_set::execute(store, cmd_name, args) {
+                Ok(resp) => return Ok(resp),
+                Err(Error::UnknownCommand(_)) => {}
+                Err(e) => return Err(e),
+            }
+            match hyperloglog::execute(store, cmd_name, args) {
+                Ok(resp) => return Ok(resp),
+                Err(Error::UnknownCommand(_)) => {}
+                Err(e) => return Err(e),
+            }
+
+            // Bitmap commands
+            if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"BIT")
+                || cmd_name.eq_ignore_ascii_case(b"SETBIT")
+                || cmd_name.eq_ignore_ascii_case(b"GETBIT")
+            {
+                return bitmap::execute(store, cmd_name, args);
+            }
+
+            // JSON commands
+            #[cfg(feature = "json")]
+            if cmd_name.len() > 5 && cmd_name[..5].eq_ignore_ascii_case(b"JSON.") {
+                return json::execute(store, cmd_name, args);
+            }
+
+            // TimeSeries commands
+            #[cfg(feature = "timeseries")]
+            if cmd_name.len() > 3 && cmd_name[..3].eq_ignore_ascii_case(b"TS.") {
+                return timeseries::execute(store, cmd_name, args);
+            }
+
+            // Search commands
+            #[cfg(feature = "search")]
+            if cmd_name.len() > 3 && cmd_name[..3].eq_ignore_ascii_case(b"FT.") {
+                return search::execute(store, cmd_name, args);
+            }
+
+            // Geo commands
+            if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"GEO") {
+                return geo::execute(store, cmd_name, args);
+            }
+
+            // Stream commands
+            if !cmd_name.is_empty() && (cmd_name[0] == b'X' || cmd_name[0] == b'x') {
+                return stream::execute(store, cmd_name, args);
+            }
+
+            // Scripting commands (EVAL, EVALSHA, SCRIPT, FUNCTION, FCALL)
+            if cmd_name.eq_ignore_ascii_case(b"EVAL")
+                || cmd_name.eq_ignore_ascii_case(b"EVAL_RO")
+                || cmd_name.eq_ignore_ascii_case(b"EVALSHA")
+                || cmd_name.eq_ignore_ascii_case(b"EVALSHA_RO")
+                || cmd_name.eq_ignore_ascii_case(b"SCRIPT")
+                || cmd_name.eq_ignore_ascii_case(b"FUNCTION")
+                || cmd_name.eq_ignore_ascii_case(b"FCALL")
+                || cmd_name.eq_ignore_ascii_case(b"FCALL_RO")
+            {
+                return scripting::execute(store, cmd_name, args);
+            }
+
+            // Vector commands
+            #[cfg(feature = "vector")]
+            if !cmd_name.is_empty() && (cmd_name[0] == b'V' || cmd_name[0] == b'v') {
+                match vector::execute(store, cmd_name, args) {
+                    Ok(resp) => return Ok(resp),
+                    Err(Error::UnknownCommand(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Bloom
+            #[cfg(feature = "bloom")]
+            {
+                if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"BF.") {
+                    return bloom::execute(store, cmd_name, args);
+                }
+                if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"CF.") {
+                    return cuckoo::execute(store, cmd_name, args);
+                }
+                if cmd_name.len() >= 8 && cmd_name[..8].eq_ignore_ascii_case(b"TDIGEST.") {
+                    return tdigest::execute(store, cmd_name, args);
+                }
+                if cmd_name.len() >= 5 && cmd_name[..5].eq_ignore_ascii_case(b"TOPK.") {
+                    return topk::execute(store, cmd_name, args);
+                }
+                if cmd_name.len() >= 4 && cmd_name[..4].eq_ignore_ascii_case(b"CMS.") {
+                    return cms::execute(store, cmd_name, args);
+                }
+            }
+
+            Err(Error::UnknownCommand(
+                String::from_utf8_lossy(raw_name).into_owned(),
+            ))
+        };
+
+        let result = execute_module();
+
+        // Propagation logic
+        if let Ok(ref resp) = result {
+            // Only propagate if successful (not error response per se, but RespValue::Error is valid response)
+            // But usually we don't propagate errors.
+            // Helper: is_error() on RespValue
+            let is_error = matches!(resp, RespValue::Error(_));
+
+            if !is_error {
+                if let Some(repl) = replication {
+                    let mut should_propagate = is_write_command(cmd_name);
+
+                    // Special handling for GETEX: only propagate if it has write options
+                    if cmd.is_command(b"GETEX") && args.len() > 1 {
+                        should_propagate = true;
+                    }
+
+                    if should_propagate {
+                        // Special rewrite logic for certain commands
+                        if cmd.is_command(b"GETDEL") {
+                            // GETDEL key -> DEL key
+                            let parts = vec![Bytes::from_static(b"DEL"), args[0].clone()];
+                            repl.propagate(&parts);
+                        } else if cmd.is_command(b"GETEX") {
+                            // Rewrite GETEX based on options
+                            // GETEX key [EX seconds | PX ms | EXAT | PXAT | PERSIST]
+                            if args.len() > 1 {
+                                let key = &args[0];
+                                let opt = args[1].to_ascii_uppercase();
+                                match opt.as_slice() {
+                                    b"PERSIST" => {
+                                        let parts =
+                                            vec![Bytes::from_static(b"PERSIST"), key.clone()];
+                                        repl.propagate(&parts);
+                                    }
+                                    b"EX" | b"PX" | b"EXAT" | b"PXAT" => {
+                                        if args.len() >= 3 {
+                                            // We normalize everything to PEXPIREAT for simplicity in propagation
+                                            // provided we can calculate the absolute time.
+                                            // But for now, let's just propagate the command that was used equivalent?
+                                            // Redis propagates as PEXPIREAT for EX/PX/EXAT/PXAT.
+                                            // We need to calculate the timestamp if relative.
+
+                                            use crate::storage::now_ms;
+
+                                            // We can read what was set or recalculate.
+                                            // Easier to just recalculate based on input.
+                                            let val_str =
+                                                std::str::from_utf8(&args[2]).unwrap_or("0");
+                                            let val = val_str.parse::<i64>().unwrap_or(0);
+
+                                            let expire_at_ms = match opt.as_slice() {
+                                                b"EX" => now_ms() + val * 1000,
+                                                b"PX" => now_ms() + val,
+                                                b"EXAT" => val * 1000,
+                                                b"PXAT" => val,
+                                                _ => 0,
+                                            };
+
+                                            if expire_at_ms > 0 {
+                                                let parts = vec![
+                                                    Bytes::from_static(b"PEXPIREAT"),
+                                                    key.clone(),
+                                                    Bytes::from(expire_at_ms.to_string()),
+                                                ];
+                                                repl.propagate(&parts);
+                                            }
+                                        }
+                                    }
+                                    _ => {} // Should not happen if validation passed
+                                }
+                            }
+                        } else {
+                            // Standard propagation
+                            let mut parts = Vec::with_capacity(1 + args.len());
+                            parts.push(Bytes::copy_from_slice(cmd.name()));
+                            parts.extend_from_slice(args);
+                            repl.propagate(&parts);
+                        }
+                    }
+                }
+            }
         }
-
-        // RedisBloom-like probabilistic data structures (feature-gated)
-        #[cfg(feature = "bloom")]
-        {
-            // Bloom Filter
-            if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"BF.") {
-                return bloom::execute(store, cmd_name, args);
-            }
-
-            // Cuckoo Filter
-            if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"CF.") {
-                return cuckoo::execute(store, cmd_name, args);
-            }
-
-            // TDigest
-            if cmd_name.len() >= 8 && cmd_name[..8].eq_ignore_ascii_case(b"TDIGEST.") {
-                return tdigest::execute(store, cmd_name, args);
-            }
-
-            // Top-K
-            if cmd_name.len() >= 5 && cmd_name[..5].eq_ignore_ascii_case(b"TOPK.") {
-                return topk::execute(store, cmd_name, args);
-            }
-
-            // Count-Min Sketch
-            if cmd_name.len() >= 4 && cmd_name[..4].eq_ignore_ascii_case(b"CMS.") {
-                return cms::execute(store, cmd_name, args);
-            }
-        }
-
-        Err(Error::UnknownCommand(
-            String::from_utf8_lossy(cmd_name).into_owned(),
-        ))
+        result
     }
 }
 
@@ -532,20 +623,137 @@ fn is_cluster_protocol_command(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"READWRITE")
 }
 
-/// Check if a command is a write command (used for cluster read/write checks)
+const READ_ONLY_COMMANDS: &[&str] = &[
+    "GET",
+    "MGET",
+    "STRLEN",
+    "GETRANGE",
+    "EXISTS",
+    "TTL",
+    "PTTL",
+    "TYPE",
+    "GETBIT",
+    "BITCOUNT",
+    "BITPOS",
+    "SUBSTR",
+    "DUMP",
+    "OBJECT",
+    "KEYS",
+    "SCAN",
+    "RANDOMKEY",
+    "DBSIZE",
+    "LLEN",
+    "LINDEX",
+    "LRANGE",
+    "LPOS",
+    "SCARD",
+    "SISMEMBER",
+    "SMISMEMBER",
+    "SRANDMEMBER",
+    "SINTER",
+    "SUNION",
+    "SDIFF",
+    "SSCAN",
+    "HLEN",
+    "HKEYS",
+    "HVALS",
+    "HGET",
+    "HMGET",
+    "HEXISTS",
+    "HSTRLEN",
+    "HGETALL",
+    "HSCAN",
+    "HRANDFIELD",
+    "ZCARD",
+    "ZCOUNT",
+    "ZLEXCOUNT",
+    "ZSCORE",
+    "ZRANK",
+    "ZREVRANK",
+    "ZRANGE",
+    "ZRANGEBYLEX",
+    "ZRANGEBYSCORE",
+    "ZREVRANGE",
+    "ZREVRANGEBYLEX",
+    "ZREVRANGEBYSCORE",
+    "ZMPOP",
+    "ZINTER",
+    "ZUNION",
+    "ZDIFF",
+    "ZSCAN",
+    "PFCOUNT",
+    "XREAD",
+    "XREADGROUP",
+    "XRANGE",
+    "XREVRANGE",
+    "XLEN",
+    "XPENDING",
+    "XINFO",
+    "GEOHASH",
+    "GEOPOS",
+    "GEODIST",
+    "GEORADIUS_RO",
+    "GEORADIUSBYMEMBER_RO",
+    "GEOSEARCH",
+    "EVAL_RO",
+    "EVALSHA_RO",
+    "FCALL_RO",
+    "FUNCTION",
+    "COMMAND",
+    "ECHO",
+    "PING",
+    "TIME",
+    "ROLE",
+    "LASTSAVE",
+    "LOLWUT",
+    "MEMORY",
+    "WAIT",
+    "WAITAOF",
+    "AUTH",
+    "HELLO",
+    "ACL",
+    "BGREWRITEAOF",
+    "BGSAVE",
+    "SAVE",
+    "SHUTDOWN",
+    "SLAVEOF",
+    "REPLICAOF",
+    "SYNC",
+    "PSYNC",
+    "MONITOR",
+    "DEBUG",
+    "CONFIG",
+    "CLIENT",
+    "CLUSTER",
+    "READONLY",
+    "READWRITE",
+    "ASKING",
+    "SELECT",
+    "SUBSCRIBE",
+    "PSUBSCRIBE",
+    "UNSUBSCRIBE",
+    "PUNSUBSCRIBE",
+    "SSUBSCRIBE",
+    "SUNSUBSCRIBE",
+    "PUBSUB",
+    "WATCH",
+    "UNWATCH",
+    "MULTI",
+    "EXEC",
+    "DISCARD",
+    "QUIT",
+    "RESET",
+    "FAILOVER",
+    "REPLCONF",
+    "MODULE",
+    "LATENCY",
+    "SLOWLOG",
+    "SWAPDB",
+    "INFO",
+];
+
+/// Check if a command is a write command (used for cluster read/write checks and replication)
 fn is_write_command(cmd: &[u8]) -> bool {
     let c = std::str::from_utf8(cmd).unwrap_or("").to_uppercase();
-    match c.as_str() {
-        "SET" | "MSET" | "SETNX" | "MSETNX" | "DEL" | "UNLINK" | "EXPIRE" | "PEXPIRE"
-        | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LSET"
-        | "LINSERT" | "LTRIM" | "LREM" | "SADD" | "SREM" | "SPOP" | "SMOVE" | "HSET" | "HMSET"
-        | "HSETNX" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "ZADD" | "ZREM" | "ZINCRBY"
-        | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZPOPMAX" | "ZPOPMIN" | "FLUSHDB"
-        | "FLUSHALL" | "RESTORE" | "RENAME" | "RENAMENX" | "APPEND" | "INCR" | "DECR"
-        | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "BF.RESERVE" | "BF.ADD" | "BF.MADD"
-        | "BF.INSERT" | "BF.LOADCHUNK" | "CF.RESERVE" | "CF.ADD" | "CF.ADDNX" | "CF.INSERT"
-        | "CF.INSERTNX" | "CF.DEL" | "CF.LOADCHUNK" | "TOPK.RESERVE" | "TOPK.ADD"
-        | "TOPK.INCRBY" | "CMS.INITBYDIM" | "CMS.INITBYPROB" | "CMS.INCRBY" | "CMS.MERGE" => true,
-        _ => false,
-    }
+    !READ_ONLY_COMMANDS.contains(&c.as_str())
 }

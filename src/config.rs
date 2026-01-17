@@ -307,7 +307,7 @@ fn default_pidfile() -> String {
     }
     #[cfg(not(windows))]
     {
-        "/var/run/redis_6379.pid".to_string()
+        "/var/run/sockudo-kv_6379.pid".to_string()
     }
 }
 

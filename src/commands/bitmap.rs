@@ -70,7 +70,9 @@ fn cmd_setbit(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 
     let value: i64 = parse_int(&args[2])?;
     if value != 0 && value != 1 {
-        return Err(Error::Syntax);
+        return Err(Error::Custom(
+            "bit is not an integer or out of range".into(),
+        ));
     }
 
     // Redis limits offset to 2^32-1

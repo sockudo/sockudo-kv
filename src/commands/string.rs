@@ -28,17 +28,29 @@ fn parse_float(b: &[u8]) -> Result<f64> {
         .map_err(|_| Error::NotFloat)
 }
 
+/// SET command conditional options (Redis 8.4+)
+#[derive(Default, Clone)]
+enum SetCondition {
+    #[default]
+    None,
+    Nx,            // Only set if not exists
+    Xx,            // Only set if exists
+    Ifeq(Bytes),   // Only set if value equals
+    Ifne(Bytes),   // Only set if value not equals
+    Ifdeq(String), // Only set if digest equals
+    Ifdne(String), // Only set if digest not equals
+}
+
 /// SET command options
 #[derive(Default)]
 struct SetOptions {
-    nx: bool,          // Only set if not exists
-    xx: bool,          // Only set if exists
-    get: bool,         // Return old value
-    ex: Option<i64>,   // Expire in seconds
-    px: Option<i64>,   // Expire in milliseconds
-    exat: Option<i64>, // Expire at unix time (seconds)
-    pxat: Option<i64>, // Expire at unix time (ms)
-    keepttl: bool,     // Keep existing TTL
+    condition: SetCondition, // NX, XX, IFEQ, IFNE, IFDEQ, IFDNE
+    get: bool,               // Return old value
+    ex: Option<i64>,         // Expire in seconds
+    px: Option<i64>,         // Expire in milliseconds
+    exat: Option<i64>,       // Expire at unix time (seconds)
+    pxat: Option<i64>,       // Expire at unix time (ms)
+    keepttl: bool,           // Keep existing TTL
 }
 
 /// Execute string commands
@@ -67,6 +79,8 @@ pub fn execute(store: &Store, cmd: &[u8], args: &[Bytes]) -> Result<RespValue> {
         b"GETEX" => cmd_getex(store, args),
         b"GETDEL" => cmd_getdel(store, args),
         b"LCS" => cmd_lcs(store, args),
+        b"DIGEST" => cmd_digest(store, args),
+        b"DELEX" => cmd_delex(store, args),
         _ => Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd).into_owned(),
         )),
@@ -84,7 +98,7 @@ fn cmd_get(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     })
 }
 
-/// SET key value [NX|XX] [GET] [EX seconds|PX milliseconds|EXAT unix-time|PXAT unix-time-ms] [KEEPTTL]
+/// SET key value [NX|XX|IFEQ value|IFNE value|IFDEQ digest|IFDNE digest] [GET] [EX seconds|PX milliseconds|EXAT unix-time|PXAT unix-time-ms] [KEEPTTL]
 fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.len() < 2 {
         return Err(Error::WrongArity("SET"));
@@ -99,6 +113,7 @@ fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     let key = &args[0];
     let value = &args[1];
     let mut opts = SetOptions::default();
+    let mut has_condition = false;
 
     let mut i = 2;
     while i < args.len() {
@@ -106,9 +121,63 @@ fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 
         // Use case-insensitive comparison without allocation
         if eq_ignore_ascii_case(arg, b"NX") {
-            opts.nx = true;
+            if has_condition {
+                return Err(Error::Syntax); // Multiple conditions
+            }
+            opts.condition = SetCondition::Nx;
+            has_condition = true;
         } else if eq_ignore_ascii_case(arg, b"XX") {
-            opts.xx = true;
+            if has_condition {
+                return Err(Error::Syntax); // Multiple conditions
+            }
+            opts.condition = SetCondition::Xx;
+            has_condition = true;
+        } else if eq_ignore_ascii_case(arg, b"IFEQ") {
+            if has_condition {
+                return Err(Error::Syntax);
+            }
+            i += 1;
+            if i >= args.len() {
+                return Err(Error::Syntax);
+            }
+            opts.condition = SetCondition::Ifeq(args[i].clone());
+            has_condition = true;
+        } else if eq_ignore_ascii_case(arg, b"IFNE") {
+            if has_condition {
+                return Err(Error::Syntax);
+            }
+            i += 1;
+            if i >= args.len() {
+                return Err(Error::Syntax);
+            }
+            opts.condition = SetCondition::Ifne(args[i].clone());
+            has_condition = true;
+        } else if eq_ignore_ascii_case(arg, b"IFDEQ") {
+            if has_condition {
+                return Err(Error::Syntax);
+            }
+            i += 1;
+            if i >= args.len() {
+                return Err(Error::Syntax);
+            }
+            let digest = std::str::from_utf8(&args[i])
+                .map_err(|_| Error::Syntax)?
+                .to_string();
+            opts.condition = SetCondition::Ifdeq(digest);
+            has_condition = true;
+        } else if eq_ignore_ascii_case(arg, b"IFDNE") {
+            if has_condition {
+                return Err(Error::Syntax);
+            }
+            i += 1;
+            if i >= args.len() {
+                return Err(Error::Syntax);
+            }
+            let digest = std::str::from_utf8(&args[i])
+                .map_err(|_| Error::Syntax)?
+                .to_string();
+            opts.condition = SetCondition::Ifdne(digest);
+            has_condition = true;
         } else if eq_ignore_ascii_case(arg, b"GET") {
             opts.get = true;
         } else if eq_ignore_ascii_case(arg, b"KEEPTTL") {
@@ -143,25 +212,81 @@ fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         i += 1;
     }
 
-    // NX and XX are mutually exclusive
-    if opts.nx && opts.xx {
-        return Err(Error::Syntax);
-    }
+    // Get old value if GET option - must return WRONGTYPE if key exists but is not a string
+    let old_value = if opts.get {
+        store.get_or_wrongtype(key)?
+    } else {
+        None
+    };
 
-    // Get old value if GET option
-    let old_value = if opts.get { store.get(key) } else { None };
-
-    // Check NX/XX conditions
+    // Check conditions
     let exists = store.exists(key);
-    if opts.nx && exists {
-        return Ok(if opts.get {
-            old_value.map(RespValue::bulk).unwrap_or(RespValue::null())
-        } else {
-            RespValue::null()
-        });
-    }
-    if opts.xx && !exists {
-        return Ok(RespValue::null());
+    match &opts.condition {
+        SetCondition::None => {}
+        SetCondition::Nx => {
+            if exists {
+                return Ok(if opts.get {
+                    old_value.map(RespValue::bulk).unwrap_or(RespValue::null())
+                } else {
+                    RespValue::null()
+                });
+            }
+        }
+        SetCondition::Xx => {
+            if !exists {
+                return Ok(RespValue::null());
+            }
+        }
+        SetCondition::Ifeq(expected) => {
+            let current = store.get(key);
+            if current.as_ref().map(|v| v.as_ref()) != Some(expected.as_ref()) {
+                return Ok(if opts.get {
+                    old_value.map(RespValue::bulk).unwrap_or(RespValue::null())
+                } else {
+                    RespValue::null()
+                });
+            }
+        }
+        SetCondition::Ifne(expected) => {
+            let current = store.get(key);
+            if current.as_ref().map(|v| v.as_ref()) == Some(expected.as_ref()) {
+                return Ok(if opts.get {
+                    old_value.map(RespValue::bulk).unwrap_or(RespValue::null())
+                } else {
+                    RespValue::null()
+                });
+            }
+        }
+        SetCondition::Ifdeq(expected_digest) => {
+            if let Some(current) = store.get(key) {
+                let current_hash = xxhash_rust::xxh3::xxh3_64(&current);
+                let current_digest = format!("{:016x}", current_hash);
+                if current_digest != *expected_digest {
+                    return Ok(if opts.get {
+                        old_value.map(RespValue::bulk).unwrap_or(RespValue::null())
+                    } else {
+                        RespValue::null()
+                    });
+                }
+            } else {
+                // Key doesn't exist, digest can't match
+                return Ok(RespValue::null());
+            }
+        }
+        SetCondition::Ifdne(expected_digest) => {
+            if let Some(current) = store.get(key) {
+                let current_hash = xxhash_rust::xxh3::xxh3_64(&current);
+                let current_digest = format!("{:016x}", current_hash);
+                if current_digest == *expected_digest {
+                    return Ok(if opts.get {
+                        old_value.map(RespValue::bulk).unwrap_or(RespValue::null())
+                    } else {
+                        RespValue::null()
+                    });
+                }
+            }
+            // Key doesn't exist or digest doesn't match - proceed with set
+        }
     }
 
     // Calculate expiration
@@ -283,32 +408,46 @@ fn cmd_msetex(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         return Err(Error::WrongArity("MSETEX"));
     }
 
-    // Parse numkeys
-    let numkeys = parse_int(&args[0])? as usize;
-    if numkeys == 0 {
-        return Err(Error::Other("at least one key required"));
+    // Parse numkeys - must return specific error message for invalid values
+    let numkeys_i64 = match parse_int(&args[0]) {
+        Ok(n) => n,
+        Err(_) => return Err(Error::Custom("invalid numkeys value".into())),
+    };
+    if numkeys_i64 <= 0 {
+        return Err(Error::Custom("invalid numkeys value".into()));
     }
 
-    // Need numkeys * 2 arguments for keys and values, plus at least expiration option
-    let min_args = 1 + numkeys * 2;
-    if args.len() < min_args {
-        return Err(Error::WrongArity("MSETEX"));
+    // Check for overflow when converting to usize (numkeys * 2 must not overflow)
+    let numkeys = numkeys_i64 as usize;
+    let kv_count = match numkeys.checked_mul(2) {
+        Some(c) => c,
+        None => return Err(Error::Custom("invalid numkeys value".into())),
+    };
+
+    // Check if we have enough arguments for key-value pairs
+    // args[0] is numkeys, then we need numkeys*2 args for keys and values
+    if args.len() < 1 + kv_count {
+        return Err(Error::Custom("wrong number of key-value pairs".into()));
     }
 
     // Parse key-value pairs
-    let pairs: Vec<(Bytes, Bytes)> = args[1..1 + numkeys * 2]
+    let pairs: Vec<(Bytes, Bytes)> = args[1..1 + kv_count]
         .chunks_exact(2)
         .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
         .collect();
 
-    // Parse options
+    // Parse options - track which expiration options are set
     let mut nx = false;
     let mut xx = false;
+    let mut has_ex = false;
+    let mut has_px = false;
+    let mut has_exat = false;
+    let mut has_pxat = false;
     let mut expire_ms: Option<i64> = None;
     let mut expire_at_ms: Option<i64> = None;
-    let _keepttl = false;
+    let mut keepttl = false;
 
-    let mut i = 1 + numkeys * 2;
+    let mut i = 1 + kv_count;
     while i < args.len() {
         let arg = &args[i];
         if eq_ignore_ascii_case(arg, b"NX") {
@@ -316,26 +455,30 @@ fn cmd_msetex(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         } else if eq_ignore_ascii_case(arg, b"XX") {
             xx = true;
         } else if eq_ignore_ascii_case(arg, b"KEEPTTL") {
-            // KEEPTTL not really applicable for MSETEX but we accept it
+            keepttl = true;
         } else if eq_ignore_ascii_case(arg, b"EX") {
+            has_ex = true;
             i += 1;
             if i >= args.len() {
                 return Err(Error::Syntax);
             }
             expire_ms = Some(parse_int(&args[i])? * 1000);
         } else if eq_ignore_ascii_case(arg, b"PX") {
+            has_px = true;
             i += 1;
             if i >= args.len() {
                 return Err(Error::Syntax);
             }
             expire_ms = Some(parse_int(&args[i])?);
         } else if eq_ignore_ascii_case(arg, b"EXAT") {
+            has_exat = true;
             i += 1;
             if i >= args.len() {
                 return Err(Error::Syntax);
             }
             expire_at_ms = Some(parse_int(&args[i])? * 1000);
         } else if eq_ignore_ascii_case(arg, b"PXAT") {
+            has_pxat = true;
             i += 1;
             if i >= args.len() {
                 return Err(Error::Syntax);
@@ -352,11 +495,28 @@ fn cmd_msetex(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         return Err(Error::Syntax);
     }
 
+    // Expiration options are mutually exclusive (EX, PX, EXAT, PXAT)
+    let has_expiration = has_ex || has_px || has_exat || has_pxat;
+    let expire_count = [has_ex, has_px, has_exat, has_pxat]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+    if expire_count > 1 {
+        return Err(Error::Syntax);
+    }
+
+    // KEEPTTL conflicts with expiration flags
+    if keepttl && has_expiration {
+        return Err(Error::Syntax);
+    }
+
     // Execute based on expiration type
     let success = if let Some(expire_at) = expire_at_ms {
         store.mset_exat(pairs, expire_at, nx, xx)
     } else if let Some(expire) = expire_ms {
         store.mset_ex(pairs, expire, nx, xx)
+    } else if keepttl {
+        store.mset_keepttl(pairs, nx, xx)
     } else {
         // No expiration specified - use default MSET behavior
         if nx || xx {
@@ -364,10 +524,10 @@ fn cmd_msetex(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             for (key, _) in &pairs {
                 let exists = store.exists(key);
                 if nx && exists {
-                    return Ok(RespValue::null());
+                    return Ok(RespValue::integer(0));
                 }
                 if xx && !exists {
-                    return Ok(RespValue::null());
+                    return Ok(RespValue::integer(0));
                 }
             }
         }
@@ -375,11 +535,8 @@ fn cmd_msetex(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         true
     };
 
-    if success {
-        Ok(RespValue::ok())
-    } else {
-        Ok(RespValue::null())
-    }
+    // MSETEX always returns integer in Redis 8.4: 1 for success, 0 for NX/XX failure
+    Ok(RespValue::integer(if success { 1 } else { 0 }))
 }
 
 /// APPEND key value
@@ -454,7 +611,7 @@ fn cmd_getrange(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     }
     let start = parse_int(&args[1])?;
     let end = parse_int(&args[2])?;
-    let result = store.getrange(&args[0], start, end);
+    let result = store.getrange(&args[0], start, end)?;
     Ok(RespValue::bulk(result))
 }
 
@@ -466,6 +623,12 @@ fn cmd_setrange(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     let offset = parse_int(&args[1])?;
     if offset < 0 {
         return Err(Error::Other("offset is out of range"));
+    }
+    // Max string size check (512MB)
+    if offset as usize + args[2].len() > 512 * 1024 * 1024 {
+        return Err(Error::Custom(
+            "string exceeds maximum allowed size (512MB)".into(),
+        ));
     }
     let len = store.setrange(args[0].clone(), offset as usize, &args[2])?;
     Ok(RespValue::integer(len as i64))
@@ -612,96 +775,117 @@ fn cmd_lcs(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 }
 
 /// Compute LCS with optional index tracking
+/// Ported exactly from Redis t_string.c lcsCommand()
 fn compute_lcs(
     a: &[u8],
     b: &[u8],
     track_idx: bool,
     min_match_len: usize,
 ) -> (Bytes, Vec<((usize, usize), (usize, usize), usize)>) {
-    let m = a.len();
-    let n = b.len();
+    let alen = a.len();
+    let blen = b.len();
 
-    if m == 0 || n == 0 {
+    if alen == 0 || blen == 0 {
         return (Bytes::new(), vec![]);
     }
 
-    // DP table
-    let mut dp = vec![vec![0u16; n + 1]; m + 1];
+    // DP table using flat array like Redis: LCS[i,j] = lcs[j + i*(blen+1)]
+    let mut lcs_table = vec![0u32; (alen + 1) * (blen + 1)];
+    let lcs = |i: usize, j: usize| -> usize { j + i * (blen + 1) };
 
-    for i in 1..=m {
-        for j in 1..=n {
+    // Build the LCS table
+    for i in 1..=alen {
+        for j in 1..=blen {
             if a[i - 1] == b[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1] + 1;
+                lcs_table[lcs(i, j)] = lcs_table[lcs(i - 1, j - 1)] + 1;
             } else {
-                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+                let lcs1 = lcs_table[lcs(i - 1, j)];
+                let lcs2 = lcs_table[lcs(i, j - 1)];
+                lcs_table[lcs(i, j)] = lcs1.max(lcs2);
             }
         }
     }
 
-    // Backtrack to find LCS
-    let mut lcs = Vec::with_capacity(dp[m][n] as usize);
-    let mut i = m;
-    let mut j = n;
+    let lcs_len = lcs_table[lcs(alen, blen)] as usize;
+    let mut result = vec![0u8; lcs_len];
+    let mut matches = Vec::new();
 
-    while i > 0 && j > 0 {
+    // Track current contiguous match range
+    // alen signals "no range in progress" (sentinel value like Redis)
+    let mut arange_start: usize = alen;
+    let mut arange_end: usize = 0;
+    let mut brange_start: usize = 0;
+    let mut brange_end: usize = 0;
+
+    let mut i = alen;
+    let mut j = blen;
+    let mut idx = lcs_len;
+
+    // Backtrack to find LCS and matching ranges (exactly like Redis)
+    while idx > 0 && i > 0 && j > 0 {
+        let mut emit_range = false;
+
         if a[i - 1] == b[j - 1] {
-            lcs.push(a[i - 1]);
+            // Match found - store the character
+            result[idx - 1] = a[i - 1];
+
+            if track_idx {
+                if arange_start == alen {
+                    // Start a new range
+                    arange_start = i - 1;
+                    arange_end = i - 1;
+                    brange_start = j - 1;
+                    brange_end = j - 1;
+                } else {
+                    // Try to extend the range backward (contiguous match)
+                    if arange_start == i && brange_start == j {
+                        arange_start -= 1;
+                        brange_start -= 1;
+                    } else {
+                        // Not contiguous, emit current range
+                        emit_range = true;
+                    }
+                }
+
+                // Emit if we reached the start of either string
+                if arange_start == 0 || brange_start == 0 {
+                    emit_range = true;
+                }
+            }
+
+            idx -= 1;
             i -= 1;
             j -= 1;
-        } else if dp[i - 1][j] > dp[i][j - 1] {
-            i -= 1;
         } else {
-            j -= 1;
-        }
-    }
-
-    lcs.reverse();
-
-    // Track matches if needed
-    let matches = if track_idx {
-        find_lcs_matches(a, b, &lcs, min_match_len)
-    } else {
-        vec![]
-    };
-
-    (Bytes::from(lcs), matches)
-}
-
-/// Find matching ranges for LCS
-fn find_lcs_matches(
-    a: &[u8],
-    b: &[u8],
-    _lcs: &[u8],
-    min_len: usize,
-) -> Vec<((usize, usize), (usize, usize), usize)> {
-    let mut matches = vec![];
-    let m = a.len();
-    let n = b.len();
-
-    // Find common substrings
-    let mut i = 0;
-    while i < m {
-        let mut j = 0;
-        while j < n {
-            if a[i] == b[j] {
-                let start_i = i;
-                let start_j = j;
-                while i < m && j < n && a[i] == b[j] {
-                    i += 1;
-                    j += 1;
-                }
-                let len = i - start_i;
-                if len >= min_len {
-                    matches.push(((start_i, i - 1), (start_j, j - 1), len));
-                }
+            // No match - follow the larger LCS path
+            let lcs1 = lcs_table[lcs(i - 1, j)];
+            let lcs2 = lcs_table[lcs(i, j - 1)];
+            if lcs1 > lcs2 {
+                i -= 1;
             } else {
-                j += 1;
+                j -= 1;
+            }
+            // If we had a range in progress, emit it
+            if track_idx && arange_start != alen {
+                emit_range = true;
             }
         }
-        i += 1;
+
+        // Emit the current range if needed (exactly like Redis)
+        if emit_range {
+            let match_len = arange_end - arange_start + 1;
+            if min_match_len == 0 || match_len >= min_match_len {
+                matches.push((
+                    (arange_start, arange_end),
+                    (brange_start, brange_end),
+                    match_len,
+                ));
+            }
+            arange_start = alen; // Reset sentinel - restart at next match
+        }
     }
 
-    matches
+    (Bytes::from(result), matches)
 }
 
 /// Format float like Redis
@@ -711,5 +895,86 @@ fn format_float(f: f64) -> String {
     } else {
         let s = format!("{:.17}", f);
         s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// DIGEST key
+/// Get the XXH3 hash digest for the value stored in the specified key as a hexadecimal string.
+/// Keys must be of type string.
+/// Available since Redis 8.4.0
+fn cmd_digest(store: &Store, args: &[Bytes]) -> Result<RespValue> {
+    if args.len() != 1 {
+        return Err(Error::WrongArity("DIGEST"));
+    }
+
+    // Get string value, returning WRONGTYPE if key exists but is not a string
+    match store.get_or_wrongtype(&args[0])? {
+        Some(value) => {
+            // Compute XXH3 64-bit hash
+            let hash = xxhash_rust::xxh3::xxh3_64(&value);
+            // Format as lowercase hexadecimal string (16 chars for 64-bit)
+            Ok(RespValue::bulk_string(&format!("{:016x}", hash)))
+        }
+        None => Ok(RespValue::null()),
+    }
+}
+
+/// DELEX key [IFEQ value | IFNE value | IFDEQ digest | IFDNE digest]
+/// Conditionally removes the specified key based on value or hash digest comparison.
+/// Available since Redis 8.4.0
+fn cmd_delex(store: &Store, args: &[Bytes]) -> Result<RespValue> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(Error::WrongArity("DELEX"));
+    }
+
+    let key = &args[0];
+
+    // If no condition, just delete (like DEL)
+    if args.len() == 1 {
+        let deleted = store.del(key);
+        return Ok(RespValue::integer(if deleted { 1 } else { 0 }));
+    }
+
+    // Parse condition
+    if args.len() != 3 {
+        return Err(Error::Syntax);
+    }
+
+    let condition = &args[1];
+    let cond_value = &args[2];
+
+    // Get current value
+    let current = match store.get_or_wrongtype(key)? {
+        Some(v) => v,
+        None => return Ok(RespValue::integer(0)), // Key doesn't exist
+    };
+
+    let should_delete = if eq_ignore_ascii_case(condition, b"IFEQ") {
+        // Delete if value equals
+        current.as_ref() == cond_value.as_ref()
+    } else if eq_ignore_ascii_case(condition, b"IFNE") {
+        // Delete if value not equals
+        current.as_ref() != cond_value.as_ref()
+    } else if eq_ignore_ascii_case(condition, b"IFDEQ") {
+        // Delete if digest equals
+        let current_hash = xxhash_rust::xxh3::xxh3_64(&current);
+        let current_digest = format!("{:016x}", current_hash);
+        let cond_digest = std::str::from_utf8(cond_value).unwrap_or("");
+        current_digest == cond_digest
+    } else if eq_ignore_ascii_case(condition, b"IFDNE") {
+        // Delete if digest not equals
+        let current_hash = xxhash_rust::xxh3::xxh3_64(&current);
+        let current_digest = format!("{:016x}", current_hash);
+        let cond_digest = std::str::from_utf8(cond_value).unwrap_or("");
+        current_digest != cond_digest
+    } else {
+        return Err(Error::Syntax);
+    };
+
+    if should_delete {
+        store.del(key);
+        Ok(RespValue::integer(1))
+    } else {
+        Ok(RespValue::integer(0))
     }
 }

@@ -75,6 +75,7 @@ env_logger = "0.11.8"
 hashbrown = "0.16.1"
 crossbeam-utils = "0.8.21"
 ahash = "0.8.12"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 itertools = "0.14.0"
 x509-parser = "0.18.0"
 pkcs8 = { version = "0.10.2", features = ["encryption", "pem"] }

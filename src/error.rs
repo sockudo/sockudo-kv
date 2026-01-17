@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("ERR wrong number of arguments for '{0}' command")]
+    #[error("ERR wrong number of arguments for '{}' command", .0.to_ascii_lowercase())]
     WrongArity(&'static str),
 
     #[error("ERR value is not an integer or out of range")]

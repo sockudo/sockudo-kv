@@ -429,7 +429,20 @@ impl Store {
             return None;
         }
         Some(match &entry_ref.1.data {
-            DataType::String(_) => "raw",
+            DataType::String(s) => {
+                // Check if string can be represented as an integer
+                if std::str::from_utf8(s)
+                    .ok()
+                    .and_then(|str_val| str_val.parse::<i64>().ok())
+                    .is_some()
+                {
+                    "int"
+                } else if s.len() <= 44 {
+                    "embstr"
+                } else {
+                    "raw"
+                }
+            }
             DataType::List(_) => "quicklist",
             DataType::Set(_) => "hashtable",
             DataType::IntSet(_) => "intset",
@@ -447,6 +460,184 @@ impl Store {
             return None;
         }
         Some(entry_ref.1.data.type_name())
+    }
+
+    /// Estimate memory usage for a key (like Redis MEMORY USAGE)
+    /// Returns memory in bytes including key overhead, value, and internal structures
+    pub fn memory_usage(&self, key: &[u8], samples: usize) -> Option<usize> {
+        let entry_ref = self.data_get(key)?;
+        if entry_ref.1.is_expired() {
+            return None;
+        }
+
+        // Base overhead: Entry struct (data, expire_at, version, lru_time, lfu_counter)
+        // AtomicI64 = 8, AtomicU64 = 8, AtomicU8 = 1, pointer to data ~ 8
+        const ENTRY_OVERHEAD: usize = 64;
+
+        // Key overhead: Bytes struct (ptr + len + cap) + actual key bytes
+        const BYTES_OVERHEAD: usize = 24; // Bytes struct size
+        let key_size = BYTES_OVERHEAD + key.len();
+
+        // Data size varies by type
+        let data_size = match &entry_ref.1.data {
+            DataType::String(s) => {
+                // Bytes overhead + actual string length
+                BYTES_OVERHEAD + s.len()
+            }
+            DataType::List(l) => {
+                // QuickList: each node has overhead + data
+                // Estimate: 64 bytes per node overhead + actual data
+                let mut total = 64; // QuickList base overhead
+                let len = l.len();
+                if len > 0 {
+                    // Sample some elements if list is large
+                    let sample_count = samples.min(len);
+                    let mut sample_size = 0;
+                    for (i, item) in l.iter().enumerate() {
+                        if i >= sample_count {
+                            break;
+                        }
+                        sample_size += BYTES_OVERHEAD + item.len();
+                    }
+                    // Extrapolate from sample
+                    total += (sample_size * len) / sample_count;
+                    // Add node overhead (quicklist node ~ 32 bytes each)
+                    total += len * 32;
+                }
+                total
+            }
+            DataType::Set(s) => {
+                // DashSet: hash table overhead + elements
+                let len = s.len();
+                // Base hash table overhead (shards, metadata)
+                let mut total = 256;
+                if len > 0 {
+                    let sample_count = samples.min(len);
+                    let mut sample_size = 0;
+                    for (i, item) in s.iter().enumerate() {
+                        if i >= sample_count {
+                            break;
+                        }
+                        // Each element: Bytes + hash entry overhead
+                        sample_size += BYTES_OVERHEAD + item.len() + 16;
+                    }
+                    total += (sample_size * len) / sample_count;
+                }
+                total
+            }
+            DataType::IntSet(s) => {
+                // IntSet: compact integer storage
+                // Each integer uses 2, 4, or 8 bytes depending on encoding
+                let len = s.len();
+                64 + len * 8 // Assume worst case 8 bytes per int
+            }
+            DataType::Hash(h) => {
+                // DashTable: hash table overhead + field-value pairs
+                let len = h.len();
+                let mut total = 256; // Base hash table overhead
+                if len > 0 {
+                    let sample_count = samples.min(len);
+                    let mut sample_size = 0;
+                    let mut counted = 0;
+                    h.for_each(|kv| {
+                        if counted >= sample_count {
+                            return;
+                        }
+                        // Field + value + hash entry overhead
+                        sample_size += BYTES_OVERHEAD * 2 + kv.0.len() + kv.1.len() + 16;
+                        counted += 1;
+                    });
+                    if counted > 0 {
+                        total += (sample_size * len) / counted;
+                    }
+                }
+                total
+            }
+            DataType::HashPacked(lp) => {
+                // Listpack: compact storage - estimate based on entry count
+                // Each entry averages ~20 bytes (field + value encoded)
+                64 + lp.len() * 20
+            }
+            DataType::SortedSet(zs) => {
+                // SortedSetData: HashMap + BTreeMap
+                let len = zs.len();
+                // Base overhead for both maps
+                let mut total = 128;
+                if len > 0 {
+                    let sample_count = samples.min(len);
+                    let mut sample_size = 0;
+                    for (i, (member, _)) in zs.scores.iter().enumerate() {
+                        if i >= sample_count {
+                            break;
+                        }
+                        // Member in both maps + score (f64 = 8) + tree node overhead
+                        sample_size += BYTES_OVERHEAD + member.len() + 8 + 48;
+                    }
+                    total += (sample_size * len) / sample_count;
+                }
+                total
+            }
+            DataType::SortedSetPacked(lp) => {
+                // Listpack: compact storage - estimate based on entry count
+                // Each entry averages ~16 bytes (member + score encoded)
+                64 + lp.len() * 16
+            }
+            DataType::Stream(st) => {
+                // Stream: BTreeMap entries + consumer groups
+                let entries_len = st.entries.len();
+                // Base overhead
+                let mut total = 128;
+                if entries_len > 0 {
+                    let sample_count = samples.min(entries_len);
+                    let mut sample_size = 0;
+                    for (i, (_, fields)) in st.entries.iter().enumerate() {
+                        if i >= sample_count {
+                            break;
+                        }
+                        // StreamId (16) + fields vec overhead + each field pair
+                        sample_size += 16 + 24;
+                        for (k, v) in fields {
+                            sample_size += BYTES_OVERHEAD * 2 + k.len() + v.len();
+                        }
+                    }
+                    total += (sample_size * entries_len) / sample_count;
+                }
+                // Consumer groups overhead
+                total += st.groups.len() * 256;
+                total
+            }
+            DataType::HyperLogLog(_) => {
+                // HLL: fixed size registers (typically 12KB for 16384 registers)
+                12304
+            }
+            DataType::Json(j) => {
+                // JSON: estimate based on string representation
+                let json_str = sonic_rs::to_string(j.as_ref()).unwrap_or_default();
+                64 + json_str.len() * 2 // Account for object overhead
+            }
+            DataType::TimeSeries(ts) => {
+                // TimeSeries: compressed chunks
+                ts.memory_usage()
+            }
+            DataType::VectorSet(vs) => {
+                // VectorSet: HNSW graph
+                let base = 256;
+                let per_node = BYTES_OVERHEAD + vs.dim * 4 + 64; // element + vector + connections
+                base + vs.len() * per_node
+            }
+            #[cfg(feature = "bloom")]
+            DataType::BloomFilter(bf) => bf.size_bytes() + 64,
+            #[cfg(feature = "bloom")]
+            DataType::CuckooFilter(cf) => cf.size_bytes() + 64,
+            #[cfg(feature = "bloom")]
+            DataType::TDigest(td) => td.memory_usage(),
+            #[cfg(feature = "bloom")]
+            DataType::TopK(tk) => tk.memory_usage(),
+            #[cfg(feature = "bloom")]
+            DataType::CountMinSketch(cms) => cms.memory_usage(),
+        };
+
+        Some(ENTRY_OVERHEAD + key_size + data_size)
     }
 
     /// Serialize a key value for DUMP command

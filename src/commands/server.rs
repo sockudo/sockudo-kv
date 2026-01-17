@@ -42,7 +42,7 @@ pub fn execute(
         b"REPLCONF" => cmd_replconf(server, args),
         b"REPLICAOF" | b"SLAVEOF" => cmd_replicaof(server, args),
         b"ROLE" => cmd_role(server),
-        b"SYNC" => cmd_sync(server, args),
+        b"SYNC" => cmd_sync(multi_store, server, args),
         b"MODULE" => cmd_module(server, args),
         _ => Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd).into_owned(),
@@ -1086,12 +1086,19 @@ fn cmd_memory(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             if args.len() < 2 {
                 return Err(Error::WrongArity("MEMORY USAGE"));
             }
-            // Estimate: base overhead + rough size
-            let size = if store.exists(&args[1]) { 64 } else { 0 };
-            if size > 0 {
-                Ok(RespValue::integer(size))
+            // Parse optional SAMPLES count (default 5 like Redis)
+            let samples = if args.len() >= 4 && args[2].eq_ignore_ascii_case(b"SAMPLES") {
+                std::str::from_utf8(&args[3])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(5)
             } else {
-                Ok(RespValue::null())
+                5
+            };
+            // Use the new memory_usage method for accurate estimation
+            match store.memory_usage(&args[1], samples) {
+                Some(size) => Ok(RespValue::integer(size as i64)),
+                None => Ok(RespValue::null()),
             }
         }
         _ => Err(Error::Custom(format!(
@@ -1908,9 +1915,17 @@ fn cmd_role(server: &Arc<ServerState>) -> Result<RespValue> {
     }
 }
 
-fn cmd_sync(server: &Arc<ServerState>, _args: &[Bytes]) -> Result<RespValue> {
-    // Treat SYNC same as PSYNC / FULLRESYNC in this simple impl
-    cmd_psync(server, _args)
+fn cmd_sync(
+    multi_store: Option<&Arc<MultiStore>>,
+    _server: &Arc<ServerState>,
+    _args: &[Bytes],
+) -> Result<RespValue> {
+    if let Some(ms) = multi_store {
+        let rdb = crate::replication::rdb::generate_rdb(ms);
+        Ok(RespValue::bulk(rdb))
+    } else {
+        Err(Error::Custom("ERR replication not available".into()))
+    }
 }
 
 fn cmd_module(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {

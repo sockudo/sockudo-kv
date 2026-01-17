@@ -23,6 +23,25 @@ impl Store {
         })
     }
 
+    /// Get string value, returning WRONGTYPE error if key exists but is not a string
+    /// This is used by SET ... GET to properly return errors for non-string types
+    #[inline]
+    pub fn get_or_wrongtype(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        match self.data_get(key) {
+            Some(e) => {
+                if e.1.is_expired() {
+                    Ok(None)
+                } else {
+                    match &e.1.data {
+                        DataType::String(s) => Ok(Some(s.clone())),
+                        _ => Err(Error::WrongType),
+                    }
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Get string value with TTL
     #[inline]
     pub fn get_with_ttl(&self, key: &[u8]) -> Option<(Bytes, Option<i64>)> {
@@ -303,38 +322,67 @@ impl Store {
         }
     }
 
-    /// Get substring
+    /// Get substring - Redis-compatible GETRANGE implementation
+    /// Ported from Redis t_string.c getrangeCommand()
     #[inline]
-    pub fn getrange(&self, key: &[u8], start: i64, end: i64) -> Bytes {
-        self.data_get(key)
-            .and_then(|e| {
-                if e.1.is_expired() {
-                    return None;
+    pub fn getrange(&self, key: &[u8], start: i64, end: i64) -> crate::error::Result<Bytes> {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    return Ok(Bytes::new());
                 }
-                e.1.data.as_string().map(|s| {
-                    let len = s.len() as i64;
-                    let start = normalize_index(start, len);
-                    let end = normalize_index(end, len);
+                match &entry_ref.1.data {
+                    DataType::String(s) => {
+                        let strlen = s.len() as i64;
 
-                    if start > end || start >= len {
-                        return Bytes::new();
+                        // Redis: Convert negative indexes
+                        // Special case: if both are negative and start > end, return empty
+                        if start < 0 && end < 0 && start > end {
+                            return Ok(Bytes::new());
+                        }
+
+                        let mut real_start = if start < 0 { strlen + start } else { start };
+                        let mut real_end = if end < 0 { strlen + end } else { end };
+
+                        // Clamp to valid range
+                        if real_start < 0 {
+                            real_start = 0;
+                        }
+                        if real_end < 0 {
+                            real_end = 0;
+                        }
+                        if real_end >= strlen {
+                            real_end = strlen - 1;
+                        }
+
+                        // Check for empty result conditions
+                        if real_start > real_end || strlen == 0 {
+                            return Ok(Bytes::new());
+                        }
+
+                        Ok(Bytes::copy_from_slice(
+                            &s[real_start as usize..=real_end as usize],
+                        ))
                     }
-
-                    let start = start.max(0) as usize;
-                    let end = (end + 1).min(len) as usize;
-                    s.slice(start..end)
-                })
-            })
-            .unwrap_or_default()
+                    _ => Err(crate::error::Error::WrongType),
+                }
+            }
+            None => Ok(Bytes::new()),
+        }
     }
 
-    /// Set substring
+    /// Set substring - Redis-compatible SETRANGE implementation
+    /// Ported from Redis t_string.c setrangeCommand()
     #[inline]
     pub fn setrange(&self, key: Bytes, offset: usize, value: &[u8]) -> Result<usize> {
         match self.data_entry(&key) {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
+                    // Redis: If key doesn't exist (or is expired) and value is empty, return 0
+                    if value.is_empty() {
+                        return Ok(0);
+                    }
                     let mut bytes = vec![0u8; offset + value.len()];
                     bytes[offset..offset + value.len()].copy_from_slice(value);
                     entry.data = DataType::String(Bytes::from(bytes));
@@ -345,6 +393,10 @@ impl Store {
 
                 let result = match &mut entry.data {
                     DataType::String(s) => {
+                        // Redis: If value is empty, just return current length
+                        if value.is_empty() {
+                            return Ok(s.len());
+                        }
                         let mut bytes = s.to_vec();
                         let new_len = offset + value.len();
                         if new_len > bytes.len() {
@@ -362,6 +414,10 @@ impl Store {
                 result
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
+                // Redis: If key doesn't exist and value is empty, return 0 without creating key
+                if value.is_empty() {
+                    return Ok(0);
+                }
                 let mut bytes = vec![0u8; offset + value.len()];
                 bytes[offset..offset + value.len()].copy_from_slice(value);
                 let len = bytes.len();
@@ -503,14 +559,56 @@ impl Store {
         }
         true
     }
-}
 
-/// Normalize negative indices for string operations
-fn normalize_index(idx: i64, len: i64) -> i64 {
-    if idx < 0 {
-        (len + idx).max(0)
-    } else {
-        idx.min(len - 1)
+    /// Multi-set keeping existing TTL (MSET KEEPTTL)
+    #[inline]
+    pub fn mset_keepttl(&self, pairs: Vec<(Bytes, Bytes)>, nx: bool, xx: bool) -> bool {
+        // Pre-check NX/XX conditions
+        if nx || xx {
+            for (key, _) in &pairs {
+                let exists = self.exists(key);
+                if nx && exists {
+                    return false;
+                }
+                if xx && !exists {
+                    return false;
+                }
+            }
+        }
+
+        // Set all keys keeping existing expiration
+        for (key, value) in pairs {
+            match self.data_entry(&key) {
+                crate::storage::dashtable::Entry::Vacant(e) => {
+                    // New key - no expiration to keep, so just insert
+                    e.insert((key, Entry::new(DataType::String(value))));
+                    self.key_count.fetch_add(1, Ordering::Relaxed);
+                }
+                crate::storage::dashtable::Entry::Occupied(mut e) => {
+                    let entry = &mut e.get_mut().1;
+
+                    // If entry is expired, it's effectively new, so we treat it as new (clearing expiration)
+                    if entry.is_expired() {
+                        entry.data = DataType::String(value);
+                        entry.persist(); // Clear expiration since it was expired
+                        entry.bump_version();
+                    } else {
+                        // Alive entry - update value but keep metadata (expiration)
+                        match &mut entry.data {
+                            DataType::String(s) => {
+                                *s = value;
+                            }
+                            _ => {
+                                entry.data = DataType::String(value);
+                            }
+                        }
+                        // Explicitly NOT calling persist() here to preserve expiration
+                        entry.bump_version();
+                    }
+                }
+            }
+        }
+        true
     }
 }
 

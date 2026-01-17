@@ -40,7 +40,7 @@ pub enum ConfigType {
 
 /// Getter function type
 pub type ConfigGetter = fn(&ServerConfig) -> String;
-/// Setter function type  
+/// Setter function type
 pub type ConfigSetter = fn(&mut ServerConfig, &str) -> Result<(), String>;
 /// Applier function type (applies config to runtime state)
 pub type ConfigApplier = fn(&ServerState, &ServerConfig);
@@ -861,7 +861,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         alias: None,
         flags: ConfigFlags::IMMUTABLE,
         config_type: ConfigType::String,
-        default_value: "/var/run/redis_6379.pid",
+        default_value: "/var/run/sockudo-kv_6379.pid",
         getter: string_getter!(pidfile),
         setter: immutable_setter!(),
         applier: None,
