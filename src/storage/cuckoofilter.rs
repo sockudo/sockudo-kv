@@ -197,13 +197,22 @@ pub struct CuckooFilterConfig {
 }
 
 impl Default for CuckooFilterConfig {
+    /// Redis-compatible defaults following RedisBloom CF module conventions
     fn default() -> Self {
         Self {
             capacity: 1024,
-            bucket_size: 4,      // 4 entries per bucket is optimal per paper
-            max_iterations: 500, // Max kicks before giving up
+            // RedisBloom uses bucket_size=2 by default for better space efficiency
+            // at the cost of slightly more relocations. The paper recommends 4.
+            bucket_size: 2,
+            // Maximum cuckoo kicks before declaring filter full
+            // RedisBloom uses 500 which provides good balance
+            max_iterations: 500,
+            // Expansion factor when creating new sub-filters
+            // 1 = same size as original, 2 = double size
             expansion: 1,
-            fingerprint_bits: 16, // 16-bit fingerprints = ~0.0001 FP rate with b=4
+            // 16-bit fingerprints provide false positive rate of ~0.03% with b=2
+            // or ~0.0001% with b=4
+            fingerprint_bits: 16,
         }
     }
 }

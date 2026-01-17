@@ -110,6 +110,7 @@ fn parse_schema_field(args: &[Bytes], i: &mut usize) -> Result<SchemaField> {
                 phonetic,
                 sortable,
                 noindex,
+                withsuffixtrie: false,
             }
         }
         b"TAG" => {
@@ -117,6 +118,7 @@ fn parse_schema_field(args: &[Bytes], i: &mut usize) -> Result<SchemaField> {
             let mut casesensitive = false;
             let mut sortable = false;
             let mut noindex = false;
+            let mut withsuffixtrie = false;
 
             while *i < args.len() {
                 let opt = args[*i].to_ascii_uppercase();
@@ -144,6 +146,7 @@ fn parse_schema_field(args: &[Bytes], i: &mut usize) -> Result<SchemaField> {
                         *i += 1;
                     }
                     b"WITHSUFFIXTRIE" => {
+                        withsuffixtrie = true;
                         *i += 1;
                     }
                     _ => break,
@@ -155,6 +158,7 @@ fn parse_schema_field(args: &[Bytes], i: &mut usize) -> Result<SchemaField> {
                 casesensitive,
                 sortable,
                 noindex,
+                withsuffixtrie,
             }
         }
         b"NUMERIC" => {
@@ -242,7 +246,14 @@ fn parse_schema_field(args: &[Bytes], i: &mut usize) -> Result<SchemaField> {
                             *i += 1;
                         }
                     }
-                    b"TYPE" | b"M" | b"EF_CONSTRUCTION" | b"EF_RUNTIME" | b"EPSILON" => {
+                    b"TYPE" => {
+                        *i += 1;
+                        // Skip data type value
+                        if *i < args.len() {
+                            *i += 1;
+                        }
+                    }
+                    b"M" | b"EF_CONSTRUCTION" | b"EF_RUNTIME" | b"EPSILON" => {
                         // Skip HNSW-specific params
                         *i += 2;
                     }
@@ -255,7 +266,31 @@ fn parse_schema_field(args: &[Bytes], i: &mut usize) -> Result<SchemaField> {
                 dim,
                 distance_metric,
                 initial_cap,
+                m: None,
+                ef_construction: None,
+                ef_runtime: None,
+                data_type: crate::storage::ops::search_ops::VectorDataType::Float32,
             }
+        }
+        b"GEOSHAPE" => {
+            let mut coord_system = crate::storage::ops::search_ops::CoordSystem::Spherical;
+
+            while *i < args.len() {
+                let opt = args[*i].to_ascii_uppercase();
+                match opt.as_slice() {
+                    b"FLAT" => {
+                        coord_system = crate::storage::ops::search_ops::CoordSystem::Flat;
+                        *i += 1;
+                    }
+                    b"SPHERICAL" => {
+                        coord_system = crate::storage::ops::search_ops::CoordSystem::Spherical;
+                        *i += 1;
+                    }
+                    _ => break,
+                }
+            }
+
+            FieldType::GeoShape { coord_system }
         }
         _ => return Err(Error::Syntax),
     };
@@ -452,6 +487,7 @@ fn cmd_ft_info(store: &Store, args: &[Bytes]) -> Result<RespValue> {
                 FieldType::Numeric { .. } => "NUMERIC",
                 FieldType::Geo { .. } => "GEO",
                 FieldType::Vector { .. } => "VECTOR",
+                FieldType::GeoShape { .. } => "GEOSHAPE",
             };
             field_info.push(RespValue::bulk(Bytes::copy_from_slice(
                 type_name.as_bytes(),

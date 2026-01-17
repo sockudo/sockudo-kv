@@ -11,76 +11,39 @@ use crate::config_table::{CONFIG_TABLE, ConfigFlags, find_config, matches_patter
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use crate::server_state::{
-    ACL_CATEGORIES, AclCommandRules, AclUser, ServerState, get_commands_in_category,
+    ACL_CATEGORIES, AclCommandRules, AclUser, Role, ServerState, get_commands_in_category,
 };
-use crate::storage::Store;
+use crate::storage::{MultiStore, Store};
 
 /// Execute a server command
 pub fn execute(
+    multi_store: Option<&Arc<MultiStore>>,
     store: &Store,
     server: &Arc<ServerState>,
     cmd: &[u8],
     args: &[Bytes],
 ) -> Result<RespValue> {
     match cmd.to_ascii_uppercase().as_slice() {
-        // ACL commands
+        // ... (other commands)
         b"ACL" => cmd_acl(server, args),
-
-        // COMMAND introspection
         b"COMMAND" => cmd_command(args),
-
-        // CONFIG command
         b"CONFIG" => cmd_config(server, args),
-
-        // DEBUG command (gated by enable_debug_command)
         b"DEBUG" => cmd_debug(server, args),
-
-        // Memory commands
         b"MEMORY" => cmd_memory(store, args),
-
-        // Latency commands
         b"LATENCY" => cmd_latency(server, args),
-
-        // Slowlog commands
         b"SLOWLOG" => cmd_slowlog(server, args),
-
-        // Server management
-        b"BGREWRITEAOF" => Ok(RespValue::bulk_string(
-            "Background append only file rewriting started",
-        )),
-
-        b"LASTSAVE" => Ok(RespValue::integer(
-            server
-                .last_save_time
-                .load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )),
+        b"BGREWRITEAOF" => cmd_bgrewriteaof(multi_store, server),
+        b"LASTSAVE" => cmd_lastsave(server),
         b"LOLWUT" => cmd_lolwut(args),
-        b"SHUTDOWN" => Err(Error::Custom("ERR Server is shutting down".to_string())),
-        b"TIME" => {
-            let (secs, usecs) = server.time();
-            Ok(RespValue::array(vec![
-                RespValue::bulk_string(&secs.to_string()),
-                RespValue::bulk_string(&usecs.to_string()),
-            ]))
-        }
-
-        // Replication stubs
-        b"FAILOVER" => Ok(RespValue::ok()),
-        b"PSYNC" => Ok(RespValue::bulk_string(
-            "+FULLRESYNC 0000000000000000000000000000000000000000 0",
-        )),
-        b"REPLCONF" => Ok(RespValue::ok()),
-        b"REPLICAOF" | b"SLAVEOF" => Ok(RespValue::ok()),
-        b"ROLE" => Ok(RespValue::array(vec![
-            RespValue::bulk_string("master"),
-            RespValue::integer(0),
-            RespValue::array(vec![]),
-        ])),
-        b"SYNC" => Ok(RespValue::bulk_string("")),
-
-        // Module stubs (gated by enable_module_command)
-        b"MODULE" => cmd_module_gated(server, args),
-
+        b"SHUTDOWN" => cmd_shutdown(server, args),
+        b"TIME" => cmd_time(server),
+        b"FAILOVER" => cmd_failover(server, args),
+        b"PSYNC" => cmd_psync(server, args),
+        b"REPLCONF" => cmd_replconf(server, args),
+        b"REPLICAOF" | b"SLAVEOF" => cmd_replicaof(server, args),
+        b"ROLE" => cmd_role(server),
+        b"SYNC" => cmd_sync(server, args),
+        b"MODULE" => cmd_module(server, args),
         _ => Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd).into_owned(),
         )),
@@ -1346,40 +1309,6 @@ sockudo-kv ver. 7.0.0
     Ok(RespValue::bulk_string(art))
 }
 
-fn cmd_module(args: &[Bytes]) -> Result<RespValue> {
-    if args.is_empty() {
-        return Err(Error::WrongArity("MODULE"));
-    }
-
-    match args[0].to_ascii_uppercase().as_slice() {
-        b"LIST" => Ok(RespValue::array(vec![])),
-        b"LOAD" | b"LOADEX" => Err(Error::Custom(
-            "ERR Module loading not supported".to_string(),
-        )),
-        b"UNLOAD" => Err(Error::Custom("ERR No such module".to_string())),
-        _ => Err(Error::Custom(format!(
-            "ERR Unknown subcommand '{}'",
-            String::from_utf8_lossy(&args[0])
-        ))),
-    }
-}
-
-/// MODULE command with enable_module_command gating
-fn cmd_module_gated(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
-    let config = server.config.read();
-
-    // Check if MODULE command is enabled
-    // "no" = blocked, "yes" = allowed, "local" = allowed only for local connections
-    if !config.enable_module_command {
-        return Err(Error::Custom(
-            "NOPERM The MODULE command is disabled. You can enable it with 'enable-module-command' config option.".to_string()
-        ));
-    }
-
-    drop(config);
-    cmd_module(args)
-}
-
 /// DEBUG command implementation with enable_debug_command gating
 fn cmd_debug(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
     let config = server.config.read();
@@ -1733,4 +1662,349 @@ fn cmd_config_get(server: &Arc<ServerState>, pattern: &[u8]) -> Result<RespValue
     }
 
     Ok(RespValue::array(result))
+}
+
+// === Server Management Commands ===
+
+fn cmd_bgrewriteaof(
+    multi_store: Option<&Arc<MultiStore>>,
+    server: &Arc<ServerState>,
+) -> Result<RespValue> {
+    if server
+        .aof_rewrite_in_progress
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err(Error::Custom(
+            "ERR Background append only file rewriting already in progress".to_string(),
+        ));
+    }
+
+    if server
+        .rdb_bgsave_in_progress
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err(Error::Custom(
+            "ERR Background save already in progress".to_string(),
+        ));
+    }
+
+    let multi_store = match multi_store {
+        Some(s) => s.clone(),
+        None => return Err(Error::Custom("ERR No storage access".to_string())),
+    };
+
+    server
+        .aof_rewrite_in_progress
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let server_state = server.clone();
+    let config = server.config.read().clone();
+    let rdb_config = crate::replication::rdb::RdbConfig {
+        compression: config.rdbcompression,
+        checksum: config.rdbchecksum,
+    };
+
+    tokio::spawn(async move {
+        // Use standard RDB generation as AOF rewrite content (RDB preamble style)
+        let rdb_data = crate::replication::rdb::generate_rdb_with_config(&multi_store, rdb_config);
+
+        // Write to temp file
+        let aof_filename = &config.appendfilename;
+        let temp_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_aof = format!("temp-rewriteaof-bg-{}.aof", temp_suffix);
+        let aof_path = std::path::Path::new(&config.dir).join(aof_filename);
+        let temp_path = std::path::Path::new(&config.dir).join(&temp_aof);
+
+        // Save using helper if possible, or manual write
+        // We reuse the basic file writing logic essentially
+        if let Ok(mut file) = std::fs::File::create(&temp_path) {
+            if let Ok(_) = file.write_all(&rdb_data) {
+                if let Ok(_) = file.sync_all() {
+                    // Atomic rename
+                    if let Ok(_) = std::fs::rename(&temp_path, &aof_path) {
+                        // Success
+                        println!("Background AOF rewrite terminated with success");
+                    } else {
+                        eprintln!("Background AOF rewrite failed: rename error");
+                    }
+                } else {
+                    eprintln!("Background AOF rewrite failed: sync error");
+                }
+            } else {
+                eprintln!("Background AOF rewrite failed: write error");
+            }
+        } else {
+            eprintln!("Background AOF rewrite failed: create error");
+        }
+
+        // Remove temp file if it still exists (on error)
+        if temp_path.exists() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+
+        server_state
+            .aof_rewrite_in_progress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    Ok(RespValue::bulk_string(
+        "Background append only file rewriting started",
+    ))
+}
+
+fn cmd_lastsave(server: &Arc<ServerState>) -> Result<RespValue> {
+    let last = server
+        .last_save_time
+        .load(std::sync::atomic::Ordering::Relaxed) as i64;
+    Ok(RespValue::integer(last))
+}
+
+fn cmd_shutdown(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
+    let save = if args.len() > 1 {
+        let arg = std::str::from_utf8(&args[1]).map_err(|_| Error::Syntax)?;
+        if arg.eq_ignore_ascii_case("NOSAVE") {
+            false
+        } else if arg.eq_ignore_ascii_case("SAVE") {
+            true
+        } else {
+            return Err(Error::Syntax);
+        }
+    } else {
+        // Default behavior: save if save points are configured
+        let config = server.config.read();
+        !config.save_points.is_empty()
+    };
+
+    server
+        .shutdown_save
+        .store(save, std::sync::atomic::Ordering::Relaxed);
+    server
+        .shutdown_asap
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    server.shutdown_notify.notify_waiters();
+
+    Ok(RespValue::ok())
+}
+
+fn cmd_time(server: &Arc<ServerState>) -> Result<RespValue> {
+    let (secs, usecs) = server.time();
+    Ok(RespValue::array(vec![
+        RespValue::bulk_string(&secs.to_string()),
+        RespValue::bulk_string(&usecs.to_string()),
+    ]))
+}
+
+// === Replication Commands ===
+
+fn cmd_failover(server: &Arc<ServerState>, _args: &[Bytes]) -> Result<RespValue> {
+    // Manual failover (switch to master)
+    *server.role.write() = Role::Master;
+    // Reset master info
+    *server.master_host.write() = None;
+    server
+        .master_port
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    Ok(RespValue::ok())
+}
+
+fn cmd_psync(server: &Arc<ServerState>, _args: &[Bytes]) -> Result<RespValue> {
+    // Always perform full resync for now
+    let replid = server.master_replid.read().clone();
+    let offset = server
+        .master_repl_offset
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // PSYNC response is a Simple String in the format +FULLRESYNC <replid> <offset>
+    let resp = format!("FULLRESYNC {} {}", replid, offset);
+    Ok(RespValue::SimpleString(Bytes::copy_from_slice(
+        resp.as_bytes(),
+    )))
+}
+
+fn cmd_replconf(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
+    // Simplified REPLCONF handler
+    for i in (1..args.len()).step_by(2) {
+        if i + 1 >= args.len() {
+            break;
+        }
+        let sub = std::str::from_utf8(&args[i]).unwrap_or("");
+        if sub.eq_ignore_ascii_case("ACK") {
+            // Process ACK (ignore for now)
+            return Ok(RespValue::ok());
+        } else if sub.eq_ignore_ascii_case("GETACK") {
+            // Return ACK with current offset
+            let offset = server
+                .master_repl_offset
+                .load(std::sync::atomic::Ordering::Relaxed);
+            return Ok(RespValue::array(vec![
+                RespValue::bulk_string("REPLCONF"),
+                RespValue::bulk_string("ACK"),
+                RespValue::bulk_string(&offset.to_string()),
+            ]));
+        }
+    }
+    Ok(RespValue::ok())
+}
+
+fn cmd_replicaof(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
+    if args.len() < 3 {
+        return Err(Error::WrongArity("REPLICAOF"));
+    }
+    let host = std::str::from_utf8(&args[1]).map_err(|_| Error::Syntax)?;
+    let port_str = std::str::from_utf8(&args[2]).map_err(|_| Error::Syntax)?;
+
+    if host.eq_ignore_ascii_case("NO") && port_str.eq_ignore_ascii_case("ONE") {
+        *server.role.write() = Role::Master;
+        *server.master_host.write() = None;
+        server
+            .master_port
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        return Ok(RespValue::ok());
+    }
+
+    let port: u32 = port_str.parse().map_err(|_| Error::NotInteger)?;
+
+    *server.role.write() = Role::Slave;
+    *server.master_host.write() = Some(host.to_string());
+    server
+        .master_port
+        .store(port, std::sync::atomic::Ordering::Relaxed);
+    Ok(RespValue::ok())
+}
+
+fn cmd_role(server: &Arc<ServerState>) -> Result<RespValue> {
+    let role = *server.role.read();
+    match role {
+        Role::Master => {
+            let offset = server
+                .master_repl_offset
+                .load(std::sync::atomic::Ordering::Relaxed) as i64;
+            // master, offset, slaves (empty for now)
+            Ok(RespValue::array(vec![
+                RespValue::bulk_string("master"),
+                RespValue::integer(offset),
+                RespValue::array(vec![]),
+            ]))
+        }
+        Role::Slave => {
+            let host = server.master_host.read().clone().unwrap_or_default();
+            let port = server
+                .master_port
+                .load(std::sync::atomic::Ordering::Relaxed) as i64;
+            let offset = server
+                .master_repl_offset
+                .load(std::sync::atomic::Ordering::Relaxed) as i64;
+            // slave, master_ip, master_port, status, offset
+            Ok(RespValue::array(vec![
+                RespValue::bulk_string("slave"),
+                RespValue::bulk_string(&host),
+                RespValue::integer(port),
+                RespValue::bulk_string("connected"),
+                RespValue::integer(offset),
+            ]))
+        }
+    }
+}
+
+fn cmd_sync(server: &Arc<ServerState>, _args: &[Bytes]) -> Result<RespValue> {
+    // Treat SYNC same as PSYNC / FULLRESYNC in this simple impl
+    cmd_psync(server, _args)
+}
+
+fn cmd_module(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
+    if args.len() < 2 {
+        return Err(Error::WrongArity("MODULE"));
+    }
+
+    // Check if module command is enabled in config
+    if !server.config.read().enable_module_command {
+        return Err(Error::UnknownCommand("MODULE".to_string()));
+    }
+
+    let sub = std::str::from_utf8(&args[1]).map_err(|_| Error::Syntax)?;
+    match sub.to_uppercase().as_str() {
+        "LOAD" => Err(Error::Custom(
+            "ERR MODULE LOAD not supported in this build".to_string(),
+        )),
+        "UNLOAD" => Err(Error::Custom("ERR MODULE UNLOAD not supported".to_string())),
+        "LIST" => Ok(RespValue::array(vec![])),
+        _ => Err(Error::Custom(format!("ERR Unknown subcommand '{}'", sub))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_shutdown_command() {
+        // Create server state
+        let server = Arc::new(ServerState::new());
+
+        // Test SHUTDOWN SAVE
+        let args_save = vec![Bytes::from("SHUTDOWN"), Bytes::from("SAVE")];
+        let res = cmd_shutdown(&server, &args_save);
+        assert!(res.is_ok());
+        assert!(
+            server
+                .shutdown_asap
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(
+            server
+                .shutdown_save
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        // Reset flags
+        server
+            .shutdown_asap
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        server
+            .shutdown_save
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Test SHUTDOWN NOSAVE
+        let args_nosave = vec![Bytes::from("SHUTDOWN"), Bytes::from("NOSAVE")];
+        let res = cmd_shutdown(&server, &args_nosave);
+        assert!(res.is_ok());
+        assert!(
+            server
+                .shutdown_asap
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(
+            !server
+                .shutdown_save
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        // Test SHUTDOWN (Default)
+        // Ensure config has save points or not. Default is yes?
+        // Default ServerConfig usually has save points.
+        server
+            .shutdown_asap
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let args_default = vec![Bytes::from("SHUTDOWN")];
+        let res = cmd_shutdown(&server, &args_default);
+        assert!(res.is_ok());
+        assert!(
+            server
+                .shutdown_asap
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        // Check current config default.
+        // If save points exist, it should be true.
+        let has_save_points = !server.config.read().save_points.is_empty();
+        assert_eq!(
+            server
+                .shutdown_save
+                .load(std::sync::atomic::Ordering::Relaxed),
+            has_save_points
+        );
+    }
 }

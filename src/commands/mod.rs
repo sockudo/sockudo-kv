@@ -51,7 +51,7 @@ pub mod topk;
 use crate::error::{Error, Result};
 use crate::protocol::{Command, RespValue};
 use crate::server_state::ServerState;
-use crate::storage::Store;
+use crate::storage::{MultiStore, Store};
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -61,8 +61,13 @@ pub struct Dispatcher;
 impl Dispatcher {
     /// Execute a command with full server state (for external commands)
     #[inline]
-    pub fn execute(store: &Store, server: &Arc<ServerState>, cmd: Command) -> RespValue {
-        match Self::execute_inner(store, Some(server), &cmd) {
+    pub fn execute(
+        multi_store: &Arc<MultiStore>,
+        store: &Store,
+        server: &Arc<ServerState>,
+        cmd: Command,
+    ) -> RespValue {
+        match Self::execute_inner(Some(multi_store), store, Some(server), &cmd) {
             Ok(resp) => resp,
             Err(e) => RespValue::error(&e.to_string()),
         }
@@ -72,13 +77,14 @@ impl Dispatcher {
     /// Server-specific commands will return an error in this mode
     #[inline]
     pub fn execute_basic(store: &Store, cmd: Command) -> RespValue {
-        match Self::execute_inner(store, None, &cmd) {
+        match Self::execute_inner(None, store, None, &cmd) {
             Ok(resp) => resp,
             Err(e) => RespValue::error(&e.to_string()),
         }
     }
 
     fn execute_inner(
+        multi_store: Option<&Arc<MultiStore>>,
         store: &Store,
         server: Option<&Arc<ServerState>>,
         cmd: &Command,
@@ -186,7 +192,7 @@ impl Dispatcher {
         // Server commands (need ServerState) - includes CONFIG now
         if is_server_command(cmd_name) {
             return match server {
-                Some(srv) => server::execute(store, srv, cmd_name, args),
+                Some(srv) => server::execute(multi_store, store, srv, cmd_name, args),
                 None => Err(Error::Custom(
                     "ERR server commands not available in this context".to_string(),
                 )),

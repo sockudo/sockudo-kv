@@ -820,6 +820,24 @@ sockudo-kv v7.0.0 - High-performance Redis-compatible server
         _ = tokio::signal::ctrl_c() => {
              println!("Shutdown signal received.");
         }
+        _ = server_state.shutdown_notify.notified() => {
+            println!("Shutdown command received.");
+            if server_state.shutdown_save.load(std::sync::atomic::Ordering::Relaxed) {
+                println!("Saving DB before shutdown...");
+                let rdb_path = Path::new(&config.dir).join(&config.dbfilename);
+                let rdb_config = RdbConfig {
+                    compression: config.rdbcompression,
+                    checksum: config.rdbchecksum,
+                };
+                let data = sockudo_kv::replication::rdb::generate_rdb_with_config(&multi_store, rdb_config);
+                // Use save_rdb_file helper defined at bottom of file using false (no incremental fsync for shutdown save usually)
+                if let Err(e) = save_rdb_file(&rdb_path, &data, false) {
+                     eprintln!("Failed to save RDB: {}", e);
+                } else {
+                     println!("DB saved to {:?}", rdb_path);
+                }
+            }
+        }
         _ = async { tasks.join_all().await } => {
             println!("All listeners stopped unexpectedly.");
         }
@@ -1205,7 +1223,7 @@ where
                                         }
                                     } else {
                                         let store = multi_store.db(client.current_db());
-                                        let response = Dispatcher::execute(&store, server_state, cmd);
+                                        let response = Dispatcher::execute(multi_store, &store, server_state, cmd);
                                         if client.should_reply() {
                                             response.write_to(&mut write_buf);
                                         }

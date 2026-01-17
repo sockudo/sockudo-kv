@@ -54,8 +54,9 @@ pub use store::{EncodingConfig, Store};
 
 // Re-export commonly used types
 pub use types::{
-    Aggregation, CompactionRule, DataType, DuplicatePolicy, Entry, HyperLogLogData, SortedSetData,
-    StreamData, StreamId, TimeSeriesInfo, VectorQuantization,
+    Aggregation, CompactionRule, Consumer, ConsumerGroup, DataType, DuplicatePolicy, Entry,
+    HyperLogLogData, PendingEntry, SortedSetData, StreamData, StreamId, TimeSeriesInfo, VectorNode,
+    VectorQuantization, VectorSetData,
 };
 pub use value::now_ms;
 

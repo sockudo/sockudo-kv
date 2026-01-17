@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
 
 use crate::cluster_state::ClusterState;
 use crate::config::ServerConfig;
@@ -67,6 +68,22 @@ impl AclLogReason {
             AclLogReason::Command => "command",
             AclLogReason::Key => "key",
             AclLogReason::Channel => "channel",
+        }
+    }
+}
+
+/// Server Role
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Master,
+    Slave,
+}
+
+impl Role {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Master => "master",
+            Role::Slave => "slave",
         }
     }
 }
@@ -488,6 +505,9 @@ pub struct ServerState {
     // === Shutdown ===
     /// Shutdown timeout in seconds for replica sync
     pub shutdown_timeout: AtomicU64,
+    pub shutdown_asap: AtomicBool,
+    pub shutdown_save: AtomicBool,
+    pub shutdown_notify: Arc<Notify>,
 
     // === Client Limits ===
     /// Maximum client query buffer size in bytes (default 1GB)
@@ -504,6 +524,18 @@ pub struct ServerState {
     // === Keyspace Notifications ===
     /// Keyspace notification emitter (initialized after PubSub)
     pub keyspace_notifier: RwLock<Option<Arc<KeyspaceNotifier>>>,
+
+    // === Replication ===
+    pub role: RwLock<Role>,
+    pub master_host: RwLock<Option<String>>,
+    pub master_port: AtomicU32, // using u32 to match config, or u16? Config usually uses u16 but let's check. Redis often uses int.
+    pub master_replid: RwLock<String>,
+    pub master_replid2: RwLock<String>,
+    pub master_repl_offset: AtomicU64,
+    pub second_repl_offset: AtomicU64,
+    pub repl_backlog_size: AtomicU64,
+    pub repl_backlog_off: AtomicU64,
+    pub repl_backlog_histlen: AtomicU64,
 }
 
 impl ServerState {
@@ -528,7 +560,7 @@ impl ServerState {
             acl_log_next_id: AtomicU64::new(0),
 
             last_save_time: AtomicU64::new(now),
-            last_bgsave_status: AtomicBool::new(true),
+            last_bgsave_status: AtomicBool::new(false),
             aof_enabled: AtomicBool::new(false),
             rdb_bgsave_in_progress: AtomicBool::new(false),
             aof_rewrite_in_progress: AtomicBool::new(false),
@@ -590,6 +622,9 @@ impl ServerState {
 
             // Shutdown default
             shutdown_timeout: AtomicU64::new(10),
+            shutdown_asap: AtomicBool::new(false),
+            shutdown_save: AtomicBool::new(false),
+            shutdown_notify: Arc::new(Notify::new()),
 
             // Client limits
             client_query_buffer_limit: AtomicU64::new(1024 * 1024 * 1024), // 1GB
@@ -601,6 +636,18 @@ impl ServerState {
 
             // Keyspace notifications (initialized after PubSub is created)
             keyspace_notifier: RwLock::new(None),
+
+            // Replication defaults
+            role: RwLock::new(Role::Master),
+            master_host: RwLock::new(None),
+            master_port: AtomicU32::new(0),
+            master_replid: RwLock::new(generate_replid()),
+            master_replid2: RwLock::new(String::from("0000000000000000000000000000000000000000")),
+            master_repl_offset: AtomicU64::new(0),
+            second_repl_offset: AtomicU64::new(0),
+            repl_backlog_size: AtomicU64::new(1024 * 1024), // 1MB default
+            repl_backlog_off: AtomicU64::new(0),
+            repl_backlog_histlen: AtomicU64::new(0),
         };
 
         // Create default user
@@ -1725,4 +1772,19 @@ mod tests {
         assert!(secs > 0);
         assert!(usecs < 1_000_000);
     }
+}
+
+/// Generate a random 40-character replication ID
+fn generate_replid() -> String {
+    let chars: String = (0..40)
+        .map(|_| {
+            let idx = fastrand::u8(0..16);
+            if idx < 10 {
+                (b'0' + idx) as char
+            } else {
+                (b'a' + idx - 10) as char
+            }
+        })
+        .collect();
+    chars
 }

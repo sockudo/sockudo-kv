@@ -11,6 +11,12 @@ use crate::storage::{DataType, Entry, Store};
 /// Cuckoo Filter storage operations
 impl Store {
     /// CF.RESERVE - Create a new Cuckoo Filter with specified parameters
+    ///
+    /// Follows Redis/RedisBloom CF.RESERVE conventions:
+    /// - capacity: Number of items the filter is expected to hold
+    /// - bucket_size: Number of items per bucket (default: 2 per RedisBloom)
+    /// - max_iterations: Maximum cuckoo kicks before giving up (default: 500)
+    /// - expansion: Expansion factor for sub-filters when scaling (default: 1)
     pub fn cf_reserve(
         &self,
         key: Bytes,
@@ -23,12 +29,14 @@ impl Store {
             return Err(Error::Other("ERR item exists"));
         }
 
+        // Use RedisBloom-compatible defaults
+        let defaults = CuckooFilterConfig::default();
         let config = CuckooFilterConfig {
             capacity,
-            bucket_size: bucket_size.unwrap_or(2),
-            max_iterations: max_iterations.unwrap_or(20),
-            expansion: expansion.unwrap_or(1),
-            fingerprint_bits: 16,
+            bucket_size: bucket_size.unwrap_or(defaults.bucket_size),
+            max_iterations: max_iterations.unwrap_or(defaults.max_iterations),
+            expansion: expansion.unwrap_or(defaults.expansion),
+            fingerprint_bits: defaults.fingerprint_bits,
         };
 
         let cf = ScalableCuckooFilter::new(config);

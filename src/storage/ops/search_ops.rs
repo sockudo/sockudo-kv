@@ -11,48 +11,110 @@ use crate::storage::Store;
 
 // ==================== Search Index Types ====================
 
-/// Field types for indexing
+/// Field types for indexing (Redis-compatible)
+///
+/// Supports all RediSearch field types with their full options:
+/// - TEXT: Full-text searchable fields with stemming, phonetic matching, and weights
+/// - TAG: Exact-match fields with custom separators (like categories, labels)
+/// - NUMERIC: Sortable numeric fields supporting range queries
+/// - GEO: Geographic coordinates supporting radius queries
+/// - VECTOR: High-dimensional vectors for similarity search (KNN, range)
+/// - GEOSHAPE: Complex geographic shapes (polygons, etc.) - placeholder
 #[derive(Debug, Clone)]
 pub enum FieldType {
+    /// Full-text searchable field
     Text {
+        /// Field weight for scoring (default: 1.0)
         weight: f64,
+        /// Disable stemming for this field
         nostem: bool,
+        /// Phonetic matching algorithm (dm:en = Double Metaphone English)
         phonetic: Option<String>,
+        /// Allow sorting by this field
         sortable: bool,
+        /// Don't index this field (store only)
         noindex: bool,
+        /// Use uncompressed inverted index for faster phrase queries
+        withsuffixtrie: bool,
     },
+    /// Tag field for exact matching with separator
     Tag {
+        /// Character used to split tags (default: ',')
         separator: char,
+        /// Case-sensitive matching
         casesensitive: bool,
+        /// Allow sorting by this field
         sortable: bool,
+        /// Don't index this field
         noindex: bool,
+        /// Use uncompressed suffix trie for contains queries
+        withsuffixtrie: bool,
     },
+    /// Numeric field for range queries
     Numeric {
+        /// Allow sorting by this field
         sortable: bool,
+        /// Don't index this field
         noindex: bool,
     },
+    /// Geographic coordinate field
     Geo {
+        /// Allow sorting by distance
         sortable: bool,
+        /// Don't index this field
         noindex: bool,
     },
+    /// Vector field for similarity search
     Vector {
+        /// Search algorithm (FLAT or HNSW)
         algorithm: VectorAlgorithm,
+        /// Vector dimensions
         dim: usize,
+        /// Distance metric (L2, IP, COSINE)
         distance_metric: DistanceMetric,
+        /// Initial index capacity
         initial_cap: usize,
+        /// HNSW-specific: max edges per node at each level
+        m: Option<usize>,
+        /// HNSW-specific: ef during construction
+        ef_construction: Option<usize>,
+        /// HNSW-specific: ef during runtime search
+        ef_runtime: Option<usize>,
+        /// Quantization type (FLOAT32, FLOAT16, INT8)
+        data_type: VectorDataType,
+    },
+    /// Geographic shape field (polygons, etc.)
+    GeoShape {
+        /// Coordinate system (FLAT, SPHERICAL)
+        coord_system: CoordSystem,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorAlgorithm {
+    /// Brute-force flat index - exact results, O(n) search
     Flat,
+    /// Hierarchical Navigable Small World graph - approximate results, O(log n) search
     Hnsw,
+}
+
+impl VectorAlgorithm {
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        match b.to_ascii_uppercase().as_slice() {
+            b"FLAT" => Some(Self::Flat),
+            b"HNSW" => Some(Self::Hnsw),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistanceMetric {
+    /// Euclidean distance (L2 norm)
     L2,
-    IP, // Inner Product
+    /// Inner Product (dot product) - for normalized vectors
+    IP,
+    /// Cosine similarity (1 - cosine distance)
     Cosine,
 }
 
@@ -62,6 +124,46 @@ impl DistanceMetric {
             b"L2" => Some(Self::L2),
             b"IP" => Some(Self::IP),
             b"COSINE" => Some(Self::Cosine),
+            _ => None,
+        }
+    }
+}
+
+/// Vector data type for quantization
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorDataType {
+    #[default]
+    Float32,
+    Float16,
+    Int8,
+}
+
+impl VectorDataType {
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        match b.to_ascii_uppercase().as_slice() {
+            b"FLOAT32" => Some(Self::Float32),
+            b"FLOAT16" => Some(Self::Float16),
+            b"INT8" | b"BFLOAT16" => Some(Self::Int8),
+            _ => None,
+        }
+    }
+}
+
+/// Coordinate system for geo shapes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CoordSystem {
+    /// Flat 2D plane
+    Flat,
+    /// Spherical (Earth) coordinates
+    #[default]
+    Spherical,
+}
+
+impl CoordSystem {
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        match b.to_ascii_uppercase().as_slice() {
+            b"FLAT" => Some(Self::Flat),
+            b"SPHERICAL" => Some(Self::Spherical),
             _ => None,
         }
     }
@@ -658,6 +760,577 @@ fn encode_geohash(lat: f64, lon: f64, precision: usize) -> String {
     }
 
     geohash
+}
+
+// ==================== RediSearch Query Parser ====================
+
+/// Query node representing parsed RediSearch query
+#[derive(Debug, Clone)]
+pub enum QueryNode {
+    /// Match all documents
+    MatchAll,
+    /// Simple text search term
+    Term(String),
+    /// Exact phrase match "hello world"
+    Phrase(Vec<String>),
+    /// Prefix match hello*
+    Prefix(String),
+    /// Suffix match *world (with suffix trie)
+    Suffix(String),
+    /// Contains match *ello* (with suffix trie)
+    Contains(String),
+    /// Field-specific query @field:value
+    Field {
+        field: String,
+        query: Box<QueryNode>,
+    },
+    /// Tag query @field:{tag1|tag2}
+    Tag { field: String, tags: Vec<String> },
+    /// Numeric range @field:[min max]
+    NumericRange {
+        field: String,
+        min: f64,
+        max: f64,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    },
+    /// Geo radius @field:[lon lat radius unit]
+    GeoRadius {
+        field: String,
+        lon: f64,
+        lat: f64,
+        radius: f64,
+        unit: GeoUnit,
+    },
+    /// Vector KNN search [KNN n @field $vec]
+    VectorKnn {
+        field: String,
+        k: usize,
+        vector_param: String,
+    },
+    /// Vector range search [VECTOR_RANGE radius @field $vec]
+    VectorRange {
+        field: String,
+        radius: f32,
+        vector_param: String,
+    },
+    /// Boolean AND (intersection)
+    And(Vec<QueryNode>),
+    /// Boolean OR (union)
+    Or(Vec<QueryNode>),
+    /// Boolean NOT (negation)
+    Not(Box<QueryNode>),
+    /// Optional term ~term
+    Optional(Box<QueryNode>),
+    /// Fuzzy match term%n
+    Fuzzy { term: String, distance: u8 },
+}
+
+/// Geo distance unit
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoUnit {
+    Meters,
+    Kilometers,
+    Miles,
+    Feet,
+}
+
+impl GeoUnit {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "m" => Some(Self::Meters),
+            "km" => Some(Self::Kilometers),
+            "mi" => Some(Self::Miles),
+            "ft" => Some(Self::Feet),
+            _ => None,
+        }
+    }
+
+    pub fn to_meters(&self, value: f64) -> f64 {
+        match self {
+            Self::Meters => value,
+            Self::Kilometers => value * 1000.0,
+            Self::Miles => value * 1609.34,
+            Self::Feet => value * 0.3048,
+        }
+    }
+}
+
+/// Parse a RediSearch query string into a QueryNode AST
+pub fn parse_query(query: &str) -> QueryNode {
+    let query = query.trim();
+
+    // Empty query or "*" matches all
+    if query.is_empty() || query == "*" {
+        return QueryNode::MatchAll;
+    }
+
+    // Parse the query tokens
+    let mut parser = QueryParser::new(query);
+    parser.parse()
+}
+
+struct QueryParser<'a> {
+    input: &'a str,
+    pos: usize,
+}
+
+impl<'a> QueryParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, pos: 0 }
+    }
+
+    fn parse(&mut self) -> QueryNode {
+        let mut nodes = Vec::new();
+
+        while !self.is_eof() {
+            self.skip_whitespace();
+            if self.is_eof() {
+                break;
+            }
+
+            if let Some(node) = self.parse_primary() {
+                nodes.push(node);
+            }
+        }
+
+        if nodes.is_empty() {
+            QueryNode::MatchAll
+        } else if nodes.len() == 1 {
+            nodes.pop().unwrap()
+        } else {
+            // Default is AND between terms
+            QueryNode::And(nodes)
+        }
+    }
+
+    fn parse_primary(&mut self) -> Option<QueryNode> {
+        self.skip_whitespace();
+
+        let ch = self.peek_char()?;
+
+        match ch {
+            // Negation
+            '-' => {
+                self.advance();
+                let inner = self.parse_primary()?;
+                Some(QueryNode::Not(Box::new(inner)))
+            }
+            // Optional
+            '~' => {
+                self.advance();
+                let inner = self.parse_primary()?;
+                Some(QueryNode::Optional(Box::new(inner)))
+            }
+            // Field query @field:...
+            '@' => self.parse_field_query(),
+            // Phrase "..."
+            '"' => self.parse_phrase(),
+            // Parenthesized expression
+            '(' => self.parse_group(),
+            // OR operator
+            '|' => {
+                self.advance();
+                None // Will be handled by caller
+            }
+            // Vector query [KNN ...]
+            '[' => self.parse_bracket_query(),
+            // Regular term
+            _ => self.parse_term(),
+        }
+    }
+
+    fn parse_field_query(&mut self) -> Option<QueryNode> {
+        self.expect('@')?;
+
+        let field = self.parse_identifier()?;
+        self.expect(':')?;
+
+        self.skip_whitespace();
+        let ch = self.peek_char()?;
+
+        match ch {
+            // Tag query @field:{tag1|tag2}
+            '{' => {
+                self.advance();
+                let tags = self.parse_tags();
+                self.expect('}');
+                Some(QueryNode::Tag { field, tags })
+            }
+            // Numeric range @field:[min max]
+            '[' => {
+                self.advance();
+                let result = self.parse_numeric_or_geo_range(&field);
+                self.expect(']');
+                result
+            }
+            // Parenthesized query @field:(term1 term2)
+            '(' => {
+                self.advance();
+                let inner = self.parse_until_char(')')?;
+                self.expect(')');
+
+                // Recursively parse the inner query
+                let mut inner_parser = QueryParser::new(&inner);
+                let inner_node = inner_parser.parse();
+
+                Some(QueryNode::Field {
+                    field,
+                    query: Box::new(inner_node),
+                })
+            }
+            // Simple value @field:value
+            _ => {
+                let value = self.parse_value()?;
+
+                // Check for prefix/suffix/contains patterns
+                if value.ends_with('*') && value.starts_with('*') && value.len() > 2 {
+                    Some(QueryNode::Field {
+                        field,
+                        query: Box::new(QueryNode::Contains(value[1..value.len() - 1].to_string())),
+                    })
+                } else if value.ends_with('*') && value.len() > 1 {
+                    Some(QueryNode::Field {
+                        field,
+                        query: Box::new(QueryNode::Prefix(value[..value.len() - 1].to_string())),
+                    })
+                } else if value.starts_with('*') && value.len() > 1 {
+                    Some(QueryNode::Field {
+                        field,
+                        query: Box::new(QueryNode::Suffix(value[1..].to_string())),
+                    })
+                } else {
+                    Some(QueryNode::Field {
+                        field,
+                        query: Box::new(QueryNode::Term(value)),
+                    })
+                }
+            }
+        }
+    }
+
+    fn parse_tags(&mut self) -> Vec<String> {
+        let mut tags = Vec::new();
+        let mut current = String::new();
+
+        while let Some(ch) = self.peek_char() {
+            if ch == '}' {
+                break;
+            }
+            self.advance();
+
+            if ch == '|' {
+                if !current.is_empty() {
+                    tags.push(current.trim().to_string());
+                    current = String::new();
+                }
+            } else {
+                current.push(ch);
+            }
+        }
+
+        if !current.is_empty() {
+            tags.push(current.trim().to_string());
+        }
+
+        tags
+    }
+
+    fn parse_numeric_or_geo_range(&mut self, field: &str) -> Option<QueryNode> {
+        self.skip_whitespace();
+
+        // Check if this is a geo query (starts with coordinate)
+        let content = self.peek_until_char(']');
+        let parts: Vec<&str> = content.split_whitespace().collect();
+
+        if parts.len() >= 4 {
+            // Could be geo: [lon lat radius unit]
+            if let (Ok(lon), Ok(lat), Ok(radius)) = (
+                parts[0].parse::<f64>(),
+                parts[1].parse::<f64>(),
+                parts[2].parse::<f64>(),
+            ) {
+                let unit = GeoUnit::from_str(parts[3]).unwrap_or(GeoUnit::Kilometers);
+                // Consume the content
+                for _ in 0..content.len() {
+                    self.advance();
+                }
+                return Some(QueryNode::GeoRadius {
+                    field: field.to_string(),
+                    lon,
+                    lat,
+                    radius,
+                    unit,
+                });
+            }
+        }
+
+        // Numeric range: [min max] or [(min max] or [min (max]
+        let min_inclusive = !content.starts_with('(');
+        let content = content.trim_start_matches('(');
+
+        let parts: Vec<&str> = content.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let min = if parts[0] == "-inf" {
+                f64::NEG_INFINITY
+            } else {
+                parts[0]
+                    .trim_start_matches('(')
+                    .parse()
+                    .unwrap_or(f64::NEG_INFINITY)
+            };
+
+            let max_str = parts[1].trim_end_matches(')');
+            let max_inclusive = !parts[1].starts_with('(');
+            let max = if max_str == "+inf" || max_str == "inf" {
+                f64::INFINITY
+            } else {
+                max_str
+                    .trim_start_matches('(')
+                    .parse()
+                    .unwrap_or(f64::INFINITY)
+            };
+
+            // Consume content
+            for _ in 0..content.len() {
+                self.advance();
+            }
+
+            return Some(QueryNode::NumericRange {
+                field: field.to_string(),
+                min,
+                max,
+                min_inclusive,
+                max_inclusive,
+            });
+        }
+
+        None
+    }
+
+    fn parse_phrase(&mut self) -> Option<QueryNode> {
+        self.expect('"')?;
+        let content = self.parse_until_char('"')?;
+        self.expect('"');
+
+        let words: Vec<String> = content
+            .split_whitespace()
+            .map(|s| s.to_lowercase())
+            .collect();
+
+        if words.is_empty() {
+            None
+        } else if words.len() == 1 {
+            Some(QueryNode::Term(words.into_iter().next().unwrap()))
+        } else {
+            Some(QueryNode::Phrase(words))
+        }
+    }
+
+    fn parse_group(&mut self) -> Option<QueryNode> {
+        self.expect('(')?;
+        let content = self.parse_balanced_parens()?;
+        self.expect(')');
+
+        let mut inner_parser = QueryParser::new(&content);
+        Some(inner_parser.parse())
+    }
+
+    fn parse_bracket_query(&mut self) -> Option<QueryNode> {
+        self.expect('[')?;
+        self.skip_whitespace();
+
+        // Check for KNN or VECTOR_RANGE
+        let keyword = self.parse_identifier()?;
+
+        match keyword.to_uppercase().as_str() {
+            "KNN" => {
+                self.skip_whitespace();
+                let k: usize = self.parse_number()?.parse().ok()?;
+                self.skip_whitespace();
+                self.expect('@')?;
+                let field = self.parse_identifier()?;
+                self.skip_whitespace();
+                let vector_param = self.parse_value()?;
+                self.skip_whitespace();
+                self.expect(']');
+
+                Some(QueryNode::VectorKnn {
+                    field,
+                    k,
+                    vector_param,
+                })
+            }
+            "VECTOR_RANGE" => {
+                self.skip_whitespace();
+                let radius: f32 = self.parse_number()?.parse().ok()?;
+                self.skip_whitespace();
+                self.expect('@')?;
+                let field = self.parse_identifier()?;
+                self.skip_whitespace();
+                let vector_param = self.parse_value()?;
+                self.skip_whitespace();
+                self.expect(']');
+
+                Some(QueryNode::VectorRange {
+                    field,
+                    radius,
+                    vector_param,
+                })
+            }
+            _ => {
+                // Unknown bracket query, skip to ]
+                self.parse_until_char(']');
+                self.expect(']');
+                None
+            }
+        }
+    }
+
+    fn parse_term(&mut self) -> Option<QueryNode> {
+        let term = self.parse_value()?;
+
+        // Check for fuzzy match (term%n)
+        if term.contains('%') {
+            let parts: Vec<&str> = term.splitn(2, '%').collect();
+            if parts.len() == 2 {
+                let distance: u8 = parts[1].parse().unwrap_or(1);
+                return Some(QueryNode::Fuzzy {
+                    term: parts[0].to_lowercase(),
+                    distance,
+                });
+            }
+        }
+
+        // Check for prefix/suffix/contains
+        if term.ends_with('*') && term.starts_with('*') && term.len() > 2 {
+            Some(QueryNode::Contains(term[1..term.len() - 1].to_lowercase()))
+        } else if term.ends_with('*') && term.len() > 1 {
+            Some(QueryNode::Prefix(term[..term.len() - 1].to_lowercase()))
+        } else if term.starts_with('*') && term.len() > 1 {
+            Some(QueryNode::Suffix(term[1..].to_lowercase()))
+        } else {
+            Some(QueryNode::Term(term.to_lowercase()))
+        }
+    }
+
+    // Helper methods
+    fn is_eof(&self) -> bool {
+        self.pos >= self.input.len()
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.input[self.pos..].chars().next()
+    }
+
+    fn advance(&mut self) -> Option<char> {
+        let ch = self.peek_char()?;
+        self.pos += ch.len_utf8();
+        Some(ch)
+    }
+
+    fn expect(&mut self, expected: char) -> Option<()> {
+        if self.peek_char() == Some(expected) {
+            self.advance();
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(ch) = self.peek_char() {
+            if ch.is_whitespace() {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn parse_identifier(&mut self) -> Option<String> {
+        let mut id = String::new();
+        while let Some(ch) = self.peek_char() {
+            if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+                id.push(ch);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if id.is_empty() { None } else { Some(id) }
+    }
+
+    fn parse_value(&mut self) -> Option<String> {
+        let mut value = String::new();
+        while let Some(ch) = self.peek_char() {
+            if ch.is_whitespace() || ch == ')' || ch == ']' || ch == '}' || ch == '|' {
+                break;
+            }
+            value.push(ch);
+            self.advance();
+        }
+        if value.is_empty() { None } else { Some(value) }
+    }
+
+    fn parse_number(&mut self) -> Option<String> {
+        let mut num = String::new();
+        while let Some(ch) = self.peek_char() {
+            if ch.is_ascii_digit() || ch == '.' || ch == '-' {
+                num.push(ch);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if num.is_empty() { None } else { Some(num) }
+    }
+
+    fn parse_until_char(&mut self, end: char) -> Option<String> {
+        let mut content = String::new();
+        while let Some(ch) = self.peek_char() {
+            if ch == end {
+                break;
+            }
+            content.push(ch);
+            self.advance();
+        }
+        Some(content)
+    }
+
+    fn peek_until_char(&self, end: char) -> String {
+        let remaining = &self.input[self.pos..];
+        remaining.chars().take_while(|&c| c != end).collect()
+    }
+
+    fn parse_balanced_parens(&mut self) -> Option<String> {
+        let mut content = String::new();
+        let mut depth = 0i32;
+
+        while let Some(ch) = self.peek_char() {
+            match ch {
+                '(' => {
+                    depth += 1;
+                    content.push(ch);
+                    self.advance();
+                }
+                ')' => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    content.push(ch);
+                    self.advance();
+                }
+                _ => {
+                    content.push(ch);
+                    self.advance();
+                }
+            }
+        }
+
+        Some(content)
+    }
 }
 
 // ==================== Store Integration ====================

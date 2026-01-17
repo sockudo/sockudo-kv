@@ -642,12 +642,14 @@ impl ChunkCache {
 // Chunk Builder
 // ============================================================================
 
-/// Builder for creating compressed chunks
+/// Builder for creating compressed chunks with duplicate policy support
 #[derive(Debug)]
 pub struct ChunkBuilder {
     chunk: CompressedChunk,
     ts_codec: TimestampCodec,
     val_codec: FloatCodec,
+    /// Pending sample that hasn't been encoded yet (for duplicate handling)
+    pending_sample: Option<(i64, f64)>,
 }
 
 impl ChunkBuilder {
@@ -656,11 +658,85 @@ impl ChunkBuilder {
             chunk: CompressedChunk::new(start_time),
             ts_codec: TimestampCodec::new(),
             val_codec: FloatCodec::new(),
+            pending_sample: None,
         }
     }
 
-    /// Add a sample to the chunk
+    /// Add a sample to the chunk with duplicate policy handling
+    ///
+    /// The duplicate policy determines behavior when a sample with the same timestamp
+    /// as the pending sample arrives:
+    /// - Block: Returns false (caller should reject)
+    /// - First: Ignores the new value, keeps the first
+    /// - Last: Replaces with the new value
+    /// - Min: Keeps the minimum of the two values
+    /// - Max: Keeps the maximum of the two values
+    /// - Sum: Adds the values together
+    pub fn add_with_policy(
+        &mut self,
+        timestamp: i64,
+        value: f64,
+        policy: DuplicatePolicy,
+    ) -> Result<(), &'static str> {
+        // Check if this is a duplicate of the pending sample
+        if let Some((pending_ts, pending_val)) = self.pending_sample {
+            if timestamp == pending_ts {
+                // Handle duplicate according to policy
+                let new_value = match policy {
+                    DuplicatePolicy::Block => {
+                        return Err("TSDB: duplicate timestamp");
+                    }
+                    DuplicatePolicy::First => {
+                        // Keep existing value, ignore new one
+                        return Ok(());
+                    }
+                    DuplicatePolicy::Last => {
+                        // Replace with new value
+                        value
+                    }
+                    DuplicatePolicy::Min => {
+                        // Keep minimum
+                        pending_val.min(value)
+                    }
+                    DuplicatePolicy::Max => {
+                        // Keep maximum
+                        pending_val.max(value)
+                    }
+                    DuplicatePolicy::Sum => {
+                        // Sum the values
+                        pending_val + value
+                    }
+                };
+                self.pending_sample = Some((timestamp, new_value));
+                return Ok(());
+            } else {
+                // Different timestamp, flush pending sample first
+                self.flush_pending();
+            }
+        }
+
+        // Store as new pending sample
+        self.pending_sample = Some((timestamp, value));
+        Ok(())
+    }
+
+    /// Add a sample without duplicate checking (legacy method for backward compatibility)
     pub fn add(&mut self, timestamp: i64, value: f64) {
+        // Flush any pending sample first
+        self.flush_pending();
+        // Directly encode this sample
+        self.encode_sample(timestamp, value);
+    }
+
+    /// Flush the pending sample to the compressed buffer
+    fn flush_pending(&mut self) {
+        if let Some((ts, val)) = self.pending_sample.take() {
+            self.encode_sample(ts, val);
+        }
+    }
+
+    /// Encode a sample directly to the compressed buffer
+    fn encode_sample(&mut self, timestamp: i64, value: f64) {
         self.ts_codec.encode(timestamp, &mut self.chunk.timestamps);
         self.val_codec.encode(value, &mut self.chunk.values);
 
@@ -671,21 +747,53 @@ impl ChunkBuilder {
         self.chunk.sum_value += value;
     }
 
+    /// Get the last timestamp in this chunk (including pending)
+    pub fn last_timestamp(&self) -> Option<i64> {
+        self.pending_sample.map(|(ts, _)| ts).or_else(|| {
+            if self.chunk.count > 0 {
+                Some(self.chunk.end_time)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Get the last value in this chunk (including pending)
+    pub fn last_value(&self) -> Option<f64> {
+        self.pending_sample.map(|(_, val)| val)
+    }
+
     /// Finish building and return the chunk
-    pub fn finish(self) -> CompressedChunk {
+    pub fn finish(mut self) -> CompressedChunk {
+        // Flush any pending sample before finishing
+        self.flush_pending();
         self.chunk
     }
 
-    /// Get current sample count
+    /// Get current sample count (including pending)
     #[inline]
     pub fn count(&self) -> u32 {
+        self.chunk.count + if self.pending_sample.is_some() { 1 } else { 0 }
+    }
+
+    /// Get encoded sample count (excluding pending)
+    #[inline]
+    pub fn encoded_count(&self) -> u32 {
         self.chunk.count
     }
 
     /// Check if chunk is full
     #[inline]
     pub fn is_full(&self) -> bool {
-        self.chunk.count >= MAX_SAMPLES_PER_CHUNK as u32
+        self.count() >= MAX_SAMPLES_PER_CHUNK as u32
+    }
+
+    /// Check if we have a pending sample with the given timestamp
+    #[inline]
+    pub fn has_pending_timestamp(&self, timestamp: i64) -> bool {
+        self.pending_sample
+            .map(|(ts, _)| ts == timestamp)
+            .unwrap_or(false)
     }
 }
 
@@ -986,23 +1094,16 @@ impl TimeSeries {
         }
     }
 
-    /// Add a sample
+    /// Add a sample with full duplicate policy support
+    ///
+    /// Duplicate handling policies (when timestamp matches last sample):
+    /// - **Block**: Reject the sample with an error (default Redis behavior)
+    /// - **First**: Keep the first value, ignore the duplicate
+    /// - **Last**: Replace with the new value
+    /// - **Min**: Keep the minimum of old and new values
+    /// - **Max**: Keep the maximum of old and new values
+    /// - **Sum**: Add the new value to the existing value
     pub fn add(&mut self, timestamp: i64, value: f64) -> Result<(), &'static str> {
-        // Handle duplicates (check last timestamp)
-        if timestamp == self.last_timestamp && self.total_samples.load(Ordering::Relaxed) > 0 {
-            match self.duplicate_policy {
-                DuplicatePolicy::Block => return Err("TSDB: duplicate timestamp"),
-                DuplicatePolicy::First => return Ok(()),
-                DuplicatePolicy::Last
-                | DuplicatePolicy::Min
-                | DuplicatePolicy::Max
-                | DuplicatePolicy::Sum => {
-                    // For these policies, we'd need to update the last value
-                    // For simplicity in compressed storage, we append anyway
-                }
-            }
-        }
-
         // Get or create current chunk
         let chunk_start = (timestamp / self.chunk_duration_ms) * self.chunk_duration_ms;
 
@@ -1025,25 +1126,109 @@ impl TimeSeries {
             self.current_chunk = Some(ChunkBuilder::new(chunk_start));
         }
 
-        // Add sample to current chunk
+        // Check if this is a duplicate of an already-finalized sample
+        // (i.e., the sample is in a finalized chunk, not the current pending sample)
+        let is_duplicate_of_finalized = timestamp == self.last_timestamp
+            && self.total_samples.load(Ordering::Relaxed) > 0
+            && !self
+                .current_chunk
+                .as_ref()
+                .map(|b| b.has_pending_timestamp(timestamp))
+                .unwrap_or(false);
+
+        if is_duplicate_of_finalized {
+            // Handle duplicate of already-compressed data
+            // For Block and First, we can handle directly
+            // For Last/Min/Max/Sum, we need to update the finalized chunk (expensive)
+            match self.duplicate_policy {
+                DuplicatePolicy::Block => {
+                    return Err("TSDB: duplicate timestamp");
+                }
+                DuplicatePolicy::First => {
+                    return Ok(());
+                }
+                DuplicatePolicy::Last
+                | DuplicatePolicy::Min
+                | DuplicatePolicy::Max
+                | DuplicatePolicy::Sum => {
+                    // Need to modify the last sample in the finalized storage
+                    // This is expensive but correct per Redis/Dragonfly semantics
+                    self.update_last_sample(timestamp, value)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Add sample to current chunk with policy handling
         if let Some(builder) = &mut self.current_chunk {
-            builder.add(timestamp, value);
+            let was_pending_duplicate = builder.has_pending_timestamp(timestamp);
+            builder.add_with_policy(timestamp, value, self.duplicate_policy)?;
+
+            // Only increment total samples if this wasn't a duplicate merge
+            if !was_pending_duplicate {
+                self.total_samples.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // Update last value (may have been modified by policy)
+            if let Some(last_val) = builder.last_value() {
+                self.last_value = last_val;
+            }
         }
 
         // Update metadata
-        self.total_samples.fetch_add(1, Ordering::Relaxed);
         if self.first_timestamp == 0 || timestamp < self.first_timestamp {
             self.first_timestamp = timestamp;
         }
-        if timestamp > self.last_timestamp {
+        if timestamp >= self.last_timestamp {
             self.last_timestamp = timestamp;
         }
-        self.last_value = value;
 
         // Apply retention
         if self.retention_ms > 0 {
             let cutoff = timestamp - self.retention_ms;
             self.remove_before(cutoff);
+        }
+
+        Ok(())
+    }
+
+    /// Update the last sample in finalized storage (for duplicate policies)
+    /// This is expensive as it requires decompressing and recompressing a chunk
+    fn update_last_sample(&mut self, timestamp: i64, value: f64) -> Result<(), &'static str> {
+        // Find the chunk containing the timestamp
+        if let Some((_, chunk)) = self.chunks.last() {
+            if chunk.end_time == timestamp {
+                let chunk_start = chunk.start_time;
+
+                // Remove and decompress the chunk
+                if let Some(old_chunk) = self.chunks.remove(chunk_start) {
+                    self.cache.invalidate(chunk_start);
+
+                    let mut samples = old_chunk.decode_all();
+
+                    // Find and update the last sample
+                    if let Some(last) = samples.last_mut() {
+                        if last.0 == timestamp {
+                            // Apply the duplicate policy
+                            last.1 = match self.duplicate_policy {
+                                DuplicatePolicy::Last => value,
+                                DuplicatePolicy::Min => last.1.min(value),
+                                DuplicatePolicy::Max => last.1.max(value),
+                                DuplicatePolicy::Sum => last.1 + value,
+                                _ => last.1, // Block/First handled elsewhere
+                            };
+                            self.last_value = last.1;
+                        }
+                    }
+
+                    // Rebuild the chunk
+                    let mut builder = ChunkBuilder::new(chunk_start);
+                    for (ts, val) in samples {
+                        builder.add(ts, val);
+                    }
+                    self.chunks.insert(chunk_start, builder.finish());
+                }
+            }
         }
 
         Ok(())
@@ -1100,11 +1285,21 @@ impl TimeSeries {
         }
 
         // Query current chunk (not cached)
-        if let Some(builder) = &self.current_chunk
-            && builder.chunk.end_time >= from
-            && builder.chunk.start_time <= to
-        {
-            result.extend(builder.chunk.decode_range(from, to));
+        if let Some(builder) = &self.current_chunk {
+            // Include encoded samples from the chunk
+            if builder.chunk.count > 0
+                && builder.chunk.end_time >= from
+                && builder.chunk.start_time <= to
+            {
+                result.extend(builder.chunk.decode_range(from, to));
+            }
+
+            // Include pending sample if it's in range
+            if let Some((ts, val)) = builder.pending_sample {
+                if ts >= from && ts <= to {
+                    result.push((ts, val));
+                }
+            }
         }
 
         result.sort_by_key(|(ts, _)| *ts);
@@ -1167,11 +1362,21 @@ impl TimeSeries {
         }
 
         // Query current chunk
-        if let Some(builder) = &self.current_chunk
-            && builder.chunk.end_time >= from
-            && builder.chunk.start_time <= to
-        {
-            result.extend(builder.chunk.decode_range(from, to));
+        if let Some(builder) = &self.current_chunk {
+            // Include encoded samples from the chunk
+            if builder.chunk.count > 0
+                && builder.chunk.end_time >= from
+                && builder.chunk.start_time <= to
+            {
+                result.extend(builder.chunk.decode_range(from, to));
+            }
+
+            // Include pending sample if it's in range
+            if let Some((ts, val)) = builder.pending_sample {
+                if ts >= from && ts <= to {
+                    result.push((ts, val));
+                }
+            }
         }
 
         result.sort_by_key(|(ts, _)| *ts);
@@ -1846,6 +2051,165 @@ mod tests {
         assert_eq!(samples.len(), 100);
         assert_eq!(samples[0], (1000000, 0.0));
         assert_eq!(samples[99], (1000000 + 99 * 60000, 99.0));
+    }
+
+    // ==================== Duplicate Policy Tests ====================
+
+    #[test]
+    fn test_duplicate_policy_block() {
+        let mut ts = TimeSeries::with_options(0, DEFAULT_CHUNK_DURATION_MS, DuplicatePolicy::Block);
+
+        ts.add(1000, 10.0).unwrap();
+
+        // Duplicate should be blocked
+        let result = ts.add(1000, 20.0);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "TSDB: duplicate timestamp");
+
+        // Verify original value is preserved
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts.get_latest(), Some((1000, 10.0)));
+    }
+
+    #[test]
+    fn test_duplicate_policy_first() {
+        let mut ts = TimeSeries::with_options(0, DEFAULT_CHUNK_DURATION_MS, DuplicatePolicy::First);
+
+        ts.add(1000, 10.0).unwrap();
+        ts.add(1000, 20.0).unwrap(); // Should be ignored
+        ts.add(1000, 30.0).unwrap(); // Should be ignored
+
+        // Only first value should be kept
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts.get_latest(), Some((1000, 10.0)));
+    }
+
+    #[test]
+    fn test_duplicate_policy_last() {
+        let mut ts = TimeSeries::with_options(0, DEFAULT_CHUNK_DURATION_MS, DuplicatePolicy::Last);
+
+        ts.add(1000, 10.0).unwrap();
+        ts.add(1000, 20.0).unwrap(); // Should replace
+        ts.add(1000, 30.0).unwrap(); // Should replace
+
+        // Only last value should be kept
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts.get_latest(), Some((1000, 30.0)));
+    }
+
+    #[test]
+    fn test_duplicate_policy_min() {
+        let mut ts = TimeSeries::with_options(0, DEFAULT_CHUNK_DURATION_MS, DuplicatePolicy::Min);
+
+        ts.add(1000, 20.0).unwrap();
+        ts.add(1000, 10.0).unwrap(); // Should update to 10
+        ts.add(1000, 30.0).unwrap(); // Should keep 10
+
+        // Minimum value should be kept
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts.get_latest(), Some((1000, 10.0)));
+    }
+
+    #[test]
+    fn test_duplicate_policy_max() {
+        let mut ts = TimeSeries::with_options(0, DEFAULT_CHUNK_DURATION_MS, DuplicatePolicy::Max);
+
+        ts.add(1000, 10.0).unwrap();
+        ts.add(1000, 30.0).unwrap(); // Should update to 30
+        ts.add(1000, 20.0).unwrap(); // Should keep 30
+
+        // Maximum value should be kept
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts.get_latest(), Some((1000, 30.0)));
+    }
+
+    #[test]
+    fn test_duplicate_policy_sum() {
+        let mut ts = TimeSeries::with_options(0, DEFAULT_CHUNK_DURATION_MS, DuplicatePolicy::Sum);
+
+        ts.add(1000, 10.0).unwrap();
+        ts.add(1000, 20.0).unwrap(); // Should sum to 30
+        ts.add(1000, 5.0).unwrap(); // Should sum to 35
+
+        // Sum of all values should be kept
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts.get_latest(), Some((1000, 35.0)));
+    }
+
+    #[test]
+    fn test_duplicate_policy_with_multiple_timestamps() {
+        let mut ts = TimeSeries::with_options(0, DEFAULT_CHUNK_DURATION_MS, DuplicatePolicy::Sum);
+
+        // Add samples with different timestamps
+        ts.add(1000, 10.0).unwrap();
+        ts.add(1000, 5.0).unwrap(); // Sum = 15
+        ts.add(2000, 20.0).unwrap();
+        ts.add(2000, 10.0).unwrap(); // Sum = 30
+        ts.add(3000, 100.0).unwrap();
+        assert_eq!(ts.len(), 3);
+
+        let samples = ts.range(0, 5000);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[0], (1000, 15.0));
+        assert_eq!(samples[1], (2000, 30.0));
+        assert_eq!(samples[2], (3000, 100.0));
+    }
+
+    #[test]
+    fn test_chunk_builder_with_policy() {
+        // Test ChunkBuilder directly with duplicate policy
+        let mut builder = ChunkBuilder::new(1000000);
+
+        // Add with LAST policy
+        builder
+            .add_with_policy(1000, 10.0, DuplicatePolicy::Last)
+            .unwrap();
+        builder
+            .add_with_policy(1000, 20.0, DuplicatePolicy::Last)
+            .unwrap();
+        builder
+            .add_with_policy(2000, 30.0, DuplicatePolicy::Last)
+            .unwrap();
+
+        let chunk = builder.finish();
+        assert_eq!(chunk.count, 2);
+
+        let samples = chunk.decode_all();
+        assert_eq!(samples[0], (1000, 20.0)); // Last value
+        assert_eq!(samples[1], (2000, 30.0));
+    }
+
+    #[test]
+    fn test_chunk_builder_sum_policy() {
+        let mut builder = ChunkBuilder::new(1000000);
+
+        builder
+            .add_with_policy(1000, 10.0, DuplicatePolicy::Sum)
+            .unwrap();
+        builder
+            .add_with_policy(1000, 20.0, DuplicatePolicy::Sum)
+            .unwrap();
+        builder
+            .add_with_policy(1000, 30.0, DuplicatePolicy::Sum)
+            .unwrap();
+
+        let chunk = builder.finish();
+        assert_eq!(chunk.count, 1);
+
+        let samples = chunk.decode_all();
+        assert_eq!(samples[0], (1000, 60.0)); // Sum of 10+20+30
+    }
+
+    #[test]
+    fn test_duplicate_policy_block_allows_different_timestamps() {
+        let mut ts = TimeSeries::with_options(0, DEFAULT_CHUNK_DURATION_MS, DuplicatePolicy::Block);
+
+        ts.add(1000, 10.0).unwrap();
+        ts.add(2000, 20.0).unwrap();
+        ts.add(3000, 30.0).unwrap();
+
+        // All different timestamps should be allowed
+        assert_eq!(ts.len(), 3);
     }
 }
 
