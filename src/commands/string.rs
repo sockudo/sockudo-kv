@@ -886,6 +886,18 @@ fn compute_lcs(
         }
     }
 
+    // Emit any remaining range after loop ends (like Redis does)
+    if track_idx && arange_start != alen {
+        let match_len = arange_end - arange_start + 1;
+        if min_match_len == 0 || match_len >= min_match_len {
+            matches.push((
+                (arange_start, arange_end),
+                (brange_start, brange_end),
+                match_len,
+            ));
+        }
+    }
+
     (Bytes::from(result), matches)
 }
 

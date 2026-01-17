@@ -1620,6 +1620,12 @@ where
     socket.write_all(length_line.as_bytes()).await?;
     socket.write_all(&rdb_data).await?;
 
+    // Send SELECT 0 after RDB to set database context
+    // Redis always sends SELECT after RDB to indicate which database commands apply to
+    socket
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n")
+        .await?;
+
     // Register this connection as a replica
     let replica = replication.register_replica(addr);
     replica
