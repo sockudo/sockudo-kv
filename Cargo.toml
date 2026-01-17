@@ -22,12 +22,13 @@ name = "sockudo-kv-sentinel"
 path = "src/main.rs"
 
 [features]
-default = ["search", "json", "timeseries", "vector"]
+default = ["search", "json", "timeseries", "vector", "bloom"]
 # Optional modules (like Redis modules)
 search = []     # RediSearch-like full-text search
 json = []       # RedisJSON-like JSON operations
 timeseries = [] # RedisTimeSeries-like time-series data
 vector = []     # Vector similarity search
+bloom = []      # RedisBloom-like probabilistic data structures (BF, CF, TopK, CMS, TDigest)
 
 [dependencies]
 tokio = { version = "1", features = [

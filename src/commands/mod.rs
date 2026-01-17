@@ -32,10 +32,20 @@ pub mod timeseries;
 #[cfg(feature = "vector")]
 pub mod vector;
 
+// RedisBloom-like probabilistic data structures (feature-gated)
+#[cfg(feature = "bloom")]
 pub mod bloom;
+
+#[cfg(feature = "bloom")]
 pub mod cms;
+
+#[cfg(feature = "bloom")]
 pub mod cuckoo;
+
+#[cfg(feature = "bloom")]
 pub mod tdigest;
+
+#[cfg(feature = "bloom")]
 pub mod topk;
 
 use crate::error::{Error, Result};
@@ -341,29 +351,33 @@ impl Dispatcher {
             }
         }
 
-        // Bloom Filter
-        if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"BF.") {
-            return bloom::execute(store, cmd_name, args);
-        }
+        // RedisBloom-like probabilistic data structures (feature-gated)
+        #[cfg(feature = "bloom")]
+        {
+            // Bloom Filter
+            if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"BF.") {
+                return bloom::execute(store, cmd_name, args);
+            }
 
-        // Cuckoo Filter
-        if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"CF.") {
-            return cuckoo::execute(store, cmd_name, args);
-        }
+            // Cuckoo Filter
+            if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"CF.") {
+                return cuckoo::execute(store, cmd_name, args);
+            }
 
-        // TDigest
-        if cmd_name.len() >= 8 && cmd_name[..8].eq_ignore_ascii_case(b"TDIGEST.") {
-            return tdigest::execute(store, cmd_name, args);
-        }
+            // TDigest
+            if cmd_name.len() >= 8 && cmd_name[..8].eq_ignore_ascii_case(b"TDIGEST.") {
+                return tdigest::execute(store, cmd_name, args);
+            }
 
-        // Top-K
-        if cmd_name.len() >= 5 && cmd_name[..5].eq_ignore_ascii_case(b"TOPK.") {
-            return topk::execute(store, cmd_name, args);
-        }
+            // Top-K
+            if cmd_name.len() >= 5 && cmd_name[..5].eq_ignore_ascii_case(b"TOPK.") {
+                return topk::execute(store, cmd_name, args);
+            }
 
-        // Count-Min Sketch
-        if cmd_name.len() >= 4 && cmd_name[..4].eq_ignore_ascii_case(b"CMS.") {
-            return cms::execute(store, cmd_name, args);
+            // Count-Min Sketch
+            if cmd_name.len() >= 4 && cmd_name[..4].eq_ignore_ascii_case(b"CMS.") {
+                return cms::execute(store, cmd_name, args);
+            }
         }
 
         Err(Error::UnknownCommand(

@@ -37,14 +37,19 @@ pub enum DataType {
     /// VectorSet - HNSW-based vector similarity search
     VectorSet(Box<VectorSetData>),
     /// BloomFilter - probabilistic set membership
+    #[cfg(feature = "bloom")]
     BloomFilter(Box<super::bloomfilter::ScalableBloomFilter>),
     /// CuckooFilter - probabilistic set membership with deletion support
+    #[cfg(feature = "bloom")]
     CuckooFilter(Box<super::cuckoofilter::ScalableCuckooFilter>),
     /// TDigest - quantile estimation data structure
+    #[cfg(feature = "bloom")]
     TDigest(Box<super::tdigest::TDigest>),
     /// TopK - heavy hitters tracking
+    #[cfg(feature = "bloom")]
     TopK(Box<super::topk::TopK>),
     /// CountMinSketch - frequency estimation
+    #[cfg(feature = "bloom")]
     CountMinSketch(Box<super::cms::CountMinSketch>),
 }
 
@@ -64,10 +69,15 @@ impl std::fmt::Debug for DataType {
             DataType::Json(j) => f.debug_tuple("Json").field(j).finish(),
             DataType::TimeSeries(ts) => f.debug_tuple("TimeSeries").field(ts).finish(),
             DataType::VectorSet(v) => f.debug_tuple("VectorSet").field(v).finish(),
+            #[cfg(feature = "bloom")]
             DataType::BloomFilter(bf) => f.debug_tuple("BloomFilter").field(bf).finish(),
+            #[cfg(feature = "bloom")]
             DataType::CuckooFilter(cf) => f.debug_tuple("CuckooFilter").field(cf).finish(),
+            #[cfg(feature = "bloom")]
             DataType::TDigest(td) => f.debug_tuple("TDigest").field(td).finish(),
+            #[cfg(feature = "bloom")]
             DataType::TopK(tk) => f.debug_tuple("TopK").field(tk).finish(),
+            #[cfg(feature = "bloom")]
             DataType::CountMinSketch(cms) => f.debug_tuple("CountMinSketch").field(cms).finish(),
         }
     }
@@ -88,10 +98,15 @@ impl DataType {
             DataType::Json(_) => "ReJSON-RL",
             DataType::TimeSeries(_) => "TSDB-TYPE",
             DataType::VectorSet(_) => "vectorset",
+            #[cfg(feature = "bloom")]
             DataType::BloomFilter(_) => "MBbloom--",
+            #[cfg(feature = "bloom")]
             DataType::CuckooFilter(_) => "MBcuckoo-",
+            #[cfg(feature = "bloom")]
             DataType::TDigest(_) => "TDIS-TYPE",
+            #[cfg(feature = "bloom")]
             DataType::TopK(_) => "MBtopk---",
+            #[cfg(feature = "bloom")]
             DataType::CountMinSketch(_) => "MBcms----",
         }
     }
@@ -296,6 +311,7 @@ impl DataType {
         }
     }
 
+    #[cfg(feature = "bloom")]
     #[inline]
     pub fn as_bloomfilter(&self) -> Option<&super::bloomfilter::ScalableBloomFilter> {
         match self {
@@ -304,6 +320,7 @@ impl DataType {
         }
     }
 
+    #[cfg(feature = "bloom")]
     #[inline]
     pub fn as_bloomfilter_mut(&mut self) -> Option<&mut super::bloomfilter::ScalableBloomFilter> {
         match self {
@@ -312,6 +329,7 @@ impl DataType {
         }
     }
 
+    #[cfg(feature = "bloom")]
     #[inline]
     pub fn as_cuckoofilter(&self) -> Option<&super::cuckoofilter::ScalableCuckooFilter> {
         match self {
@@ -320,6 +338,7 @@ impl DataType {
         }
     }
 
+    #[cfg(feature = "bloom")]
     #[inline]
     pub fn as_cuckoofilter_mut(
         &mut self,
@@ -330,6 +349,7 @@ impl DataType {
         }
     }
 
+    #[cfg(feature = "bloom")]
     #[inline]
     pub fn as_tdigest(&self) -> Option<&super::tdigest::TDigest> {
         match self {
@@ -338,6 +358,7 @@ impl DataType {
         }
     }
 
+    #[cfg(feature = "bloom")]
     #[inline]
     pub fn as_tdigest_mut(&mut self) -> Option<&mut super::tdigest::TDigest> {
         match self {
@@ -346,6 +367,7 @@ impl DataType {
         }
     }
 
+    #[cfg(feature = "bloom")]
     #[inline]
     pub fn as_topk(&self) -> Option<&super::topk::TopK> {
         match self {
@@ -354,6 +376,7 @@ impl DataType {
         }
     }
 
+    #[cfg(feature = "bloom")]
     #[inline]
     pub fn as_topk_mut(&mut self) -> Option<&mut super::topk::TopK> {
         match self {
@@ -362,6 +385,7 @@ impl DataType {
         }
     }
 
+    #[cfg(feature = "bloom")]
     #[inline]
     pub fn as_cms(&self) -> Option<&super::cms::CountMinSketch> {
         match self {
@@ -370,6 +394,7 @@ impl DataType {
         }
     }
 
+    #[cfg(feature = "bloom")]
     #[inline]
     pub fn as_cms_mut(&mut self) -> Option<&mut super::cms::CountMinSketch> {
         match self {

@@ -24,19 +24,20 @@ pub mod quicklist;
 // Ultra-high-performance TimeSeries with Gorilla compression
 pub mod timeseries;
 
-// Ultra-high-performance Bloom Filter
+// RedisBloom-like probabilistic data structures (feature-gated)
+#[cfg(feature = "bloom")]
 pub mod bloomfilter;
 
-// Ultra-high-performance Cuckoo Filter
+#[cfg(feature = "bloom")]
 pub mod cuckoofilter;
 
-// Ultra-high-performance T-Digest
+#[cfg(feature = "bloom")]
 pub mod tdigest;
 
-// Ultra-high-performance Top-K Heavy Hitters
+#[cfg(feature = "bloom")]
 pub mod topk;
 
-// Ultra-high-performance Count-Min Sketch
+#[cfg(feature = "bloom")]
 pub mod cms;
 
 // Import all operation modules - each adds methods to Store via impl blocks

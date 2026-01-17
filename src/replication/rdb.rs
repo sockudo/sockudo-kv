@@ -225,16 +225,18 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
             write_string(rdb, &Bytes::from(json_str));
         }
         // Stream, TimeSeries, VectorSet - serialize as minimal representation
-        DataType::Stream(_)
-        | DataType::TimeSeries(_)
-        | DataType::VectorSet(_)
-        | DataType::BloomFilter(_)
+        DataType::Stream(_) | DataType::TimeSeries(_) | DataType::VectorSet(_) => {
+            // Skip complex types for now - they need special handling
+            // or implement simplified representation
+        }
+        // RedisBloom-like probabilistic data structures (feature-gated)
+        #[cfg(feature = "bloom")]
+        DataType::BloomFilter(_)
         | DataType::CuckooFilter(_)
         | DataType::TDigest(_)
         | DataType::TopK(_)
         | DataType::CountMinSketch(_) => {
-            // Skip complex types for now - they need special handling
-            // or implement simplified representation
+            // Skip probabilistic types for now - they need special handling
         }
     }
 }

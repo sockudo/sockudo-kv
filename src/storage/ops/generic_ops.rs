@@ -188,10 +188,15 @@ impl Store {
             }
             DataType::HashPacked(lp) => DataType::HashPacked(lp.clone()),
             DataType::SortedSetPacked(lp) => DataType::SortedSetPacked(lp.clone()),
+            #[cfg(feature = "bloom")]
             DataType::BloomFilter(bf) => DataType::BloomFilter(bf.clone()),
+            #[cfg(feature = "bloom")]
             DataType::CuckooFilter(cf) => DataType::CuckooFilter(cf.clone()),
+            #[cfg(feature = "bloom")]
             DataType::TDigest(td) => DataType::TDigest(td.clone()),
+            #[cfg(feature = "bloom")]
             DataType::TopK(tk) => DataType::TopK(tk.clone()),
+            #[cfg(feature = "bloom")]
             DataType::CountMinSketch(cms) => DataType::CountMinSketch(cms.clone()),
         };
 
@@ -446,10 +451,15 @@ impl Store {
             DataType::Json(_) => 7,
             DataType::TimeSeries(_) => 8,
             DataType::VectorSet(_) => 9,
+            #[cfg(feature = "bloom")]
             DataType::BloomFilter(_) => 10,
+            #[cfg(feature = "bloom")]
             DataType::CuckooFilter(_) => 11,
+            #[cfg(feature = "bloom")]
             DataType::TDigest(_) => 12,
+            #[cfg(feature = "bloom")]
             DataType::TopK(_) => 13,
+            #[cfg(feature = "bloom")]
             DataType::CountMinSketch(_) => 14,
         };
         data.push(type_byte);
@@ -518,16 +528,19 @@ impl Store {
                     data.extend_from_slice(&score.to_le_bytes());
                 }
             }
+            #[cfg(feature = "bloom")]
             DataType::BloomFilter(bf) => {
                 let bytes = bf.to_bytes();
                 write_varint(&mut data, bytes.len() as u64);
                 data.extend_from_slice(&bytes);
             }
+            #[cfg(feature = "bloom")]
             DataType::CuckooFilter(cf) => {
                 let bytes = cf.to_bytes();
                 write_varint(&mut data, bytes.len() as u64);
                 data.extend_from_slice(&bytes);
             }
+            #[cfg(feature = "bloom")]
             DataType::TDigest(td) => {
                 let bytes = td.to_bytes();
                 write_varint(&mut data, bytes.len() as u64);
@@ -642,6 +655,7 @@ impl Store {
                 }
                 DataType::Hash(hash)
             }
+            #[cfg(feature = "bloom")]
             10 => {
                 // Bloom Filter
                 let (len, new_pos) = read_varint(data, pos).map_err(|e| e.to_string())?;
@@ -654,6 +668,7 @@ impl Store {
                     .ok_or("ERR invalid bloom filter data")?;
                 DataType::BloomFilter(Box::new(bf))
             }
+            #[cfg(feature = "bloom")]
             11 => {
                 // Cuckoo Filter
                 let (len, new_pos) = read_varint(data, pos).map_err(|e| e.to_string())?;
