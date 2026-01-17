@@ -4,21 +4,85 @@ A high-performance, Redis-compatible in-memory database written in Rust with ult
 
 ## Features
 
-### Core Data Types
-- **Strings** - GET, SET, APPEND, INCR/DECR, GETEX, SETEX, SETNX, MGET, MSET
-- **Lists** - LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LLEN, LMOVE, LPOS
-- **Hashes** - HSET, HGET, HMSET, HGETALL, HINCRBY, HDEL, HEXISTS, HSCAN
-- **Sets** - SADD, SREM, SMEMBERS, SISMEMBER, SINTER, SUNION, SDIFF, SCARD
-- **Sorted Sets** - ZADD, ZRANGE, ZRANGEBYSCORE, ZRANK, ZINCRBY, ZREM, ZSCORE
-- **HyperLogLog** - PFADD, PFCOUNT, PFMERGE
-- **Bitmaps** - SETBIT, GETBIT, BITCOUNT, BITOP, BITPOS, BITFIELD
+### Core Data Types (Redis-compatible)
+- **Strings** - Raw bytes with optional encoding optimizations
+  - Commands: GET, SET, APPEND, INCR/DECR, GETEX, SETEX, SETNX, MGET, MSET
+  - String operations, bit manipulation, numeric operations
+  
+- **Lists** - Ordered collections (QuickList with compressed nodes)
+  - Commands: LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LLEN, LMOVE, LPOS, BLPOP, BRPOP
+  - Doubly-linked list with listpack compression for memory efficiency
+  
+- **Hashes** - Field-value maps with automatic encoding optimization
+  - Commands: HSET, HGET, HMSET, HGETALL, HINCRBY, HDEL, HEXISTS, HSCAN
+  - Switches between listpack (small) and DashTable (large) automatically
+  
+- **Sets** - Unordered unique elements with automatic int optimization
+  - Commands: SADD, SREM, SMEMBERS, SISMEMBER, SINTER, SUNION, SDIFF, SCARD, SPOP
+  - IntSet encoding for integer-only sets, DashSet for generic sets
+  
+- **Sorted Sets** - Unique elements with scores (B+Tree + HashMap)
+  - Commands: ZADD, ZRANGE, ZRANGEBYSCORE, ZRANK, ZINCRBY, ZREM, ZSCORE, ZPOPMIN, ZPOPMAX
+  - Listpack for small sets, full B+Tree implementation for large sets
+  
+- **Bitmaps** - Bit-level operations on strings
+  - Commands: SETBIT, GETBIT, BITCOUNT, BITOP, BITPOS, BITFIELD
+  - Efficient bit manipulation with SIMD optimizations
 
 ### Advanced Data Types
-- **Streams** - XADD, XREAD, XRANGE, XGROUP, XREADGROUP, XACK, XCLAIM, XPENDING
-- **JSON** - JSON.SET, JSON.GET, JSON.DEL, JSON.ARRAPPEND, JSON.OBJKEYS
-- **TimeSeries** - TS.CREATE, TS.ADD, TS.RANGE, TS.MRANGE, TS.GET, TS.INFO
-- **Vector Sets** - VADD, VSIM, VREM, VCARD, VDIM, VINFO (HNSW similarity search)
-- **Search (RediSearch)** - FT.CREATE, FT.SEARCH, FT.AGGREGATE, FT.DROPINDEX
+
+- **Streams** - Append-only log with consumer groups (Redis 5.0+)
+  - Commands: XADD, XREAD, XRANGE, XGROUP, XREADGROUP, XACK, XCLAIM, XPENDING, XTRIM
+  - Full consumer group support with PEL tracking
+  
+- **HyperLogLog** - Probabilistic cardinality estimation
+  - Commands: PFADD, PFCOUNT, PFMERGE
+  - Sparse/dense encoding with 0.81% standard error
+  
+- **JSON** - RedisJSON-compatible JSON document storage
+  - Commands: JSON.SET, JSON.GET, JSON.DEL, JSON.ARRAPPEND, JSON.OBJKEYS, JSON.NUMINCRBY
+  - Uses sonic-rs for ultra-fast JSON parsing and manipulation
+  
+- **TimeSeries** - RedisTimeSeries-compatible time-series data
+  - Commands: TS.CREATE, TS.ADD, TS.RANGE, TS.MRANGE, TS.GET, TS.INFO
+  - Gorilla compression algorithm with B+Tree indexing
+  - SIMD-accelerated aggregations (avg, sum, min, max, count)
+  
+- **Vector Sets** - HNSW-based similarity search (Redis 8.0 compatible)
+  - Commands: VADD, VSIM, VREM, VCARD, VDIM, VINFO, VGETATTR, VSETATTR
+  - Hierarchical Navigable Small World graphs for k-NN search
+  - Cosine, Euclidean, and dot product similarity metrics
+  - Optional quantization (Q8, Binary) for reduced memory
+
+### Probabilistic Data Structures (RedisBloom-compatible, feature-gated)
+
+- **Bloom Filter** - Scalable probabilistic set membership
+  - Commands: BF.ADD, BF.MADD, BF.EXISTS, BF.MEXISTS, BF.RESERVE, BF.INFO
+  - Auto-scaling with configurable false positive rate
+  
+- **Cuckoo Filter** - Probabilistic set with deletion support
+  - Commands: CF.ADD, CF.ADDNX, CF.COUNT, CF.DEL, CF.EXISTS, CF.INFO
+  - Better space efficiency than Bloom for deletion use-cases
+  
+- **T-Digest** - Streaming quantile estimation
+  - Commands: TDIGEST.CREATE, TDIGEST.ADD, TDIGEST.QUANTILE, TDIGEST.CDF, TDIGEST.MERGE
+  - Accurate percentile queries on streaming data
+  
+- **Top-K** - Heavy hitters tracking
+  - Commands: TOPK.ADD, TOPK.QUERY, TOPK.COUNT, TOPK.LIST, TOPK.INFO
+  - Count-Min Sketch based frequency tracking
+  
+- **Count-Min Sketch** - Frequency estimation
+  - Commands: CMS.INCRBY, CMS.QUERY, CMS.INFO, CMS.MERGE
+  - Space-efficient approximate counting
+
+### Full-Text Search (RediSearch-compatible)
+
+- **Search Indexes** - Full-text and secondary indexing
+  - Commands: FT.CREATE, FT.SEARCH, FT.AGGREGATE, FT.DROPINDEX, FT.INFO
+  - Text, numeric, tag, and geo fields
+  - Boolean queries with AND/OR/NOT operators
+  - Aggregations with groupby, reduce, and apply
 
 ### Server Features
 - **Pub/Sub** - SUBSCRIBE, PUBLISH, PSUBSCRIBE, PUNSUBSCRIBE
@@ -353,6 +417,132 @@ The expiration index is maintained across all operations:
 
 This ensures O(1) access to keys with expiration and matches Redis 6.0+ behavior exactly.
 
+## Data Type Implementations
+
+Sockudo-KV implements **all 18 data types** with automatic encoding optimizations for memory efficiency:
+
+### String
+- **Storage:** `Bytes` - zero-copy byte buffer
+- **Encoding:** Raw bytes, automatically converted for numeric operations
+- **Use case:** Caching, counters, sessions, binary data
+
+### List
+- **Storage:** `QuickList` - doubly-linked list of listpack nodes
+- **Encoding:** Compressed listpack nodes (configurable via `list-max-listpack-size`)
+- **Complexity:** O(1) push/pop at ends, O(n) for index access
+- **Use case:** Queues, activity feeds, recent items
+
+### Hash  
+- **Storage:** Dual encoding - `Listpack` (small) or `DashTable` (large)
+- **Threshold:** Switches at 512 entries (configurable via `hash-max-listpack-entries`)
+- **Complexity:** O(1) field access with DashTable, O(n) with listpack
+- **Use case:** Objects, session data, user profiles
+
+### Set
+- **Storage:** Dual encoding - `IntSet` (integers) or `DashSet` (generic)
+- **Threshold:** IntSet for up to 512 integer-only members
+- **Complexity:** O(1) add/remove/check membership
+- **Use case:** Tags, unique visitors, relationships
+
+### Sorted Set
+- **Storage:** Dual encoding - `Listpack` (small) or `B+Tree + HashMap` (large)
+- **Threshold:** Switches at 128 entries (configurable via `zset-max-listpack-entries`)
+- **Structure (large):** B+Tree for range queries + HashMap for O(1) score lookup
+- **Complexity:** O(log n) insert/delete, O(1) score lookup, O(log n + k) range queries
+- **Use case:** Leaderboards, priority queues, time-series indexes
+
+### Stream
+- **Storage:** `BTreeMap<StreamId, Vec<(field, value)>>` with consumer group metadata
+- **Features:** Auto-generated IDs, consumer groups, pending entries list (PEL)
+- **Complexity:** O(log n) insert, O(log n + k) range queries
+- **Use case:** Event logs, message queues, audit trails
+
+### HyperLogLog
+- **Storage:** Sparse (set of registers) or Dense (16KB register array)
+- **Encoding:** Automatically promotes sparse → dense at 3000 bytes
+- **Accuracy:** 0.81% standard error with 16,384 registers
+- **Complexity:** O(1) add, O(n) count (n = number of HLLs merged)
+- **Use case:** Unique visitor counting, cardinality estimation
+
+### Bitmap (String-based)
+- **Storage:** Byte array with bit-level operations
+- **SIMD:** Auto-vectorized for BITCOUNT, BITPOS
+- **Complexity:** O(1) getbit/setbit, O(n) for count/operations
+- **Use case:** User permissions, feature flags, bloom filters
+
+### JSON
+- **Storage:** `sonic_rs::Value` - ultra-fast JSON parser
+- **Features:** JSONPath queries, nested updates, array operations
+- **Complexity:** O(1) for top-level keys, O(depth) for nested paths
+- **Use case:** Document storage, configuration, complex objects
+
+### TimeSeries
+- **Storage:** Gorilla-compressed chunks in B+Tree
+- **Compression:** Gorilla algorithm (XOR + delta-of-delta encoding)
+- **Indexing:** B+Tree for fast range queries
+- **Aggregations:** SIMD-accelerated (avg, sum, min, max, count)
+- **Complexity:** O(log n) insert, O(log n + k/c) range (c = compression ratio)
+- **Use case:** Metrics, monitoring, IoT sensor data
+
+### VectorSet
+- **Storage:** HNSW graph + vector embeddings
+- **Index:** Hierarchical Navigable Small World for approximate k-NN
+- **Metrics:** Cosine similarity, Euclidean distance, dot product
+- **Quantization:** Optional Q8 or binary for 4x-32x memory savings
+- **Complexity:** O(log n) search with high recall, O(n) exact search
+- **Use case:** Semantic search, recommendation systems, image similarity
+
+### Bloom Filter (feature-gated)
+- **Storage:** Scalable bloom filter with multiple layers
+- **Features:** Auto-scaling, configurable false positive rate
+- **Complexity:** O(k) operations (k = number of hash functions)
+- **Use case:** Duplicate detection, cache filtering, spell checking
+
+### Cuckoo Filter (feature-gated)
+- **Storage:** Cuckoo hash table with fingerprints
+- **Features:** Deletion support, better space efficiency than Bloom
+- **Complexity:** O(1) expected add/delete/check
+- **Use case:** Set membership with deletions, counting filters
+
+### T-Digest (feature-gated)
+- **Storage:** Weighted centroids with merging buffer
+- **Features:** Streaming quantile estimation, accurate at extremes
+- **Complexity:** O(1) amortized insert, O(log n) quantile query
+- **Use case:** Percentile monitoring, latency tracking, SLA monitoring
+
+### Top-K (feature-gated)
+- **Storage:** Min-heap + Count-Min Sketch
+- **Features:** Heavy hitters tracking with approximate counts
+- **Complexity:** O(log k) add, O(k) list
+- **Use case:** Trending items, hot keys, abuse detection
+
+### Count-Min Sketch (feature-gated)
+- **Storage:** 2D array of counters (width × depth)
+- **Features:** Frequency estimation with bounded error
+- **Complexity:** O(d) operations (d = depth)
+- **Use case:** Frequency counting, rate limiting, analytics
+
+### Search Index (RediSearch)
+- **Storage:** Inverted indexes per field type
+- **Text:** Tokenized inverted index with position tracking
+- **Numeric:** Range tree for numeric fields
+- **Tag:** Hash-based exact match index
+- **Geo:** Geohash-based spatial index
+- **Complexity:** O(log n) for numeric/geo, O(m) for text (m = matching docs)
+- **Use case:** Full-text search, faceted search, geo-queries
+
+### IntSet (Internal)
+- **Storage:** Sorted array of integers (16/32/64-bit)
+- **Encoding:** Automatically upgrades int16 → int32 → int64
+- **Complexity:** O(log n) search, O(n) insert (maintains sorted order)
+- **Use case:** Internal optimization for integer-only sets
+
+### Listpack (Internal)
+- **Storage:** Compact variable-length encoding
+- **Features:** Backward traversal, length prefixes
+- **Complexity:** O(n) for operations (but very cache-friendly)
+- **Use case:** Internal optimization for small hashes/sets/sorted sets
+
 ## Supported Commands
 
 ### Strings
@@ -427,14 +617,6 @@ This ensures O(1) access to keys with expiration and matches Redis 6.0+ behavior
 ```bash
 # Run redis-benchmark against sockudo-kv
 redis-benchmark -p 6379 -q -n 100000 -c 50
-
-# Example results on modern hardware:
-# PING_INLINE: 450,000 requests per second
-# SET: 380,000 requests per second
-# GET: 420,000 requests per second
-# INCR: 400,000 requests per second
-# LPUSH: 350,000 requests per second
-# LRANGE_100: 180,000 requests per second
 ```
 
 ## License
