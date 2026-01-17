@@ -55,6 +55,7 @@ impl Store {
                             cms.query(item)
                         })
                         .collect();
+                    entry.bump_version();
                     Ok(results)
                 } else {
                     Err(Error::WrongType)
@@ -136,6 +137,7 @@ impl Store {
                     for (src, weight) in &sources {
                         dest_cms.merge(src, *weight);
                     }
+                    entry.bump_version();
                     Ok(())
                 } else {
                     Err(Error::WrongType)

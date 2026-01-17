@@ -38,7 +38,9 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if let Some(bf) = entry.data.as_bloomfilter_mut() {
-                    Ok(bf.add(item))
+                    let added = bf.add(item);
+                    entry.bump_version();
+                    Ok(added)
                 } else {
                     Err(Error::WrongType)
                 }
@@ -60,7 +62,9 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if let Some(bf) = entry.data.as_bloomfilter_mut() {
-                    Ok(items.iter().map(|item| bf.add(item)).collect())
+                    let results = items.iter().map(|item| bf.add(item)).collect();
+                    entry.bump_version();
+                    Ok(results)
                 } else {
                     Err(Error::WrongType)
                 }
@@ -153,7 +157,9 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if let Some(bf) = entry.data.as_bloomfilter_mut() {
-                    Ok(Some(items.iter().map(|item| bf.add(item)).collect()))
+                    let results = items.iter().map(|item| bf.add(item)).collect();
+                    entry.bump_version();
+                    Ok(Some(results))
                 } else {
                     Err(Error::WrongType)
                 }

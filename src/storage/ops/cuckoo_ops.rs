@@ -45,6 +45,7 @@ impl Store {
                 let entry = &mut e.get_mut().1;
                 if let Some(cf) = entry.data.as_cuckoofilter_mut() {
                     if cf.add(item) {
+                        entry.bump_version();
                         Ok(true)
                     } else {
                         // Filter is full
@@ -77,7 +78,11 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if let Some(cf) = entry.data.as_cuckoofilter_mut() {
-                    Ok(cf.add_nx(item))
+                    let added = cf.add_nx(item);
+                    if added {
+                        entry.bump_version();
+                    }
+                    Ok(added)
                 } else {
                     Err(Error::WrongType)
                 }
@@ -111,6 +116,7 @@ impl Store {
                         .iter()
                         .map(|item| if cf.add(item) { 1 } else { -1 })
                         .collect();
+                    entry.bump_version();
                     Ok(Some(results))
                 } else {
                     Err(Error::WrongType)
@@ -157,6 +163,9 @@ impl Store {
                         .iter()
                         .map(|item| if cf.add_nx(item) { 1 } else { 0 })
                         .collect();
+                    if results.iter().any(|&r| r == 1) {
+                        entry.bump_version();
+                    }
                     Ok(Some(results))
                 } else {
                     Err(Error::WrongType)
@@ -234,7 +243,11 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if let Some(cf) = entry.data.as_cuckoofilter_mut() {
-                    Ok(cf.delete(item))
+                    let deleted = cf.delete(item);
+                    if deleted {
+                        entry.bump_version();
+                    }
+                    Ok(deleted)
                 } else {
                     Err(Error::WrongType)
                 }

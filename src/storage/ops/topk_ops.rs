@@ -44,6 +44,7 @@ impl Store {
                 if let Some(tk) = entry.data.as_topk_mut() {
                     let results: Vec<Option<Bytes>> =
                         items.iter().map(|item| tk.add(item)).collect();
+                    entry.bump_version();
                     Ok(results)
                 } else {
                     Err(Error::WrongType)
@@ -70,6 +71,7 @@ impl Store {
                         .iter()
                         .map(|(item, incr)| tk.incrby(item, *incr))
                         .collect();
+                    entry.bump_version();
                     Ok(results)
                 } else {
                     Err(Error::WrongType)
