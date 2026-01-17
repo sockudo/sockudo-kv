@@ -196,19 +196,23 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    entry.data = DataType::String(Bytes::copy_from_slice(value));
+                    // Use RawString for appended strings
+                    entry.data = DataType::RawString(Bytes::copy_from_slice(value));
                     entry.persist();
                     entry.bump_version();
                     return Ok(value.len());
                 }
 
                 let result = match &mut entry.data {
-                    DataType::String(s) => {
+                    DataType::String(s) | DataType::RawString(s) => {
                         let mut new_val = Vec::with_capacity(s.len() + value.len());
                         new_val.extend_from_slice(s);
                         new_val.extend_from_slice(value);
-                        *s = Bytes::from(new_val);
-                        Ok(s.len())
+                        // Convert to RawString to mark as modified
+                        let new_bytes = Bytes::from(new_val);
+                        let len = new_bytes.len();
+                        entry.data = DataType::RawString(new_bytes);
+                        Ok(len)
                     }
                     _ => Err(Error::WrongType),
                 };
@@ -219,9 +223,10 @@ impl Store {
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
                 let len = value.len();
+                // Use RawString for new strings created by APPEND
                 e.insert((
                     key,
-                    Entry::new(DataType::String(Bytes::copy_from_slice(value))),
+                    Entry::new(DataType::RawString(Bytes::copy_from_slice(value))),
                 ));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(len)
@@ -277,6 +282,48 @@ impl Store {
                 ));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(delta)
+            }
+        }
+    }
+
+    /// Decrement integer value
+    #[inline]
+    pub fn decr(&self, key: Bytes, delta: i64) -> Result<i64> {
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
+                    // New value is 0 - delta
+                    let val = 0i64.checked_sub(delta).ok_or(Error::Overflow)?;
+                    entry.data = DataType::String(Bytes::from(val.to_string()));
+                    entry.persist();
+                    entry.bump_version();
+                    return Ok(val);
+                }
+
+                match &mut entry.data {
+                    DataType::String(s) => {
+                        let val: i64 = std::str::from_utf8(s)
+                            .map_err(|_| Error::NotInteger)?
+                            .parse()
+                            .map_err(|_| Error::NotInteger)?;
+                        let new_val = val.checked_sub(delta).ok_or(Error::Overflow)?;
+                        *s = Bytes::from(new_val.to_string());
+                        entry.bump_version();
+                        Ok(new_val)
+                    }
+                    _ => Err(Error::WrongType),
+                }
+            }
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                // New value is 0 - delta
+                let val = 0i64.checked_sub(delta).ok_or(Error::Overflow)?;
+                e.insert((
+                    key,
+                    Entry::new(DataType::String(Bytes::from(val.to_string()))),
+                ));
+                self.key_count.fetch_add(1, Ordering::Relaxed);
+                Ok(val)
             }
         }
     }
@@ -385,14 +432,15 @@ impl Store {
                     }
                     let mut bytes = vec![0u8; offset + value.len()];
                     bytes[offset..offset + value.len()].copy_from_slice(value);
-                    entry.data = DataType::String(Bytes::from(bytes));
+                    // Use RawString for modified strings
+                    entry.data = DataType::RawString(Bytes::from(bytes));
                     entry.persist();
                     entry.bump_version();
                     return Ok(entry.data.as_string().unwrap().len());
                 }
 
                 let result = match &mut entry.data {
-                    DataType::String(s) => {
+                    DataType::String(s) | DataType::RawString(s) => {
                         // Redis: If value is empty, just return current length
                         if value.is_empty() {
                             return Ok(s.len());
@@ -403,8 +451,11 @@ impl Store {
                             bytes.resize(new_len, 0);
                         }
                         bytes[offset..offset + value.len()].copy_from_slice(value);
-                        *s = Bytes::from(bytes);
-                        Ok(s.len())
+                        // Convert to RawString to mark as modified
+                        let new_bytes = Bytes::from(bytes);
+                        let len = new_bytes.len();
+                        entry.data = DataType::RawString(new_bytes);
+                        Ok(len)
                     }
                     _ => Err(Error::WrongType),
                 };
@@ -421,7 +472,8 @@ impl Store {
                 let mut bytes = vec![0u8; offset + value.len()];
                 bytes[offset..offset + value.len()].copy_from_slice(value);
                 let len = bytes.len();
-                e.insert((key, Entry::new(DataType::String(Bytes::from(bytes)))));
+                // Use RawString for new strings created by SETRANGE
+                e.insert((key, Entry::new(DataType::RawString(Bytes::from(bytes)))));
                 self.key_count.fetch_add(1, Ordering::Relaxed);
                 Ok(len)
             }

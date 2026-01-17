@@ -184,6 +184,8 @@ pub struct ClientState {
     pub asking: AtomicBool,
     /// READONLY mode for replica reads
     pub readonly: AtomicBool,
+    /// Protocol version (2 or 3)
+    pub protocol_version: AtomicU8,
 }
 
 impl ClientState {
@@ -216,6 +218,7 @@ impl ClientState {
             watched_keys: parking_lot::RwLock::new(Vec::new()),
             asking: AtomicBool::new(false),
             readonly: AtomicBool::new(false),
+            protocol_version: AtomicU8::new(2),
         }
     }
 

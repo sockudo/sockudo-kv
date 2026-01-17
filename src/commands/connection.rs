@@ -729,6 +729,9 @@ fn cmd_hello(
                 "NOPROTO sorry this protocol version is not supported".to_string(),
             ));
         }
+        client
+            .protocol_version
+            .store(protover as u8, Ordering::Relaxed);
         i = 1;
     }
 

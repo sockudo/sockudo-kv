@@ -617,7 +617,7 @@ fn cmd_decr(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.len() != 1 {
         return Err(Error::WrongArity("DECR"));
     }
-    let val = store.incr(args[0].clone(), -1)?;
+    let val = store.decr(args[0].clone(), 1)?;
     Ok(RespValue::integer(val))
 }
 
@@ -627,7 +627,7 @@ fn cmd_decrby(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         return Err(Error::WrongArity("DECRBY"));
     }
     let delta = parse_int(&args[1])?;
-    let val = store.incr(args[0].clone(), -delta)?;
+    let val = store.decr(args[0].clone(), delta)?;
     Ok(RespValue::integer(val))
 }
 

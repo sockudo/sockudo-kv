@@ -41,8 +41,8 @@ impl Store {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     // Expired entry: create new
-                    let max_entries = self.encoding.zset_max_listpack_entries;
-                    let max_value = self.encoding.zset_max_listpack_value;
+                    let max_entries = self.encoding.read().zset_max_listpack_entries;
+                    let max_value = self.encoding.read().zset_max_listpack_value;
                     let should_pack = members.len() < max_entries
                         && members.iter().all(|(_, m)| m.len() <= max_value);
 
@@ -72,8 +72,8 @@ impl Store {
                 match &mut entry.data {
                     DataType::SortedSetPacked(lp) => {
                         // Check if we need to upgrade
-                        let max_entries = self.encoding.zset_max_listpack_entries;
-                        let max_value = self.encoding.zset_max_listpack_value;
+                        let max_entries = self.encoding.read().zset_max_listpack_entries;
+                        let max_value = self.encoding.read().zset_max_listpack_value;
                         let needs_upgrade = members.iter().any(|(_, m)| m.len() > max_value)
                             || lp.len() + members.len() > max_entries;
 
@@ -116,8 +116,8 @@ impl Store {
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
                 // New key: use packed if small enough
-                let max_entries = self.encoding.zset_max_listpack_entries;
-                let max_value = self.encoding.zset_max_listpack_value;
+                let max_entries = self.encoding.read().zset_max_listpack_entries;
+                let max_value = self.encoding.read().zset_max_listpack_value;
                 let should_pack = members.len() < max_entries
                     && members.iter().all(|(_, m)| m.len() <= max_value);
 
@@ -323,7 +323,7 @@ impl Store {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     // Create new packed
-                    let max_value = self.encoding.zset_max_listpack_value;
+                    let max_value = self.encoding.read().zset_max_listpack_value;
                     if member.len() <= max_value {
                         let mut lp = Listpack::new();
                         lp.zinsert(&member, delta);
@@ -347,8 +347,8 @@ impl Store {
                         }
 
                         // Check if we need to upgrade
-                        let max_value = self.encoding.zset_max_listpack_value;
-                        let max_entries = self.encoding.zset_max_listpack_entries;
+                        let max_value = self.encoding.read().zset_max_listpack_value;
+                        let max_entries = self.encoding.read().zset_max_listpack_entries;
                         if member.len() > max_value
                             || (!lp.contains_key(&member) && lp.len() >= max_entries)
                         {
@@ -376,7 +376,7 @@ impl Store {
                 result
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
-                let max_value = self.encoding.zset_max_listpack_value;
+                let max_value = self.encoding.read().zset_max_listpack_value;
                 if member.len() <= max_value {
                     let mut lp = Listpack::new();
                     lp.zinsert(&member, delta);

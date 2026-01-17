@@ -124,6 +124,7 @@ impl Store {
         // Clone the data type
         let cloned_data = match &source_entry.1.data {
             DataType::String(s) => DataType::String(s.clone()),
+            DataType::RawString(s) => DataType::RawString(s.clone()),
             DataType::List(l) => DataType::List(l.clone()),
             DataType::Set(s) => DataType::Set(s.clone()),
             DataType::IntSet(s) => DataType::IntSet(s.clone()),
@@ -443,11 +444,17 @@ impl Store {
                     "raw"
                 }
             }
+            DataType::RawString(_) => {
+                // RawString is always "raw" encoding (modified by SETRANGE/APPEND)
+                "raw"
+            }
             DataType::List(_) => "quicklist",
             DataType::Set(_) => "hashtable",
             DataType::IntSet(_) => "intset",
             DataType::Hash(_) => "hashtable",
+            DataType::HashPacked(_) => "listpack",
             DataType::SortedSet(_) => "skiplist",
+            DataType::SortedSetPacked(_) => "listpack",
             DataType::Stream(_) => "stream",
             _ => "unknown",
         })
@@ -494,7 +501,7 @@ impl Store {
 
         // Data size varies by type
         let data_size = match &entry_ref.1.data {
-            DataType::String(s) => {
+            DataType::String(s) | DataType::RawString(s) => {
                 // SDS header + value bytes + null terminator
                 sds_overhead(s.len()) + s.len() + 1
             }
@@ -651,7 +658,7 @@ impl Store {
         data.extend_from_slice(&expire.to_le_bytes());
 
         let type_byte = match &entry_ref.1.data {
-            DataType::String(_) => 0u8,
+            DataType::String(_) | DataType::RawString(_) => 0u8,
             DataType::List(_) => 1,
             DataType::Set(_) => 2,
             DataType::IntSet(_) => 2, // Dump as regular set
@@ -676,7 +683,7 @@ impl Store {
         data.push(type_byte);
 
         match &entry_ref.1.data {
-            DataType::String(s) => {
+            DataType::String(s) | DataType::RawString(s) => {
                 write_varint(&mut data, s.len() as u64);
                 data.extend_from_slice(s);
             }

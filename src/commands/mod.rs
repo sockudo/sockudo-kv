@@ -67,9 +67,17 @@ impl Dispatcher {
         store: &Store,
         server: &Arc<ServerState>,
         replication: Option<&Arc<ReplicationManager>>,
+        client: Option<&crate::client::ClientState>,
         cmd: Command,
     ) -> RespValue {
-        match Self::execute_inner(Some(multi_store), store, Some(server), replication, &cmd) {
+        match Self::execute_inner(
+            Some(multi_store),
+            store,
+            Some(server),
+            replication,
+            client,
+            &cmd,
+        ) {
             Ok(resp) => resp,
             Err(e) => RespValue::error(&e.to_string()),
         }
@@ -79,7 +87,7 @@ impl Dispatcher {
     /// Server-specific commands will return an error in this mode
     #[inline]
     pub fn execute_basic(store: &Store, cmd: Command) -> RespValue {
-        match Self::execute_inner(None, store, None, None, &cmd) {
+        match Self::execute_inner(None, store, None, None, None, &cmd) {
             Ok(resp) => resp,
             Err(e) => RespValue::error(&e.to_string()),
         }
@@ -90,6 +98,7 @@ impl Dispatcher {
         store: &Store,
         server: Option<&Arc<ServerState>>,
         replication: Option<&Arc<ReplicationManager>>,
+        client: Option<&crate::client::ClientState>,
         cmd: &Command,
     ) -> Result<RespValue> {
         let args = &cmd.args;
@@ -358,7 +367,7 @@ impl Dispatcher {
                 Err(Error::UnknownCommand(_)) => {}
                 Err(e) => return Err(e),
             }
-            match hash::execute(store, cmd_name, args) {
+            match hash::execute(store, cmd_name, args, client, replication) {
                 Ok(resp) => return Ok(resp),
                 Err(Error::UnknownCommand(_)) => {}
                 Err(e) => return Err(e),
@@ -494,6 +503,16 @@ impl Dispatcher {
                                 let parts = vec![Bytes::from_static(b"DEL"), args[0].clone()];
                                 repl.propagate(&parts);
                             }
+                        } else if cmd.is_command(b"HGETDEL")
+                            || cmd.is_command(b"HSET")
+                            || cmd.is_command(b"HDEL")
+                            || cmd.is_command(b"HMSET")
+                            || cmd.is_command(b"HSETNX")
+                            || cmd.is_command(b"HINCRBY")
+                            || cmd.is_command(b"HINCRBYFLOAT")
+                        {
+                            // Hash commands handle their own propagation in hash.rs
+                            // Skip standard propagation to avoid double propagation
                         } else if cmd.is_command(b"GETEX") {
                             // Rewrite GETEX based on options
                             // GETEX key [EX seconds | PX ms | EXAT | PXAT | PERSIST]

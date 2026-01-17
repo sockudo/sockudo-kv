@@ -1242,7 +1242,14 @@ where
                                         }
                                     } else {
                                         let store = multi_store.db(client.current_db());
-                                        let response = Dispatcher::execute(multi_store, &store, server_state, Some(replication), cmd);
+                                        let response = Dispatcher::execute(
+                                            multi_store,
+                                            &store,
+                                            server_state,
+                                            Some(replication),
+                                            Some(client),
+                                            cmd,
+                                        );
                                         if client.should_reply() {
                                             response.write_to(&mut write_buf);
                                         }

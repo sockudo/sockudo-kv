@@ -5,6 +5,8 @@ use super::dashtable::{DashTable, calculate_hash};
 use super::expiration_index::ExpirationIndex;
 use super::ops::search_ops::SearchIndex;
 use super::types::Entry;
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// Encoding configuration thresholds (mirrors Redis/Dragonfly config options)
 /// Controls when to use compact encodings vs full data structures
@@ -74,7 +76,8 @@ pub struct Store {
     /// Search aliases: alias -> index_name
     pub(crate) search_aliases: DashTable<(Bytes, Bytes)>,
     /// Encoding thresholds for data structure optimization
-    pub encoding: EncodingConfig,
+    /// Encoding thresholds for data structure optimization
+    pub encoding: Arc<RwLock<EncodingConfig>>,
 }
 
 impl Store {
@@ -104,14 +107,14 @@ impl Store {
             // Metadata maps rarely used, minimal 2 shards
             search_indexes: DashTable::with_shard_amount(2),
             search_aliases: DashTable::with_shard_amount(2),
-            encoding: EncodingConfig::default(),
+            encoding: Arc::new(RwLock::new(EncodingConfig::default())),
         }
     }
 
     /// Create a new store with specified encoding config
     pub fn with_encoding(encoding: EncodingConfig) -> Self {
         let mut store = Self::with_capacity(0);
-        store.encoding = encoding;
+        store.encoding = Arc::new(RwLock::new(encoding));
         store
     }
 

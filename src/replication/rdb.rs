@@ -139,7 +139,7 @@ pub fn generate_rdb_with_config(
             }
 
             // Write value based on type
-            write_value(&mut rdb, key, &value.data, config.compression);
+            write_value(&mut rdb, Some(key), &value.data, config.compression);
         }
     }
 
@@ -154,16 +154,20 @@ pub fn generate_rdb_with_config(
 }
 
 /// Write a key-value pair to RDB
-fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) {
+pub(crate) fn write_value(rdb: &mut Vec<u8>, key: Option<&Bytes>, data: &DataType, compress: bool) {
     match data {
-        DataType::String(s) => {
+        DataType::String(s) | DataType::RawString(s) => {
             rdb.push(RDB_TYPE_STRING);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_string_compressed(rdb, s, compress);
         }
         DataType::List(list) => {
             rdb.push(RDB_TYPE_LIST);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_length(rdb, list.len());
             for item in list.iter() {
                 write_string(rdb, &item);
@@ -171,7 +175,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         }
         DataType::Set(set) => {
             rdb.push(RDB_TYPE_SET);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_length(rdb, set.len());
             for item in set.iter() {
                 write_string(rdb, item.key());
@@ -180,7 +186,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         DataType::IntSet(set) => {
             // Serialize as regular SET of strings for compatibility
             rdb.push(RDB_TYPE_SET);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_length(rdb, set.len());
             for item in set.iter() {
                 let s = item.to_string();
@@ -189,7 +197,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         }
         DataType::Hash(hash) => {
             rdb.push(RDB_TYPE_HASH);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_length(rdb, hash.len());
             for item in hash.iter() {
                 write_string(rdb, &item.0);
@@ -198,7 +208,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         }
         DataType::HashPacked(lp) => {
             rdb.push(RDB_TYPE_HASH);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_length(rdb, lp.len());
             for (k, v) in lp.iter() {
                 write_string(rdb, &k);
@@ -207,7 +219,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         }
         DataType::SortedSet(zset) => {
             rdb.push(RDB_TYPE_ZSET);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_length(rdb, zset.len());
             for (member, score) in &zset.scores {
                 write_string(rdb, member);
@@ -217,7 +231,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         }
         DataType::SortedSetPacked(lp) => {
             rdb.push(RDB_TYPE_ZSET);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_length(rdb, lp.len());
             for (member, score) in lp.ziter() {
                 write_string(rdb, &member);
@@ -228,34 +244,44 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         DataType::HyperLogLog(hll) => {
             // Store as string (Redis stores HLL as special string)
             rdb.push(RDB_TYPE_STRING);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             let regs = hll.get_registers();
             write_string(rdb, &Bytes::copy_from_slice(&regs));
         }
         DataType::Json(json) => {
             // Serialize JSON as string
             rdb.push(RDB_TYPE_STRING);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             let json_str = sonic_rs::to_string(json.as_ref()).unwrap_or_default();
             write_string(rdb, &Bytes::from(json_str));
         }
         // Stream - serialize with full structure
         DataType::Stream(stream) => {
             rdb.push(RDB_TYPE_STREAM);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_stream(rdb, stream);
         }
         // TimeSeries - serialize as module type with binary data
         DataType::TimeSeries(ts) => {
             rdb.push(RDB_TYPE_MODULE_2);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_module_type(rdb, MODULE_TYPE_TIMESERIES);
             write_timeseries(rdb, ts);
         }
         // VectorSet - serialize as module type with binary data
         DataType::VectorSet(vs) => {
             rdb.push(RDB_TYPE_MODULE_2);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_module_type(rdb, MODULE_TYPE_VECTORSET);
             write_vectorset(rdb, vs);
         }
@@ -263,7 +289,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         #[cfg(feature = "bloom")]
         DataType::BloomFilter(bf) => {
             rdb.push(RDB_TYPE_MODULE_2);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_module_type(rdb, MODULE_TYPE_BLOOMFILTER);
             let bf_bytes = bf.to_bytes();
             write_string(rdb, &Bytes::from(bf_bytes));
@@ -271,7 +299,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         #[cfg(feature = "bloom")]
         DataType::CuckooFilter(cf) => {
             rdb.push(RDB_TYPE_MODULE_2);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_module_type(rdb, MODULE_TYPE_CUCKOOFILTER);
             let cf_bytes = cf.to_bytes();
             write_string(rdb, &Bytes::from(cf_bytes));
@@ -279,7 +309,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         #[cfg(feature = "bloom")]
         DataType::TDigest(td) => {
             rdb.push(RDB_TYPE_MODULE_2);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_module_type(rdb, MODULE_TYPE_TDIGEST);
             let td_bytes = td.to_bytes();
             write_string(rdb, &Bytes::from(td_bytes));
@@ -287,7 +319,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         #[cfg(feature = "bloom")]
         DataType::TopK(tk) => {
             rdb.push(RDB_TYPE_MODULE_2);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_module_type(rdb, MODULE_TYPE_TOPK);
             let tk_bytes = tk.to_bytes();
             write_string(rdb, &Bytes::from(tk_bytes));
@@ -295,7 +329,9 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         #[cfg(feature = "bloom")]
         DataType::CountMinSketch(cms) => {
             rdb.push(RDB_TYPE_MODULE_2);
-            write_string(rdb, key);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
             write_module_type(rdb, MODULE_TYPE_CMS);
             let cms_bytes = cms.to_bytes();
             write_string(rdb, &Bytes::from(cms_bytes));

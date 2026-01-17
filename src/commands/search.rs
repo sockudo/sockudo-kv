@@ -595,7 +595,7 @@ fn cmd_ft_search(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         response.push(RespValue::bulk(key.clone()));
         if !nocontent {
             // Get document fields
-            let hash_data = store.hgetall(&key);
+            let hash_data = store.hgetall(&key).unwrap_or_default();
             if !hash_data.is_empty() {
                 let mut fields = Vec::with_capacity(hash_data.len() * 2 + 2);
                 fields.push(RespValue::bulk(Bytes::from_static(b"$")));
@@ -733,8 +733,8 @@ fn cmd_ft_aggregate(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     let reduce_fld = reduce_field.unwrap_or_default();
 
     for (key, _score) in &results {
-        // Get document fields from hash
-        let hash_fields = store.hgetall(key.as_ref());
+        // Get document fields
+        let hash_fields = store.hgetall(key.as_ref()).unwrap_or_default();
         let group_val = hash_fields
             .iter()
             .find(|(k, _)| String::from_utf8_lossy(k).eq_ignore_ascii_case(&group_field))

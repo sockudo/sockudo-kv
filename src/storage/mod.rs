@@ -45,6 +45,8 @@ pub mod cms;
 pub mod eviction;
 pub mod ops;
 
+pub use ops::generic_ops::match_pattern;
+
 #[cfg(test)]
 mod bptree_bench;
 
@@ -58,7 +60,7 @@ pub use types::{
     HyperLogLogData, PendingEntry, SortedSetData, StreamData, StreamId, TimeSeriesInfo, VectorNode,
     VectorQuantization, VectorSetData,
 };
-pub use value::now_ms;
+pub use value::{allow_access_expired, now_ms, set_allow_access_expired};
 
 // Re-export high-performance HyperLogLog
 pub use hyperloglog::HyperLogLog;

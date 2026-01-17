@@ -416,7 +416,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     // === Data Structure Limits ===
     ConfigEntry {
         name: "hash-max-listpack-entries",
-        alias: None,
+        alias: Some("hash-max-ziplist-entries"), // Legacy Redis 5.x name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Integer,
         default_value: "512",
@@ -426,7 +426,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     },
     ConfigEntry {
         name: "hash-max-listpack-value",
-        alias: None,
+        alias: Some("hash-max-ziplist-value"), // Legacy Redis 5.x name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Integer,
         default_value: "64",

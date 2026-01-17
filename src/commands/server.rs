@@ -14,6 +14,35 @@ use crate::server_state::{
     ACL_CATEGORIES, AclCommandRules, AclUser, Role, ServerState, get_commands_in_category,
 };
 use crate::storage::{MultiStore, Store};
+use sha1::{Digest, Sha1};
+use std::io;
+
+struct Sha1Writer {
+    hasher: Sha1,
+}
+
+impl Sha1Writer {
+    fn new() -> Self {
+        Self {
+            hasher: Sha1::new(),
+        }
+    }
+
+    fn finalize(self) -> [u8; 20] {
+        self.hasher.finalize().into()
+    }
+}
+
+impl io::Write for Sha1Writer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Execute a server command
 pub fn execute(
@@ -27,8 +56,8 @@ pub fn execute(
         // ... (other commands)
         b"ACL" => cmd_acl(server, args),
         b"COMMAND" => cmd_command(args),
-        b"CONFIG" => cmd_config(server, args),
-        b"DEBUG" => cmd_debug(server, args),
+        b"CONFIG" => cmd_config(multi_store, server, args),
+        b"DEBUG" => cmd_debug(multi_store, store, server, args),
         b"MEMORY" => cmd_memory(store, args),
         b"LATENCY" => cmd_latency(server, args),
         b"SLOWLOG" => cmd_slowlog(server, args),
@@ -1317,7 +1346,12 @@ sockudo-kv ver. 7.0.0
 }
 
 /// DEBUG command implementation with enable_debug_command gating
-fn cmd_debug(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
+fn cmd_debug(
+    multi_store: Option<&Arc<MultiStore>>,
+    store: &Store,
+    server: &Arc<ServerState>,
+    args: &[Bytes],
+) -> Result<RespValue> {
     let config = server.config.read();
 
     // Check if DEBUG command is enabled
@@ -1349,17 +1383,123 @@ fn cmd_debug(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
 
         // DEBUG SEGFAULT - intentionally crash (for testing crash handling)
         b"SEGFAULT" => {
-            // This would normally cause a segfault but we'll panic instead
-            panic!("DEBUG SEGFAULT called - intentional crash for testing");
+            // Perform an invalid memory access to crash the process
+            #[allow(clippy::deref_nullptr)]
+            unsafe {
+                let ptr: *mut i32 = std::ptr::null_mut();
+                *ptr = 42;
+            }
+            Ok(RespValue::ok())
         }
 
         // DEBUG DIGEST - return a checksum of the database
-        b"DIGEST" => Ok(RespValue::bulk_string(
-            "0000000000000000000000000000000000000000",
-        )),
+        b"DIGEST" => {
+            let digest = compute_dataset_digest(multi_store, store);
+            Ok(RespValue::SimpleString(Bytes::from(hex::encode(digest))))
+        }
 
         // DEBUG DIGEST-VALUE - return digest of specific keys
-        b"DIGEST-VALUE" => Ok(RespValue::array(vec![])),
+        b"DIGEST-VALUE" => {
+            let mut digests = Vec::new();
+            for key in args.iter().skip(1) {
+                if let Some(entry_ref) = store.data_get(key) {
+                    let entry = &entry_ref.value.1;
+                    let digest = compute_key_digest(key, entry);
+                    digests.push(RespValue::SimpleString(Bytes::from(hex::encode(digest))));
+                } else {
+                    // Return zero hex string for missing keys
+                    digests.push(RespValue::SimpleString(Bytes::from_static(
+                        b"0000000000000000000000000000000000000000",
+                    )));
+                }
+            }
+            Ok(RespValue::array(digests))
+        }
+
+        // DEBUG POPULATE count [prefix] [size]
+        b"POPULATE" => {
+            if args.len() < 2 {
+                return Err(Error::WrongArity("DEBUG POPULATE"));
+            }
+            let count: usize = std::str::from_utf8(&args[1])
+                .map_err(|_| Error::NotInteger)?
+                .parse()
+                .map_err(|_| Error::NotInteger)?;
+            let prefix = if args.len() > 2 {
+                std::str::from_utf8(&args[2]).unwrap_or("key")
+            } else {
+                "key"
+            };
+            let size: usize = if args.len() > 3 {
+                std::str::from_utf8(&args[3])
+                    .map_err(|_| Error::NotInteger)?
+                    .parse()
+                    .map_err(|_| Error::NotInteger)?
+            } else {
+                0
+            };
+
+            let val_str = if size > 0 {
+                std::iter::repeat("A").take(size).collect::<String>()
+            } else {
+                "value".to_string()
+            };
+            let val_bytes = Bytes::from(val_str);
+
+            for i in 0..count {
+                let key = format!("{}:{}", prefix, i);
+                let key_bytes = Bytes::from(key);
+                let entry =
+                    crate::storage::Entry::new(crate::storage::DataType::String(val_bytes.clone()));
+
+                let hash = crate::storage::calculate_hash(&key_bytes);
+                let k_ref = key_bytes.clone();
+                let key_eq = move |v: &(Bytes, crate::storage::Entry)| v.0 == k_ref;
+                let key_hasher =
+                    |v: &(Bytes, crate::storage::Entry)| crate::storage::calculate_hash(&v.0);
+
+                if store
+                    .data
+                    .insert(hash, (key_bytes.clone(), entry), key_eq, key_hasher)
+                    .is_none()
+                {
+                    store
+                        .key_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Ok(RespValue::ok())
+        }
+
+        // DEBUG LOG message
+        b"LOG" => {
+            if args.len() < 2 {
+                return Err(Error::WrongArity("DEBUG LOG"));
+            }
+            let msg = std::str::from_utf8(&args[1]).unwrap_or("");
+            println!("DEBUG LOG: {}", msg);
+            // Also log to proper logger if available, but println is fine for now as per Redis behavior which logs to server log
+            Ok(RespValue::ok())
+        }
+
+        // DEBUG PANIC
+        b"PANIC" => {
+            panic!("DEBUG PANIC called");
+        }
+
+        // DEBUG OOM - simulate abort/oom. We can't really alloc until OOM safely, so we panic "OOM".
+        b"OOM" => {
+            // In rust, simulating OOM strictly is hard without unsafe or allocator tricks.
+            // We will panic with a distinct message.
+            panic!("DEBUG OOM - Out of memory simulation");
+        }
+        b"ERROR" => {
+            if args.len() < 2 {
+                return Err(Error::WrongArity("DEBUG ERROR"));
+            }
+            let msg = std::str::from_utf8(&args[1]).unwrap_or("error");
+            Err(Error::Custom(msg.to_string()))
+        }
 
         // DEBUG QUICKLIST-PACKED-THRESHOLD
         b"QUICKLIST-PACKED-THRESHOLD" => Ok(RespValue::ok()),
@@ -1367,31 +1507,126 @@ fn cmd_debug(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
         // DEBUG SET-ACTIVE-EXPIRE - enable/disable active expiration
         b"SET-ACTIVE-EXPIRE" => Ok(RespValue::ok()),
 
+        // DEBUG SET-ALLOW-ACCESS-EXPIRED - allow access to logically expired keys
+        b"SET-ALLOW-ACCESS-EXPIRED" => {
+            if args.len() < 2 {
+                return Err(Error::WrongArity("DEBUG SET-ALLOW-ACCESS-EXPIRED"));
+            }
+            let value = std::str::from_utf8(&args[1])
+                .map_err(|_| Error::NotInteger)?
+                .parse::<i64>()
+                .map_err(|_| Error::NotInteger)?;
+            crate::storage::set_allow_access_expired(value != 0);
+            Ok(RespValue::ok())
+        }
+
         // DEBUG OBJECT key - show internal encoding info
         b"OBJECT" => {
             if args.len() < 2 {
                 return Err(Error::WrongArity("DEBUG OBJECT"));
             }
-            Ok(RespValue::bulk_string(
-                "Value at:0x0 refcount:1 encoding:embstr serializedlength:0 lru:0 lru_seconds_idle:0",
-            ))
+            let key = &args[1];
+            if let Some(entry_ref) = store.data_get(key) {
+                let entry = &entry_ref.value.1;
+                let encoding = match entry.data {
+                    crate::storage::DataType::String(_) => "embstr", // or raw
+                    crate::storage::DataType::List(_) => "quicklist",
+                    crate::storage::DataType::Set(_) => "hashtable",
+                    crate::storage::DataType::Hash(_) => "hashtable",
+                    crate::storage::DataType::HashPacked(_) => "listpack",
+                    crate::storage::DataType::SortedSet(_) => "skiplist",
+                    crate::storage::DataType::SortedSetPacked(_) => "listpack",
+                    _ => entry.data.type_name(),
+                };
+                // Estimate serialized length (placeholder for now, matching plan to use 0 or estimate)
+                // Redis uses rdbSavedObjectLen not readily available without actually serializing
+                let serialized_len = 0;
+                let lru = entry.lru_time();
+                let idle = entry.idle_time();
+
+                // Address is just for show, use a dummy or actual pointer if possible (but Entry is struct)
+                // We'll use 0x0 as placeholder like existing stub
+                Ok(RespValue::SimpleString(Bytes::from(format!(
+                    "Value at:0x0 refcount:1 encoding:{} serializedlength:{} lru:{} lru_seconds_idle:{}",
+                    encoding, serialized_len, lru, idle
+                ))))
+            } else {
+                Err(Error::Custom("ERR no such key".to_string()))
+            }
         }
 
         // DEBUG RELOAD - reload the dataset
-        b"RELOAD" => Ok(RespValue::ok()),
+        b"RELOAD" => {
+            if let Some(ms) = multi_store {
+                // 1. Save RDB to disk
+                let config = server.config.read();
+                let rdb_path = std::path::Path::new(&config.dir).join(&config.dbfilename);
+                drop(config);
 
-        // DEBUG RESTART - restart the server
-        b"RESTART" => Err(Error::Custom(
-            "ERR DEBUG RESTART is not supported".to_string(),
-        )),
+                let rdb_data = crate::replication::rdb::generate_rdb(ms);
+                std::fs::write(&rdb_path, &rdb_data)
+                    .map_err(|e| Error::Custom(format!("Failed to write RDB: {}", e)))?;
+
+                // 2. Flush all databases
+                ms.flush_all();
+
+                // 3. Load RDB from disk
+                let data = std::fs::read(&rdb_path)
+                    .map_err(|e| Error::Custom(format!("Failed to read RDB: {}", e)))?;
+                crate::replication::rdb::load_rdb(&data, ms)
+                    .map_err(|e| Error::Custom(format!("Failed to load RDB: {}", e)))?;
+
+                Ok(RespValue::ok())
+            } else {
+                Err(Error::Custom(
+                    "ERR DEBUG RELOAD requires multi_store access".to_string(),
+                ))
+            }
+        }
+
+        // DEBUG RESTART
+        b"RESTART" => Err(Error::Custom("ERR DEBUG RESTART not supported".to_string())),
 
         // DEBUG STRUCTSIZE - return sizes of internal structures
         b"STRUCTSIZE" => Ok(RespValue::bulk_string(
-            "bits:64 robj:16 sdshdr8:3 sdshdr16:5 sdshdr32:9 sdshdr64:17",
+            format!(
+                "bits:64 robj:{} sdshdr8:3 sdshdr16:5 sdshdr32:9 sdshdr64:17 Entry:{} DataType:{}",
+                std::mem::size_of::<crate::storage::Entry>(), // approximation
+                std::mem::size_of::<crate::storage::Entry>(),
+                std::mem::size_of::<crate::storage::DataType>()
+            )
+            .as_str(),
         )),
 
         // DEBUG HTSTATS dbid - hashtable statistics
-        b"HTSTATS" => Ok(RespValue::bulk_string("[Dictionary HT]\n")),
+        b"HTSTATS" => {
+            let dbid = if args.len() > 1 {
+                std::str::from_utf8(&args[1])
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            if let Some(db) = multi_store.map(|ms| ms.get_db(dbid)).flatten() {
+                let mut stats = String::new();
+                stats.push_str(&format!(
+                    "[Dictionary HT]
+Db ID: {}
+Table Size: {}
+Shards: {}
+",
+                    dbid,
+                    db.data.len(),
+                    db.data.shards_len()
+                ));
+                // We could iterate shards if DashTable exposed it
+                Ok(RespValue::bulk_string(stats.as_str()))
+            } else {
+                Err(Error::Custom("ERR no such database".to_string()))
+            }
+        }
 
         // DEBUG HTSTATS-KEY key - per-key hashtable stats
         b"HTSTATS-KEY" => Ok(RespValue::bulk_string("")),
@@ -1414,14 +1649,6 @@ fn cmd_debug(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
 
         // DEBUG PAUSE-CRON milliseconds
         b"PAUSE-CRON" => Ok(RespValue::ok()),
-
-        // DEBUG OOM - simulate out of memory
-        b"OOM" => Err(Error::Custom("OOM command not allowed".to_string())),
-
-        // DEBUG PANIC - cause panic
-        b"PANIC" => {
-            panic!("DEBUG PANIC called - intentional panic for testing");
-        }
 
         // DEBUG LISTPACK-ENTRIES - get listpack stats
         b"LISTPACK-ENTRIES" => Ok(RespValue::integer(0)),
@@ -1447,7 +1674,11 @@ fn cmd_debug(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
 
 // === CONFIG Command ===
 
-fn cmd_config(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
+fn cmd_config(
+    multi_store: Option<&Arc<MultiStore>>,
+    server: &Arc<ServerState>,
+    args: &[Bytes],
+) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::Syntax);
     }
@@ -1463,7 +1694,7 @@ fn cmd_config(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
             if args.len() < 3 {
                 return Err(Error::WrongArity("CONFIG SET"));
             }
-            cmd_config_set(server, &args[1], &args[2])
+            cmd_config_set(multi_store, server, &args[1], &args[2])
         }
         b"RESETSTAT" => Ok(RespValue::ok()),
         // ... regex continue from existing code
@@ -1475,7 +1706,12 @@ fn cmd_config(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
     }
 }
 
-fn cmd_config_set(server: &Arc<ServerState>, parameter: &[u8], value: &[u8]) -> Result<RespValue> {
+fn cmd_config_set(
+    multi_store: Option<&Arc<MultiStore>>,
+    server: &Arc<ServerState>,
+    parameter: &[u8],
+    value: &[u8],
+) -> Result<RespValue> {
     let param_str = std::str::from_utf8(parameter)
         .map_err(|_| Error::Custom("Invalid parameter name".into()))?;
     let value_str =
@@ -1529,6 +1765,25 @@ fn cmd_config_set(server: &Arc<ServerState>, parameter: &[u8], value: &[u8]) -> 
     // Acquire lock and apply setter
     let mut config = server.config.write();
     (entry.setter)(&mut config, value_str).map_err(|e| Error::Custom(format!("ERR {}", e)))?;
+
+    // Propagate encoding changes to all stores
+    if let Some(ms) = multi_store {
+        for store in ms.all_databases() {
+            let mut enc = store.encoding.write();
+            enc.hash_max_listpack_entries = config.hash_max_listpack_entries;
+            enc.hash_max_listpack_value = config.hash_max_listpack_value;
+            enc.list_max_listpack_size = config.list_max_listpack_size;
+            enc.list_compress_depth = config.list_compress_depth;
+            enc.set_max_intset_entries = config.set_max_intset_entries;
+            enc.set_max_listpack_entries = config.set_max_listpack_entries;
+            enc.set_max_listpack_value = config.set_max_listpack_value;
+            enc.zset_max_listpack_entries = config.zset_max_listpack_entries;
+            enc.zset_max_listpack_value = config.zset_max_listpack_value;
+            enc.hll_sparse_max_bytes = config.hll_sparse_max_bytes;
+            enc.stream_node_max_bytes = config.stream_node_max_bytes;
+            enc.stream_node_max_entries = config.stream_node_max_entries;
+        }
+    }
 
     // Apply runtime changes if applier exists
     if let Some(applier) = entry.applier {
@@ -1949,6 +2204,83 @@ fn cmd_module(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
     }
 }
 
+fn compute_dataset_digest(multi_store: Option<&Arc<MultiStore>>, store: &Store) -> [u8; 20] {
+    let mut final_digest = [0u8; 20];
+
+    // Logic: if multi_store present, iterate all. Else iterate single.
+    if let Some(ms) = multi_store {
+        for (db_index, db) in ms.all_databases().iter().enumerate() {
+            // For each key in DB
+            db.for_each_key(|key_bytes| {
+                if let Some(entry_ref) = db.data_get(&Bytes::copy_from_slice(key_bytes)) {
+                    let entry = &entry_ref.value.1;
+                    xor_key_digest(&mut final_digest, key_bytes, entry, db_index);
+                }
+            });
+        }
+    } else {
+        store.for_each_key(|key_bytes| {
+            if let Some(entry_ref) = store.data_get(&Bytes::copy_from_slice(key_bytes)) {
+                let entry = &entry_ref.value.1;
+                xor_key_digest(&mut final_digest, key_bytes, entry, 0);
+            }
+        });
+    }
+
+    final_digest
+}
+
+fn xor_key_digest(
+    digest: &mut [u8; 20],
+    key: &[u8],
+    entry: &crate::storage::Entry,
+    _db_index: usize,
+) {
+    let d = compute_key_digest(key, entry);
+    for i in 0..20 {
+        digest[i] ^= d[i];
+    }
+}
+
+fn compute_key_digest(key: &[u8], entry: &crate::storage::Entry) -> [u8; 20] {
+    let mut digest = [0u8; 20];
+
+    // Key hash
+    let key_hash = {
+        let mut s = Sha1Writer::new();
+        let _ = s.write(key);
+        s.finalize()
+    };
+
+    // Value hash - use RDB serialization
+    let val_hash = {
+        let mut buf = Vec::new();
+        // Use RDB serialization.
+        crate::replication::rdb::write_value(&mut buf, None, &entry.data, true);
+        let mut s = Sha1Writer::new();
+        let _ = s.write(&buf);
+        s.finalize()
+    };
+
+    // Combine hashes.
+    for i in 0..20 {
+        digest[i] ^= key_hash[i];
+        digest[i] ^= val_hash[i];
+    }
+
+    // Expiration logic
+    if entry.is_expired() {
+        let mut s = Sha1Writer::new();
+        let _ = s.write(b"!!expire!!");
+        let exp_hash = s.finalize();
+        for i in 0..20 {
+            digest[i] ^= exp_hash[i];
+        }
+    }
+
+    digest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2021,5 +2353,45 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             has_save_points
         );
+    }
+
+    #[test]
+    fn test_debug_digest() {
+        use crate::server_state::ServerState;
+        use crate::storage::{DataType, Entry, Store};
+
+        let store = Store::new();
+        // Insert some data
+        let key = Bytes::from("key1");
+        let val = Entry::new(DataType::String(Bytes::from("value1")));
+        store.data.insert_unique(
+            crate::storage::calculate_hash(&key),
+            (key.clone(), val),
+            |k| crate::storage::calculate_hash(&k.0),
+        );
+
+        // Setup server state
+        let server = Arc::new(ServerState::new());
+        // Enable debug command in config
+        {
+            let mut config = server.config.write();
+            config.enable_debug_command = true;
+        }
+
+        // Call DEBUG DIGEST
+        // We need args: "DEBUG", "DIGEST"
+        let args = vec![Bytes::from("DIGEST")];
+        // multi_store None is fine for test
+        // Store is passed as optional reference in cmd_debug? No, store is required reference.
+        let res = cmd_debug(None, &store, &server, &args);
+        match res {
+            Ok(RespValue::SimpleString(digest)) => {
+                let s = std::str::from_utf8(&digest).unwrap();
+                println!("Digest: {}", s);
+                assert_eq!(s.len(), 40); // SHA1 hex
+                assert_ne!(s, "0000000000000000000000000000000000000000"); // Should not be zero if not empty
+            }
+            _ => panic!("Expected SimpleString digest, got {:?}", res),
+        }
     }
 }

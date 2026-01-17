@@ -10,8 +10,10 @@ use super::value::now_ms;
 /// All Redis data types
 /// All Redis data types
 pub enum DataType {
-    /// String - raw bytes
+    /// String - raw bytes (may be int-encoded if parseable as integer)
     String(Bytes),
+    /// RawString - always "raw" encoding (modified by SETRANGE/APPEND)
+    RawString(Bytes),
     /// List - doubly-linked list (QuickList for memory efficiency)
     List(super::quicklist::QuickList),
     /// Set - unordered unique strings
@@ -57,6 +59,7 @@ impl std::fmt::Debug for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DataType::String(s) => f.debug_tuple("String").field(s).finish(),
+            DataType::RawString(s) => f.debug_tuple("RawString").field(s).finish(),
             DataType::List(l) => f.debug_tuple("List").field(l).finish(),
             DataType::Set(s) => f.debug_tuple("Set").field(s).finish(),
             DataType::IntSet(s) => f.debug_tuple("IntSet").field(s).finish(),
@@ -87,7 +90,7 @@ impl DataType {
     #[inline]
     pub fn type_name(&self) -> &'static str {
         match self {
-            DataType::String(_) => "string",
+            DataType::String(_) | DataType::RawString(_) => "string",
             DataType::List(_) => "list",
             DataType::Set(_) => "set",
             DataType::IntSet(_) => "set",
@@ -114,7 +117,7 @@ impl DataType {
     #[inline]
     pub fn as_string(&self) -> Option<&Bytes> {
         match self {
-            DataType::String(s) => Some(s),
+            DataType::String(s) | DataType::RawString(s) => Some(s),
             _ => None,
         }
     }
@@ -122,7 +125,7 @@ impl DataType {
     #[inline]
     pub fn as_string_mut(&mut self) -> Option<&mut Bytes> {
         match self {
-            DataType::String(s) => Some(s),
+            DataType::String(s) | DataType::RawString(s) => Some(s),
             _ => None,
         }
     }
@@ -969,6 +972,10 @@ impl Entry {
 
     #[inline(always)]
     pub fn is_expired(&self) -> bool {
+        // When allow_access_expired is set, never report keys as expired
+        if super::value::allow_access_expired() {
+            return false;
+        }
         let exp = self.expire_at.load(Ordering::Relaxed);
         exp != Self::NO_EXPIRE && now_ms() >= exp
     }
