@@ -216,16 +216,67 @@ impl Dispatcher {
                         .load(std::sync::atomic::Ordering::Relaxed)
                 })
                 .unwrap_or(false);
-            return cmd_del(store, args, use_lazy);
+            let result = cmd_del(store, args, use_lazy);
+            // Propagate DEL to replicas
+            if let Ok(ref resp) = result {
+                if !matches!(resp, RespValue::Error(_)) {
+                    if let Some(repl) = replication {
+                        let mut parts = Vec::with_capacity(1 + args.len());
+                        parts.push(Bytes::from_static(b"DEL"));
+                        parts.extend_from_slice(args);
+                        repl.propagate(&parts);
+                    }
+                }
+            }
+            return result;
         }
         if cmd.is_command(b"EXISTS") {
             return cmd_exists(store, args);
         }
         if cmd.is_command(b"EXPIRE") {
-            return cmd_expire(store, args);
+            let result = cmd_expire(store, args);
+            // Propagate EXPIRE (convert to PEXPIREAT for consistency)
+            if let Ok(RespValue::Integer(1)) = result {
+                if let Some(repl) = replication {
+                    // Convert EXPIRE to PEXPIREAT with absolute timestamp
+                    if let Ok(seconds) = std::str::from_utf8(&args[1])
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .ok_or(())
+                    {
+                        let expire_at = crate::storage::now_ms() + seconds * 1000;
+                        let parts = vec![
+                            Bytes::from_static(b"PEXPIREAT"),
+                            args[0].clone(),
+                            Bytes::from(expire_at.to_string()),
+                        ];
+                        repl.propagate(&parts);
+                    }
+                }
+            }
+            return result;
         }
         if cmd.is_command(b"PEXPIRE") {
-            return cmd_pexpire(store, args);
+            let result = cmd_pexpire(store, args);
+            // Propagate PEXPIRE (convert to PEXPIREAT for consistency)
+            if let Ok(RespValue::Integer(1)) = result {
+                if let Some(repl) = replication {
+                    if let Ok(ms) = std::str::from_utf8(&args[1])
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .ok_or(())
+                    {
+                        let expire_at = crate::storage::now_ms() + ms;
+                        let parts = vec![
+                            Bytes::from_static(b"PEXPIREAT"),
+                            args[0].clone(),
+                            Bytes::from(expire_at.to_string()),
+                        ];
+                        repl.propagate(&parts);
+                    }
+                }
+            }
+            return result;
         }
         if cmd.is_command(b"TTL") {
             return cmd_ttl(store, args);
@@ -234,7 +285,15 @@ impl Dispatcher {
             return cmd_pttl(store, args);
         }
         if cmd.is_command(b"PERSIST") {
-            return cmd_persist(store, args);
+            let result = cmd_persist(store, args);
+            // Propagate PERSIST
+            if let Ok(RespValue::Integer(1)) = result {
+                if let Some(repl) = replication {
+                    let parts = vec![Bytes::from_static(b"PERSIST"), args[0].clone()];
+                    repl.propagate(&parts);
+                }
+            }
+            return result;
         }
         if cmd.is_command(b"TYPE") {
             return cmd_type(store, args);
@@ -254,6 +313,15 @@ impl Dispatcher {
                 store.lazy_flush();
             } else {
                 store.flush();
+            }
+            // Propagate FLUSHDB/FLUSHALL
+            if let Some(repl) = replication {
+                let cmd_bytes = if cmd.is_command(b"FLUSHALL") {
+                    Bytes::from_static(b"FLUSHALL")
+                } else {
+                    Bytes::from_static(b"FLUSHDB")
+                };
+                repl.propagate(&[cmd_bytes]);
             }
             return Ok(RespValue::ok());
         }
@@ -419,6 +487,13 @@ impl Dispatcher {
                             // GETDEL key -> DEL key
                             let parts = vec![Bytes::from_static(b"DEL"), args[0].clone()];
                             repl.propagate(&parts);
+                        } else if cmd.is_command(b"DELEX") {
+                            // DELEX key [condition] -> DEL key (when successful deletion)
+                            // Only propagate if deletion actually happened (result is integer 1)
+                            if matches!(result, Ok(RespValue::Integer(1))) {
+                                let parts = vec![Bytes::from_static(b"DEL"), args[0].clone()];
+                                repl.propagate(&parts);
+                            }
                         } else if cmd.is_command(b"GETEX") {
                             // Rewrite GETEX based on options
                             // GETEX key [EX seconds | PX ms | EXAT | PXAT | PERSIST]

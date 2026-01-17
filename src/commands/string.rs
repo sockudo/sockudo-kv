@@ -28,6 +28,12 @@ fn parse_float(b: &[u8]) -> Result<f64> {
         .map_err(|_| Error::NotFloat)
 }
 
+/// Validate that a string is exactly 16 hexadecimal characters
+#[inline]
+fn is_valid_hex_digest(s: &str) -> bool {
+    s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// SET command conditional options (Redis 8.4+)
 #[derive(Default, Clone)]
 enum SetCondition {
@@ -163,6 +169,7 @@ fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             let digest = std::str::from_utf8(&args[i])
                 .map_err(|_| Error::Syntax)?
                 .to_string();
+            // Don't validate digest format here - only validate when key exists and we need to compare
             opts.condition = SetCondition::Ifdeq(digest);
             has_condition = true;
         } else if eq_ignore_ascii_case(arg, b"IFDNE") {
@@ -176,6 +183,7 @@ fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             let digest = std::str::from_utf8(&args[i])
                 .map_err(|_| Error::Syntax)?
                 .to_string();
+            // Don't validate digest format here - only validate when key exists and we need to compare
             opts.condition = SetCondition::Ifdne(digest);
             has_condition = true;
         } else if eq_ignore_ascii_case(arg, b"GET") {
@@ -238,7 +246,8 @@ fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             }
         }
         SetCondition::Ifeq(expected) => {
-            let current = store.get(key);
+            // Use get_or_wrongtype to return WRONGTYPE for non-string keys
+            let current = store.get_or_wrongtype(key)?;
             if current.as_ref().map(|v| v.as_ref()) != Some(expected.as_ref()) {
                 return Ok(if opts.get {
                     old_value.map(RespValue::bulk).unwrap_or(RespValue::null())
@@ -248,7 +257,8 @@ fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             }
         }
         SetCondition::Ifne(expected) => {
-            let current = store.get(key);
+            // Use get_or_wrongtype to return WRONGTYPE for non-string keys
+            let current = store.get_or_wrongtype(key)?;
             if current.as_ref().map(|v| v.as_ref()) == Some(expected.as_ref()) {
                 return Ok(if opts.get {
                     old_value.map(RespValue::bulk).unwrap_or(RespValue::null())
@@ -258,10 +268,18 @@ fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             }
         }
         SetCondition::Ifdeq(expected_digest) => {
-            if let Some(current) = store.get(key) {
+            // Use get_or_wrongtype to return WRONGTYPE for non-string keys
+            if let Some(current) = store.get_or_wrongtype(key)? {
+                // Only validate digest format when key exists and we need to compare
+                if !is_valid_hex_digest(expected_digest) {
+                    return Err(Error::Custom(
+                        "ERR IFDEQ/IFDNE digest must be exactly 16 hexadecimal characters".into(),
+                    ));
+                }
                 let current_hash = xxhash_rust::xxh3::xxh3_64(&current);
                 let current_digest = format!("{:016x}", current_hash);
-                if current_digest != *expected_digest {
+                // Case-insensitive comparison for hex digits
+                if !current_digest.eq_ignore_ascii_case(expected_digest) {
                     return Ok(if opts.get {
                         old_value.map(RespValue::bulk).unwrap_or(RespValue::null())
                     } else {
@@ -269,15 +287,23 @@ fn cmd_set(store: &Store, args: &[Bytes]) -> Result<RespValue> {
                     });
                 }
             } else {
-                // Key doesn't exist, digest can't match
+                // Key doesn't exist, digest can't match - return nil without validating format
                 return Ok(RespValue::null());
             }
         }
         SetCondition::Ifdne(expected_digest) => {
-            if let Some(current) = store.get(key) {
+            // Use get_or_wrongtype to return WRONGTYPE for non-string keys
+            if let Some(current) = store.get_or_wrongtype(key)? {
+                // Only validate digest format when key exists and we need to compare
+                if !is_valid_hex_digest(expected_digest) {
+                    return Err(Error::Custom(
+                        "ERR IFDEQ/IFDNE digest must be exactly 16 hexadecimal characters".into(),
+                    ));
+                }
                 let current_hash = xxhash_rust::xxh3::xxh3_64(&current);
                 let current_digest = format!("{:016x}", current_hash);
-                if current_digest == *expected_digest {
+                // Case-insensitive comparison for hex digits
+                if current_digest.eq_ignore_ascii_case(expected_digest) {
                     return Ok(if opts.get {
                         old_value.map(RespValue::bulk).unwrap_or(RespValue::null())
                     } else {
@@ -936,7 +962,8 @@ fn cmd_digest(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 /// Conditionally removes the specified key based on value or hash digest comparison.
 /// Available since Redis 8.4.0
 fn cmd_delex(store: &Store, args: &[Bytes]) -> Result<RespValue> {
-    if args.is_empty() || args.len() > 3 {
+    // Valid args: 1 (just key) or 3 (key + condition + value)
+    if args.is_empty() || args.len() == 2 || args.len() > 3 {
         return Err(Error::WrongArity("DELEX"));
     }
 
@@ -948,19 +975,26 @@ fn cmd_delex(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         return Ok(RespValue::integer(if deleted { 1 } else { 0 }));
     }
 
-    // Parse condition
-    if args.len() != 3 {
-        return Err(Error::Syntax);
-    }
+    // args.len() == 3 at this point
 
     let condition = &args[1];
     let cond_value = &args[2];
 
-    // Get current value
-    let current = match store.get_or_wrongtype(key)? {
-        Some(v) => v,
+    // Get current value - DELEX with conditions requires string type
+    // First check if key exists and is a string type
+    match store.key_type(key) {
         None => return Ok(RespValue::integer(0)), // Key doesn't exist
-    };
+        Some("string") => {}                      // OK, proceed
+        Some(_) => {
+            // Redis returns a specific error for DELEX on wrong type, not WRONGTYPE
+            return Err(Error::Custom(
+                "ERR Key should be of string type if conditions are specified".into(),
+            ));
+        }
+    }
+
+    // Now we know key exists and is a string, get its value
+    let current = store.get(key).expect("key exists and is string");
 
     let should_delete = if eq_ignore_ascii_case(condition, b"IFEQ") {
         // Delete if value equals
@@ -969,19 +1003,32 @@ fn cmd_delex(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         // Delete if value not equals
         current.as_ref() != cond_value.as_ref()
     } else if eq_ignore_ascii_case(condition, b"IFDEQ") {
-        // Delete if digest equals
+        // Delete if digest equals (case-insensitive)
+        let cond_digest = std::str::from_utf8(cond_value).unwrap_or("");
+        if !is_valid_hex_digest(cond_digest) {
+            return Err(Error::Custom(
+                "ERR IFDEQ/IFDNE digest must be exactly 16 hexadecimal characters".into(),
+            ));
+        }
         let current_hash = xxhash_rust::xxh3::xxh3_64(&current);
         let current_digest = format!("{:016x}", current_hash);
-        let cond_digest = std::str::from_utf8(cond_value).unwrap_or("");
-        current_digest == cond_digest
+        current_digest.eq_ignore_ascii_case(cond_digest)
     } else if eq_ignore_ascii_case(condition, b"IFDNE") {
-        // Delete if digest not equals
+        // Delete if digest not equals (case-insensitive)
+        let cond_digest = std::str::from_utf8(cond_value).unwrap_or("");
+        if !is_valid_hex_digest(cond_digest) {
+            return Err(Error::Custom(
+                "ERR IFDEQ/IFDNE digest must be exactly 16 hexadecimal characters".into(),
+            ));
+        }
         let current_hash = xxhash_rust::xxh3::xxh3_64(&current);
         let current_digest = format!("{:016x}", current_hash);
-        let cond_digest = std::str::from_utf8(cond_value).unwrap_or("");
-        current_digest != cond_digest
+        !current_digest.eq_ignore_ascii_case(cond_digest)
     } else {
-        return Err(Error::Syntax);
+        return Err(Error::Custom(format!(
+            "ERR Invalid condition: {}",
+            String::from_utf8_lossy(condition)
+        )));
     };
 
     if should_delete {
