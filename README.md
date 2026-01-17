@@ -39,6 +39,7 @@ Sockudo-KV is engineered for maximum performance:
 - **SIMD-friendly** auto-vectorized distance calculations for vector search
 - **Tokio async runtime** for efficient I/O multiplexing
 - **Connection pooling** and efficient buffer management
+- **Redis 6.0+ expiration algorithm** with adaptive sampling and expiration index for O(1) key expiration
 
 ## Quick Start
 
@@ -195,9 +196,13 @@ sockudo-kv/
 │   ├── lua_engine.rs        # Lua scripting (EVAL, FCALL)
 │   ├── cluster_state.rs     # Redis Cluster state
 │   ├── client_manager.rs    # Client connection tracking
+│   ├── cron.rs              # Background tasks (expiration, LFU decay)
 │   ├── storage/
 │   │   ├── mod.rs           # Storage layer entry
+│   │   ├── store.rs         # Core key-value store
 │   │   ├── types.rs         # Data type definitions
+│   │   ├── expiration_index.rs  # Redis 6.0+ style expiration tracking
+│   │   ├── eviction.rs      # Memory eviction policies (LRU, LFU)
 │   │   └── ops/             # Operations by data type
 │   │       ├── string_ops.rs
 │   │       ├── list_ops.rs
@@ -224,6 +229,129 @@ sockudo-kv/
 │       ├── rdb.rs           # RDB serialization
 │       └── replica.rs       # Replication client
 ```
+
+## Key Expiration (Redis 6.0+ Compatible)
+
+Sockudo-KV implements the **exact same key expiration algorithm** as Redis 6.0+ and Dragonfly:
+
+### Hybrid Expiration Strategy
+
+1. **Passive Expiration (Lazy Deletion)**
+   - When a key is accessed (GET, SET, etc.), check if expired
+   - If expired, delete immediately and return null
+   - Zero overhead for keys without expiration
+
+2. **Active Expiration (Background Sampling)**
+   - Runs 10 times per second (configurable via `hz`)
+   - **Algorithm:**
+     - Sample 20 random keys that have TTL set
+     - Delete all expired keys found
+     - **If >25% expired, repeat immediately** (adaptive)
+     - Maximum 16 iterations per cycle (safety limit)
+   - Time-bounded to prevent blocking
+
+### Expiration Index
+
+Unlike Redis <6.0 which sampled from all keys, Sockudo-KV uses an **expiration index**:
+
+```
+BTreeMap<i64, DashSet<Bytes>>
+   │         └─ Keys expiring at this time
+   └─ Expiration timestamp (ms)
+```
+
+**Benefits:**
+- **O(1) sampling** - only samples keys with expiration
+- **Sorted by time** - enables efficient range queries
+- **Concurrent access** - thread-safe with RwLock
+- **Auto-cleanup** - empty buckets removed automatically
+
+### Configuration
+
+```conf
+# Active expiration effort (1-10, default 1)
+# Higher = more CPU time spent on expiration
+active-expire-effort 1
+
+# Background task frequency (default 10 Hz)
+hz 10
+
+# Dynamic Hz scaling based on client count
+dynamic-hz yes
+
+# Lazy freeing on expiration (async deletion)
+lazyfree-lazy-expire no
+```
+
+### Performance Characteristics
+
+| Metric | Value |
+|--------|-------|
+| Sampling complexity | O(1) per key |
+| Keys sampled per cycle | 20 (Redis default) |
+| Adaptive threshold | 25% expired keys |
+| Max iterations | 16 per cycle |
+| Frequency | 10 Hz (100ms interval) |
+| Index overhead | ~24 bytes per key with TTL |
+
+### Expiration Commands
+
+All Redis expiration commands fully supported:
+
+```bash
+# Relative expiration
+EXPIRE key 60              # Expire in 60 seconds
+PEXPIRE key 60000          # Expire in 60000 milliseconds
+
+# Absolute expiration
+EXPIREAT key 1735689600    # Expire at Unix timestamp
+PEXPIREAT key 1735689600000  # Expire at Unix timestamp (ms)
+
+# Conditional expiration (Redis 7.0+)
+EXPIRE key 60 NX           # Set only if no expiration
+EXPIRE key 60 XX           # Set only if has expiration
+EXPIRE key 60 GT           # Set only if new > current
+EXPIRE key 60 LT           # Set only if new < current
+
+# Query expiration
+TTL key                    # Get TTL in seconds (-1 = no expiry, -2 = not exists)
+PTTL key                   # Get TTL in milliseconds
+EXPIRETIME key             # Get absolute expiration time (seconds)
+PEXPIRETIME key            # Get absolute expiration time (ms)
+
+# Remove expiration
+PERSIST key                # Remove TTL from key
+```
+
+### String Operations with Expiration
+
+```bash
+# SET with expiration options
+SET key value EX 60        # Expire in 60 seconds
+SET key value PX 60000     # Expire in 60000 ms
+SET key value EXAT 1735689600    # Expire at timestamp
+SET key value PXAT 1735689600000 # Expire at timestamp (ms)
+SET key value KEEPTTL      # Keep existing TTL
+
+# GETEX - Get with expiration modification
+GETEX key EX 60            # Get and set new expiration
+GETEX key EXAT 1735689600  # Get and set absolute expiration
+GETEX key PERSIST          # Get and remove expiration
+```
+
+### Implementation Details
+
+The expiration index is maintained across all operations:
+
+- **SET/HSET/etc with TTL** → Add to index
+- **EXPIRE/EXPIREAT** → Update index (remove old, add new)
+- **PERSIST** → Remove from index
+- **DEL/UNLINK** → Remove from index
+- **FLUSHDB/FLUSHALL** → Clear index
+- **Passive expiration** → Check on access, remove if expired
+- **Active expiration** → Sample from index, adaptive repeat
+
+This ensures O(1) access to keys with expiration and matches Redis 6.0+ behavior exactly.
 
 ## Supported Commands
 

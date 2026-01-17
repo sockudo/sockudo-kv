@@ -6,6 +6,7 @@
 
 pub mod dashtable;
 pub use dashtable::{DashTable, calculate_hash};
+mod expiration_index;
 mod multi_store;
 mod store;
 mod types;

@@ -201,7 +201,8 @@ impl Store {
         };
 
         let new_entry = Entry::new(cloned_data);
-        if let Some(expire) = source_entry.1.expire_at_ms() {
+        let expire_ms = source_entry.1.expire_at_ms();
+        if let Some(expire) = expire_ms {
             new_entry.set_expire_at(expire);
         }
 
@@ -209,8 +210,15 @@ impl Store {
             self.data_remove(dest);
         }
 
-        self.data_insert(Bytes::copy_from_slice(dest), new_entry);
+        let dest_bytes = Bytes::copy_from_slice(dest);
+        self.data_insert(dest_bytes.clone(), new_entry);
         self.key_count.fetch_add(1, Ordering::Relaxed);
+
+        // Add to expiration index if copied key has expiration
+        if let Some(expire) = expire_ms {
+            self.expiration_index.add(dest_bytes, expire);
+        }
+
         true
     }
 
@@ -239,19 +247,23 @@ impl Store {
                     return false;
                 }
 
-                if xx || gt || lt {
-                    let current = entry.expire_at_ms();
-                    if xx
-                        || (gt && current.map_or(true, |c| timestamp_ms > c))
+                let old_expire = entry.expire_at_ms();
+                let should_update = if xx || gt || lt {
+                    let current = old_expire;
+                    xx || (gt && current.map_or(true, |c| timestamp_ms > c))
                         || (lt && current.map_or(false, |c| timestamp_ms < c))
-                    {
-                        entry.set_expire_at(timestamp_ms);
-                        true
-                    } else {
-                        false
-                    }
-                } else if !nx {
+                } else {
+                    !nx
+                };
+
+                if should_update {
                     entry.set_expire_at(timestamp_ms);
+
+                    // Update expiration index
+                    let key_bytes = e.get().0.clone();
+                    self.expiration_index
+                        .update(key_bytes, old_expire, timestamp_ms);
+
                     true
                 } else {
                     false
@@ -282,7 +294,18 @@ impl Store {
                     e.remove();
                     false
                 } else {
-                    entry.persist()
+                    let old_expire = entry.expire_at_ms();
+                    let had_expire = entry.persist();
+
+                    // Remove from expiration index if it had an expiration
+                    if had_expire {
+                        if let Some(expire_ms) = old_expire {
+                            let key_bytes = e.get().0.clone();
+                            self.expiration_index.remove(&key_bytes, expire_ms);
+                        }
+                    }
+
+                    had_expire
                 }
             }
             crate::storage::dashtable::Entry::Vacant(_) => false,
@@ -702,8 +725,15 @@ impl Store {
         if replace {
             self.data_remove(key);
         }
-        self.data_insert(Bytes::copy_from_slice(key), entry);
+
+        let key_bytes = Bytes::copy_from_slice(key);
+        self.data_insert(key_bytes.clone(), entry);
         self.key_count.fetch_add(1, Ordering::Relaxed);
+
+        // Add to expiration index if key has expiration
+        if let Some(exp) = final_expire {
+            self.expiration_index.add(key_bytes, exp);
+        }
 
         Ok(())
     }
@@ -712,6 +742,7 @@ impl Store {
         self.data.clear();
         self.search_indexes.clear();
         self.search_aliases.clear();
+        self.expiration_index.clear();
         self.key_count.store(0, Ordering::Relaxed);
     }
 
@@ -720,12 +751,18 @@ impl Store {
     /// The actual memory deallocation happens in the background
     #[inline]
     pub fn lazy_del(&self, key: &[u8]) -> bool {
-        if let Some(removed) = self.data_remove(key) {
+        if let Some((key_bytes, entry)) = self.data_remove(key) {
             self.key_count.fetch_sub(1, Ordering::Relaxed);
+
+            // Remove from expiration index if it has expiration
+            if let Some(expire_ms) = entry.expire_at_ms() {
+                self.expiration_index.remove(&key_bytes, expire_ms);
+            }
+
             // Spawn background task to drop the value
             // This moves the owned value to a task that will deallocate it
             std::thread::spawn(move || {
-                drop(removed);
+                drop((key_bytes, entry));
             });
             true
         } else {
@@ -741,6 +778,7 @@ impl Store {
         self.data.clear();
         self.search_indexes.clear();
         self.search_aliases.clear();
+        self.expiration_index.clear();
         self.key_count.store(0, Ordering::Relaxed);
     }
 }

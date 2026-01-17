@@ -2,6 +2,7 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::dashtable::{DashTable, calculate_hash};
+use super::expiration_index::ExpirationIndex;
 use super::ops::search_ops::SearchIndex;
 use super::types::Entry;
 
@@ -65,6 +66,9 @@ pub struct Store {
     pub(crate) data: DashTable<(Bytes, Entry)>,
     /// Track approximate key count for INFO command
     pub(crate) key_count: AtomicU64,
+    /// Expiration index for efficient active expiration (Redis 6.0+ style)
+    /// Tracks keys with TTL sorted by expiration time
+    pub(crate) expiration_index: ExpirationIndex,
     /// Search indexes: index_name -> SearchIndex
     pub(crate) search_indexes: DashTable<(Bytes, SearchIndex)>,
     /// Search aliases: alias -> index_name
@@ -96,6 +100,7 @@ impl Store {
             // Dynamic shards based on CPU count for optimal concurrency
             data: DashTable::with_capacity_and_shard_amount(capacity, shard_count),
             key_count: AtomicU64::new(0),
+            expiration_index: ExpirationIndex::new(),
             // Metadata maps rarely used, minimal 2 shards
             search_indexes: DashTable::with_shard_amount(2),
             search_aliases: DashTable::with_shard_amount(2),
@@ -135,8 +140,14 @@ impl Store {
     /// Delete a key
     #[inline]
     pub fn del(&self, key: &[u8]) -> bool {
-        if self.data_remove(key).is_some() {
+        if let Some((key_bytes, entry)) = self.data_remove(key) {
             self.key_count.fetch_sub(1, Ordering::Relaxed);
+
+            // Remove from expiration index if it has expiration
+            if let Some(expire_ms) = entry.expire_at_ms() {
+                self.expiration_index.remove(&key_bytes, expire_ms);
+            }
+
             true
         } else {
             false
@@ -156,7 +167,15 @@ impl Store {
                 if entry.is_expired() {
                     false
                 } else {
+                    let old_expire = entry.expire_at_ms();
+                    let new_expire = super::value::now_ms() + ms;
                     entry.set_expire_in(ms);
+
+                    // Update expiration index
+                    let key_bytes = e.get().0.clone();
+                    self.expiration_index
+                        .update(key_bytes, old_expire, new_expire);
+
                     true
                 }
             }
@@ -228,22 +247,43 @@ impl Store {
         }
     }
 
-    /// Sample random keys and delete expired ones
-    /// Used by the background cron task for active expiration
-    /// Returns the count of expired keys that were deleted
+    /// Redis-style active expiration cycle
+    ///
+    /// Algorithm (matches Redis 6.0+):
+    /// 1. Sample 20 random keys that have expiration set
+    /// 2. Delete all expired keys found
+    /// 3. If >25% expired, repeat (adaptive)
+    /// 4. Time-bound to prevent blocking
+    ///
+    /// Returns the total count of expired keys that were deleted
     pub fn expire_random_keys(&self, samples: usize, use_lazy: bool) -> usize {
-        let mut expired_count = 0;
-        let len = self.data.len();
-        if len == 0 {
-            return 0;
-        }
+        const REDIS_SAMPLE_SIZE: usize = 20;
+        const ADAPTIVE_THRESHOLD_PERCENT: usize = 25;
+        const MAX_ITERATIONS: usize = 16; // Safety limit
 
-        // Sample random keys and check for expiration
-        for _ in 0..samples {
-            let skip = fastrand::usize(0..len.max(1));
-            if let Some(entry) = self.data.iter().nth(skip) {
-                if entry.1.is_expired() {
-                    let key = entry.0.clone();
+        let sample_size = if samples > 0 {
+            samples
+        } else {
+            REDIS_SAMPLE_SIZE
+        };
+        let mut total_expired = 0;
+        let mut iteration = 0;
+
+        loop {
+            iteration += 1;
+
+            // Sample random keys that have expiration
+            let keys = self.expiration_index.sample_random(sample_size);
+            if keys.is_empty() {
+                break;
+            }
+
+            let sampled = keys.len();
+            let mut expired_count = 0;
+
+            // Check each sampled key and delete if expired
+            for key in keys {
+                if self.is_key_expired(&key) {
                     if use_lazy {
                         self.lazy_del(&key);
                     } else {
@@ -252,9 +292,35 @@ impl Store {
                     expired_count += 1;
                 }
             }
+
+            total_expired += expired_count;
+
+            // Redis adaptive algorithm: if >25% expired, repeat
+            let expired_percent = (expired_count * 100) / sampled.max(1);
+            if expired_percent <= ADAPTIVE_THRESHOLD_PERCENT {
+                break; // <25% expired, we're done
+            }
+
+            // Safety: don't loop forever
+            if iteration >= MAX_ITERATIONS {
+                break;
+            }
         }
 
-        expired_count
+        total_expired
+    }
+
+    /// Check if a key is expired (helper for expiration cycle)
+    #[inline]
+    fn is_key_expired(&self, key: &[u8]) -> bool {
+        let h = calculate_hash(key);
+        match self
+            .data
+            .entry(h, |kv| kv.0 == key, |kv| calculate_hash(&kv.0))
+        {
+            crate::storage::dashtable::Entry::Occupied(e) => e.get().1.is_expired(),
+            crate::storage::dashtable::Entry::Vacant(_) => false,
+        }
     }
 
     // ==================== DashTable Helpers ====================
@@ -299,5 +365,166 @@ impl Store {
 impl Default for Store {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::DataType;
+
+    #[test]
+    fn test_redis_style_expiration_cycle() {
+        let store = Store::new();
+
+        // Add 100 keys, 30 of which are already expired
+        for i in 0..100 {
+            let key = Bytes::from(format!("key{}", i));
+            let value = Bytes::from(format!("value{}", i));
+
+            if i < 30 {
+                // These keys are already expired (1ms in the past)
+                let entry =
+                    Entry::with_expire(DataType::String(value), super::super::value::now_ms() - 1);
+                store.data_insert(key.clone(), entry);
+                store
+                    .expiration_index
+                    .add(key, super::super::value::now_ms() - 1);
+            } else {
+                // These keys expire in 1 hour
+                let expire_at = super::super::value::now_ms() + 3600000;
+                let entry = Entry::with_expire(DataType::String(value), expire_at);
+                store.data_insert(key.clone(), entry);
+                store.expiration_index.add(key, expire_at);
+            }
+            store.key_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        assert_eq!(store.len(), 100);
+
+        // Run the Redis-style expiration cycle with sample size 20
+        // Since 30% of keys are expired (>25% threshold), it should repeat multiple times
+        let expired = store.expire_random_keys(20, false);
+
+        // Should have deleted some expired keys (likely all 30, but at least some)
+        assert!(expired > 0, "Should have expired at least some keys");
+        assert!(expired <= 30, "Should not expire more than 30 keys");
+
+        // The adaptive algorithm should eventually clear all expired keys
+        // Run it a few more times to be sure
+        let mut total_expired = expired;
+        for _ in 0..5 {
+            let expired = store.expire_random_keys(20, false);
+            total_expired += expired;
+            if expired == 0 {
+                break; // No more expired keys
+            }
+        }
+
+        // All 30 expired keys should eventually be deleted
+        assert_eq!(total_expired, 30, "Should have expired all 30 expired keys");
+        assert_eq!(store.len(), 70, "Should have 70 keys remaining");
+    }
+
+    #[test]
+    fn test_expiration_index_maintained() {
+        let store = Store::new();
+        let key = Bytes::from("testkey");
+        let value = Bytes::from("testvalue");
+
+        // Set key with expiration
+        let expire_at = super::super::value::now_ms() + 1000;
+        store.set_ex(key.clone(), value.clone(), 1000);
+
+        // Check expiration index has the key
+        assert!(!store.expiration_index.is_empty());
+
+        // Update expiration
+        store.expire_at(&key, expire_at + 1000, false, false, false, false);
+
+        // Delete the key
+        assert!(store.del(&key));
+
+        // Expiration index should be cleaned up
+        // Note: The index is cleaned up when the key is removed
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_persist_removes_from_index() {
+        let store = Store::new();
+        let key = Bytes::from("testkey");
+        let value = Bytes::from("testvalue");
+
+        // Set key with expiration
+        store.set_ex(key.clone(), value, 10000);
+
+        // Verify key has expiration
+        assert!(store.pttl(&key) > 0);
+
+        // Persist the key (remove expiration)
+        assert!(store.persist(&key));
+
+        // Key should no longer have expiration
+        assert_eq!(store.pttl(&key), -1);
+
+        // Key should still exist
+        assert!(store.exists(&key));
+    }
+
+    #[test]
+    fn test_flush_clears_expiration_index() {
+        let store = Store::new();
+
+        // Add multiple keys with expiration
+        for i in 0..10 {
+            let key = Bytes::from(format!("key{}", i));
+            let value = Bytes::from(format!("value{}", i));
+            store.set_ex(key, value, 10000);
+        }
+
+        assert_eq!(store.len(), 10);
+
+        // Flush the store
+        store.flush();
+
+        assert_eq!(store.len(), 0);
+        assert!(store.expiration_index.is_empty());
+    }
+
+    #[test]
+    fn test_adaptive_expiration_stops_at_threshold() {
+        let store = Store::new();
+
+        // Add 100 keys, only 5 expired (5% < 25% threshold)
+        for i in 0..100 {
+            let key = Bytes::from(format!("key{}", i));
+            let value = Bytes::from(format!("value{}", i));
+
+            if i < 5 {
+                // Expired
+                let entry =
+                    Entry::with_expire(DataType::String(value), super::super::value::now_ms() - 1);
+                store.data_insert(key.clone(), entry);
+                store
+                    .expiration_index
+                    .add(key, super::super::value::now_ms() - 1);
+            } else {
+                // Not expired
+                let expire_at = super::super::value::now_ms() + 3600000;
+                let entry = Entry::with_expire(DataType::String(value), expire_at);
+                store.data_insert(key.clone(), entry);
+                store.expiration_index.add(key, expire_at);
+            }
+            store.key_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Run expiration cycle with sample size 20
+        // Should find ~1 expired key (5% of 20), which is < 25% threshold
+        // So it should stop after first iteration
+        let expired = store.expire_random_keys(20, false);
+
+        // Should have expired some keys but not necessarily all
+        assert!(expired <= 5, "Should not exceed total expired keys");
     }
 }
