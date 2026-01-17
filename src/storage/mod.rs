@@ -27,6 +27,18 @@ pub mod timeseries;
 // Ultra-high-performance Bloom Filter
 pub mod bloomfilter;
 
+// Ultra-high-performance Cuckoo Filter
+pub mod cuckoofilter;
+
+// Ultra-high-performance T-Digest
+pub mod tdigest;
+
+// Ultra-high-performance Top-K Heavy Hitters
+pub mod topk;
+
+// Ultra-high-performance Count-Min Sketch
+pub mod cms;
+
 // Import all operation modules - each adds methods to Store via impl blocks
 pub mod eviction;
 pub mod ops;

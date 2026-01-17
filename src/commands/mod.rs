@@ -33,6 +33,10 @@ pub mod timeseries;
 pub mod vector;
 
 pub mod bloom;
+pub mod cms;
+pub mod cuckoo;
+pub mod tdigest;
+pub mod topk;
 
 use crate::error::{Error, Result};
 use crate::protocol::{Command, RespValue};
@@ -342,6 +346,26 @@ impl Dispatcher {
             return bloom::execute(store, cmd_name, args);
         }
 
+        // Cuckoo Filter
+        if cmd_name.len() >= 3 && cmd_name[..3].eq_ignore_ascii_case(b"CF.") {
+            return cuckoo::execute(store, cmd_name, args);
+        }
+
+        // TDigest
+        if cmd_name.len() >= 8 && cmd_name[..8].eq_ignore_ascii_case(b"TDIGEST.") {
+            return tdigest::execute(store, cmd_name, args);
+        }
+
+        // Top-K
+        if cmd_name.len() >= 5 && cmd_name[..5].eq_ignore_ascii_case(b"TOPK.") {
+            return topk::execute(store, cmd_name, args);
+        }
+
+        // Count-Min Sketch
+        if cmd_name.len() >= 4 && cmd_name[..4].eq_ignore_ascii_case(b"CMS.") {
+            return cms::execute(store, cmd_name, args);
+        }
+
         Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd_name).into_owned(),
         ))
@@ -499,7 +523,9 @@ fn is_write_command(cmd: &[u8]) -> bool {
         | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZPOPMAX" | "ZPOPMIN" | "FLUSHDB"
         | "FLUSHALL" | "RESTORE" | "RENAME" | "RENAMENX" | "APPEND" | "INCR" | "DECR"
         | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "BF.RESERVE" | "BF.ADD" | "BF.MADD"
-        | "BF.INSERT" | "BF.LOADCHUNK" => true,
+        | "BF.INSERT" | "BF.LOADCHUNK" | "CF.RESERVE" | "CF.ADD" | "CF.ADDNX" | "CF.INSERT"
+        | "CF.INSERTNX" | "CF.DEL" | "CF.LOADCHUNK" | "TOPK.RESERVE" | "TOPK.ADD"
+        | "TOPK.INCRBY" | "CMS.INITBYDIM" | "CMS.INITBYPROB" | "CMS.INCRBY" | "CMS.MERGE" => true,
         _ => false,
     }
 }

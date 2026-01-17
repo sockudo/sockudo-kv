@@ -189,6 +189,10 @@ impl Store {
             DataType::HashPacked(lp) => DataType::HashPacked(lp.clone()),
             DataType::SortedSetPacked(lp) => DataType::SortedSetPacked(lp.clone()),
             DataType::BloomFilter(bf) => DataType::BloomFilter(bf.clone()),
+            DataType::CuckooFilter(cf) => DataType::CuckooFilter(cf.clone()),
+            DataType::TDigest(td) => DataType::TDigest(td.clone()),
+            DataType::TopK(tk) => DataType::TopK(tk.clone()),
+            DataType::CountMinSketch(cms) => DataType::CountMinSketch(cms.clone()),
         };
 
         let new_entry = Entry::new(cloned_data);
@@ -443,6 +447,10 @@ impl Store {
             DataType::TimeSeries(_) => 8,
             DataType::VectorSet(_) => 9,
             DataType::BloomFilter(_) => 10,
+            DataType::CuckooFilter(_) => 11,
+            DataType::TDigest(_) => 12,
+            DataType::TopK(_) => 13,
+            DataType::CountMinSketch(_) => 14,
         };
         data.push(type_byte);
 
@@ -512,6 +520,16 @@ impl Store {
             }
             DataType::BloomFilter(bf) => {
                 let bytes = bf.to_bytes();
+                write_varint(&mut data, bytes.len() as u64);
+                data.extend_from_slice(&bytes);
+            }
+            DataType::CuckooFilter(cf) => {
+                let bytes = cf.to_bytes();
+                write_varint(&mut data, bytes.len() as u64);
+                data.extend_from_slice(&bytes);
+            }
+            DataType::TDigest(td) => {
+                let bytes = td.to_bytes();
                 write_varint(&mut data, bytes.len() as u64);
                 data.extend_from_slice(&bytes);
             }
@@ -635,6 +653,18 @@ impl Store {
                 let bf = crate::storage::bloomfilter::ScalableBloomFilter::from_bytes(bf_data)
                     .ok_or("ERR invalid bloom filter data")?;
                 DataType::BloomFilter(Box::new(bf))
+            }
+            11 => {
+                // Cuckoo Filter
+                let (len, new_pos) = read_varint(data, pos).map_err(|e| e.to_string())?;
+                pos = new_pos;
+                if pos + len as usize > data_len - 8 {
+                    return Err("ERR invalid cuckoo filter length".into());
+                }
+                let cf_data = &data[pos..pos + len as usize];
+                let cf = crate::storage::cuckoofilter::ScalableCuckooFilter::from_bytes(cf_data)
+                    .ok_or("ERR invalid cuckoo filter data")?;
+                DataType::CuckooFilter(Box::new(cf))
             }
             _ => return Err("ERR unsupported data type for restore".into()),
         };

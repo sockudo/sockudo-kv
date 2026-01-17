@@ -38,6 +38,14 @@ pub enum DataType {
     VectorSet(Box<VectorSetData>),
     /// BloomFilter - probabilistic set membership
     BloomFilter(Box<super::bloomfilter::ScalableBloomFilter>),
+    /// CuckooFilter - probabilistic set membership with deletion support
+    CuckooFilter(Box<super::cuckoofilter::ScalableCuckooFilter>),
+    /// TDigest - quantile estimation data structure
+    TDigest(Box<super::tdigest::TDigest>),
+    /// TopK - heavy hitters tracking
+    TopK(Box<super::topk::TopK>),
+    /// CountMinSketch - frequency estimation
+    CountMinSketch(Box<super::cms::CountMinSketch>),
 }
 
 impl std::fmt::Debug for DataType {
@@ -57,6 +65,10 @@ impl std::fmt::Debug for DataType {
             DataType::TimeSeries(ts) => f.debug_tuple("TimeSeries").field(ts).finish(),
             DataType::VectorSet(v) => f.debug_tuple("VectorSet").field(v).finish(),
             DataType::BloomFilter(bf) => f.debug_tuple("BloomFilter").field(bf).finish(),
+            DataType::CuckooFilter(cf) => f.debug_tuple("CuckooFilter").field(cf).finish(),
+            DataType::TDigest(td) => f.debug_tuple("TDigest").field(td).finish(),
+            DataType::TopK(tk) => f.debug_tuple("TopK").field(tk).finish(),
+            DataType::CountMinSketch(cms) => f.debug_tuple("CountMinSketch").field(cms).finish(),
         }
     }
 }
@@ -77,6 +89,10 @@ impl DataType {
             DataType::TimeSeries(_) => "TSDB-TYPE",
             DataType::VectorSet(_) => "vectorset",
             DataType::BloomFilter(_) => "MBbloom--",
+            DataType::CuckooFilter(_) => "MBcuckoo-",
+            DataType::TDigest(_) => "TDIS-TYPE",
+            DataType::TopK(_) => "MBtopk---",
+            DataType::CountMinSketch(_) => "MBcms----",
         }
     }
 
@@ -292,6 +308,72 @@ impl DataType {
     pub fn as_bloomfilter_mut(&mut self) -> Option<&mut super::bloomfilter::ScalableBloomFilter> {
         match self {
             DataType::BloomFilter(bf) => Some(bf),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_cuckoofilter(&self) -> Option<&super::cuckoofilter::ScalableCuckooFilter> {
+        match self {
+            DataType::CuckooFilter(cf) => Some(cf),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_cuckoofilter_mut(
+        &mut self,
+    ) -> Option<&mut super::cuckoofilter::ScalableCuckooFilter> {
+        match self {
+            DataType::CuckooFilter(cf) => Some(cf),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_tdigest(&self) -> Option<&super::tdigest::TDigest> {
+        match self {
+            DataType::TDigest(td) => Some(td),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_tdigest_mut(&mut self) -> Option<&mut super::tdigest::TDigest> {
+        match self {
+            DataType::TDigest(td) => Some(td),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_topk(&self) -> Option<&super::topk::TopK> {
+        match self {
+            DataType::TopK(tk) => Some(tk),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_topk_mut(&mut self) -> Option<&mut super::topk::TopK> {
+        match self {
+            DataType::TopK(tk) => Some(tk),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_cms(&self) -> Option<&super::cms::CountMinSketch> {
+        match self {
+            DataType::CountMinSketch(cms) => Some(cms),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_cms_mut(&mut self) -> Option<&mut super::cms::CountMinSketch> {
+        match self {
+            DataType::CountMinSketch(cms) => Some(cms),
             _ => None,
         }
     }

@@ -228,7 +228,11 @@ fn write_value(rdb: &mut Vec<u8>, key: &Bytes, data: &DataType, compress: bool) 
         DataType::Stream(_)
         | DataType::TimeSeries(_)
         | DataType::VectorSet(_)
-        | DataType::BloomFilter(_) => {
+        | DataType::BloomFilter(_)
+        | DataType::CuckooFilter(_)
+        | DataType::TDigest(_)
+        | DataType::TopK(_)
+        | DataType::CountMinSketch(_) => {
             // Skip complex types for now - they need special handling
             // or implement simplified representation
         }

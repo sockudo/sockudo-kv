@@ -6,6 +6,8 @@
 
 pub mod bitmap_ops;
 pub mod bloom_ops;
+pub mod cms_ops;
+pub mod cuckoo_ops;
 pub mod generic_ops;
 pub mod geo_ops;
 pub mod hash_ops;
@@ -17,5 +19,7 @@ pub mod set_ops;
 pub mod sorted_set_ops;
 pub mod stream_ops;
 pub mod string_ops;
+pub mod tdigest_ops;
 pub mod timeseries_ops;
+pub mod topk_ops;
 pub mod vector_ops;
