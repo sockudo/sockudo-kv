@@ -33,6 +33,7 @@ use sockudo_kv::config::ServerConfig;
 use sockudo_kv::protocol::{Command, Parser, RespValue};
 use sockudo_kv::pubsub::PubSubMessage;
 use sockudo_kv::replication::rdb::RdbConfig;
+use sockudo_kv::replication::{ReplicaState, ReplicationManager};
 use sockudo_kv::server_state::ServerState;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -156,9 +157,9 @@ pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
             r"
  ____             _               _              _  ____     __
 / ___|  ___   ___| | ___   _   __| | ___        | |/ /\ \   / /
-\___ \ / _ \ / __| |/ / | | | / _` |/ _ \  _____| ' /  \ \ / / 
- ___) | (_) | (__|   <| |_| || (_| | (_) ||_____| . \   \ V /  
-|____/ \___/ \___|_|\_\\__,_| \__,_|\___/       |_|\_\   \_/   
+\___ \ / _ \ / __| |/ / | | | / _` |/ _ \  _____| ' /  \ \ / /
+ ___) | (_) | (__|   <| |_| || (_| | (_) ||_____| . \   \ V /
+|____/ \___/ \___|_|\_\\__,_| \__,_|\___/       |_|\_\   \_/
 
 sockudo-kv v7.0.0 - High-performance Redis-compatible server
 "
@@ -1151,7 +1152,25 @@ where
                                         write_buf.extend_from_slice(b"-MISCONF Redis is configured to save RDB snapshots, but is currently not able to persist on disk. Commands that may modify the data set are disabled. Please check Redis logs for details about the error.\r\n");
                                         continue;
                                     }
-                                    if cmd.is_command(b"SWAPDB") {
+                                    if cmd.is_command(b"SYNC") || cmd.is_command(b"PSYNC") {
+                                        // SYNC/PSYNC: Enter replica streaming mode
+                                        // First, flush any pending writes
+                                        if !write_buf.is_empty() {
+                                            socket.write_all(&write_buf).await?;
+                                            write_buf.clear();
+                                        }
+
+                                        // Handle SYNC - this takes over the connection
+                                        return handle_sync_replica(
+                                            socket,
+                                            client.addr,
+                                            multi_store,
+                                            replication,
+                                            config,
+                                            cmd.is_command(b"PSYNC"),
+                                            &cmd.args,
+                                        ).await;
+                                    } else if cmd.is_command(b"SWAPDB") {
                                         // SWAPDB needs access to MultiStore
                                         let response = handle_swapdb(multi_store, &cmd.args);
                                         if client.should_reply() {
@@ -1483,6 +1502,223 @@ fn handle_select(client: &Arc<ClientState>, db_count: usize, args: &[bytes::Byte
 
     client.select_db(db_index as u64);
     RespValue::ok()
+}
+
+/// Handle SYNC/PSYNC command - enters replica streaming mode
+///
+/// This function takes over the connection and:
+/// 1. For PSYNC: Sends FULLRESYNC response with replication ID and offset
+/// 2. Sends RDB dump as a bulk string
+/// 3. Registers the connection as a replica
+/// 4. Streams all subsequent write commands to the replica
+async fn handle_sync_replica<S>(
+    socket: &mut S,
+    addr: std::net::SocketAddr,
+    multi_store: &Arc<sockudo_kv::storage::MultiStore>,
+    replication: &Arc<ReplicationManager>,
+    config: &Arc<ServerConfig>,
+    is_psync: bool,
+    args: &[bytes::Bytes],
+) -> std::io::Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    // For PSYNC, check if partial sync is possible
+    // PSYNC <replid> <offset>
+    // For now, always do full sync
+
+    let repl_id = replication.repl_id();
+    let offset = replication.offset();
+
+    if is_psync {
+        // Check if we can do partial sync
+        let can_partial = if args.len() >= 2 {
+            let client_replid = std::str::from_utf8(&args[0]).unwrap_or("");
+            let client_offset: i64 = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+
+            // Check if replid matches and offset is in backlog
+            if client_replid == repl_id && client_offset >= 0 {
+                replication
+                    .backlog
+                    .get_from_offset(client_offset)
+                    .map(|cmds| (client_offset, cmds))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((client_offset, pending_cmds)) = can_partial {
+            // Partial sync possible - send CONTINUE
+            let response = format!("+CONTINUE {}\r\n", repl_id);
+            socket.write_all(response.as_bytes()).await?;
+
+            // Register replica
+            let replica = replication.register_replica(addr);
+            replica
+                .offset
+                .store(client_offset, std::sync::atomic::Ordering::Relaxed);
+            *replica.state.write() = ReplicaState::Online;
+
+            // Send pending commands from backlog
+            for cmd in pending_cmds {
+                socket.write_all(&cmd).await?;
+            }
+
+            // Subscribe to command stream and forward
+            let mut cmd_rx = replication.cmd_tx.subscribe();
+
+            loop {
+                match cmd_rx.recv().await {
+                    Ok(cmd) => {
+                        if let Err(e) = socket.write_all(&cmd).await {
+                            eprintln!("Replica {} write error: {}", addr, e);
+                            break;
+                        }
+                        // Update replica offset
+                        replica
+                            .offset
+                            .fetch_add(cmd.len() as i64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!(
+                            "Replica {} lagged {} commands, disconnecting for full sync",
+                            addr, n
+                        );
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+
+            // Cleanup
+            replication.unregister_replica(replica.id);
+            return Ok(());
+        }
+
+        // Full sync needed - send FULLRESYNC
+        let response = format!("+FULLRESYNC {} {}\r\n", repl_id, offset);
+        socket.write_all(response.as_bytes()).await?;
+    }
+
+    // Generate RDB dump
+    let rdb_config = RdbConfig {
+        compression: config.rdbcompression,
+        checksum: config.rdbchecksum,
+    };
+    let rdb_data = sockudo_kv::replication::rdb::generate_rdb_with_config(multi_store, rdb_config);
+
+    // Send RDB as bulk string: $<length>\r\n<data>
+    // Note: No trailing \r\n after the data for RDB transfer
+    let length_line = format!("${}\r\n", rdb_data.len());
+    socket.write_all(length_line.as_bytes()).await?;
+    socket.write_all(&rdb_data).await?;
+
+    // Register this connection as a replica
+    let replica = replication.register_replica(addr);
+    replica
+        .offset
+        .store(offset, std::sync::atomic::Ordering::Relaxed);
+    *replica.state.write() = ReplicaState::Online;
+
+    // Subscribe to command broadcast channel
+    let mut cmd_rx = replication.cmd_tx.subscribe();
+
+    // Also need to handle REPLCONF ACK from replica (reading from socket)
+    let mut read_buf = BytesMut::with_capacity(1024);
+
+    // Enter streaming loop - forward all commands to replica
+    loop {
+        tokio::select! {
+            biased;
+
+            // Forward commands to replica
+            cmd_result = cmd_rx.recv() => {
+                match cmd_result {
+                    Ok(cmd) => {
+                        if let Err(e) = socket.write_all(&cmd).await {
+                            eprintln!("Replica {} write error: {}", addr, e);
+                            break;
+                        }
+                        // Update replica offset
+                        replica.offset.fetch_add(cmd.len() as i64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Replica is too slow - it missed commands
+                        // In production, should trigger full resync
+                        eprintln!("Replica {} lagged {} commands", addr, n);
+                        // For now, continue - the replica will need to reconnect for full sync
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Server shutting down
+                        break;
+                    }
+                }
+            }
+
+            // Handle incoming data from replica (REPLCONF ACK, PING, etc.)
+            read_result = socket.read_buf(&mut read_buf) => {
+                match read_result {
+                    Ok(0) => {
+                        // Replica disconnected
+                        break;
+                    }
+                    Ok(_) => {
+                        // Parse and handle replica commands (mainly REPLCONF ACK)
+                        while let Ok(Some(value)) = Parser::parse(&mut read_buf) {
+                            if let Ok(cmd) = Command::from_resp(value) {
+                                if cmd.is_command(b"REPLCONF") && cmd.args.len() >= 2 {
+                                    if cmd.args[0].eq_ignore_ascii_case(b"ACK") {
+                                        // Update ACK offset
+                                        if let Ok(ack_offset) = std::str::from_utf8(&cmd.args[1])
+                                            .ok()
+                                            .and_then(|s| s.parse::<i64>().ok())
+                                            .ok_or(())
+                                        {
+                                            replica.ack_offset.store(ack_offset, std::sync::atomic::Ordering::Relaxed);
+                                            replica.last_ack_time.store(
+                                                std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap()
+                                                    .as_secs(),
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                    } else if cmd.args[0].eq_ignore_ascii_case(b"GETACK") {
+                                        // Respond with current offset
+                                        let offset = replica.offset.load(std::sync::atomic::Ordering::Relaxed);
+                                        let response = format!("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
+                                            offset.to_string().len(), offset);
+                                        let _ = socket.write_all(response.as_bytes()).await;
+                                    }
+                                } else if cmd.is_command(b"PING") {
+                                    // Respond to PING
+                                    let _ = socket.write_all(b"+PONG\r\n").await;
+                                }
+                                // Ignore other commands from replica
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Replica {} read error: {}", addr, e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Cleanup - unregister replica
+    *replica.state.write() = ReplicaState::Disconnected;
+    replication.unregister_replica(replica.id);
+
+    Ok(())
 }
 
 /// Create a TCP listener with socket2 for proper configuration (backlog, socket mark)
