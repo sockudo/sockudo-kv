@@ -213,7 +213,7 @@ impl Dispatcher {
 
         // Info command
         if cmd.is_command(b"INFO") {
-            return Ok(cmd_info(args));
+            return Ok(cmd_info(store, args));
         }
 
         // Generic commands
@@ -660,7 +660,7 @@ fn cmd_type(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     )))
 }
 
-fn cmd_info(args: &[Bytes]) -> RespValue {
+fn cmd_info(store: &Store, args: &[Bytes]) -> RespValue {
     // Return minimal INFO response for redis-benchmark compatibility
     let section = if args.is_empty() {
         b"all"
@@ -668,16 +668,46 @@ fn cmd_info(args: &[Bytes]) -> RespValue {
         args[0].as_ref()
     };
 
-    // Return basic info string
-    let info = if section.eq_ignore_ascii_case(b"server") || section.eq_ignore_ascii_case(b"all") {
-        "# Server\r\nredis_version:7.0.0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\n"
-    } else if section.eq_ignore_ascii_case(b"replication") {
-        "# Replication\r\nrole:master\r\nconnected_slaves:0\r\n"
-    } else if section.eq_ignore_ascii_case(b"stats") {
-        "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\n"
-    } else {
-        ""
-    };
+    let mut info = String::new();
+
+    let is_all =
+        section.eq_ignore_ascii_case(b"all") || section.eq_ignore_ascii_case(b"everything");
+
+    if section.eq_ignore_ascii_case(b"server") || is_all {
+        info.push_str("# Server\r\nredis_version:7.0.0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\n");
+    }
+
+    if section.eq_ignore_ascii_case(b"replication") || is_all {
+        if !info.is_empty() && !info.ends_with("\r\n\r\n") {
+            info.push_str("\r\n");
+        }
+        info.push_str("# Replication\r\nrole:master\r\nconnected_slaves:0\r\n");
+    }
+
+    if section.eq_ignore_ascii_case(b"stats") || is_all {
+        if !info.is_empty() && !info.ends_with("\r\n\r\n") {
+            info.push_str("\r\n");
+        }
+        info.push_str("# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\n");
+    }
+
+    if section.eq_ignore_ascii_case(b"keyspace") || is_all {
+        if !info.is_empty() && !info.ends_with("\r\n\r\n") {
+            info.push_str("\r\n");
+        }
+        info.push_str("# Keyspace\r\n");
+
+        // Get key count and expiring keys count
+        let keys = store.len();
+        if keys > 0 {
+            // Count keys with TTL
+            let expires = store.expiration_index.len();
+            info.push_str(&format!(
+                "db0:keys={},expires={},avg_ttl=0\r\n",
+                keys, expires
+            ));
+        }
+    }
 
     RespValue::bulk(Bytes::copy_from_slice(info.as_bytes()))
 }

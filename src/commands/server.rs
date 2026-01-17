@@ -1505,7 +1505,24 @@ fn cmd_debug(
         b"QUICKLIST-PACKED-THRESHOLD" => Ok(RespValue::ok()),
 
         // DEBUG SET-ACTIVE-EXPIRE - enable/disable active expiration
-        b"SET-ACTIVE-EXPIRE" => Ok(RespValue::ok()),
+        b"SET-ACTIVE-EXPIRE" => {
+            if args.len() < 2 {
+                return Err(Error::WrongArity("DEBUG SET-ACTIVE-EXPIRE"));
+            }
+            let enabled = match args[1].as_ref() {
+                b"0" | b"no" | b"false" => false,
+                b"1" | b"yes" | b"true" => true,
+                _ => {
+                    return Err(Error::Custom(
+                        "ERR DEBUG SET-ACTIVE-EXPIRE requires 0 or 1".to_string(),
+                    ));
+                }
+            };
+            server
+                .active_expire_enabled
+                .store(enabled, std::sync::atomic::Ordering::Relaxed);
+            Ok(RespValue::ok())
+        }
 
         // DEBUG SET-ALLOW-ACCESS-EXPIRED - allow access to logically expired keys
         b"SET-ALLOW-ACCESS-EXPIRED" => {

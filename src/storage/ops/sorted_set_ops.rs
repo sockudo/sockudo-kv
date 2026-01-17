@@ -1255,6 +1255,84 @@ impl Store {
             crate::storage::dashtable::Entry::Vacant(_) => 0,
         }
     }
+
+    /// ZSCAN key cursor [MATCH pattern] [COUNT count]
+    /// Incrementally iterate sorted set elements
+    pub fn zscan(
+        &self,
+        key: &[u8],
+        cursor: u64,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> Result<(u64, Vec<Bytes>)> {
+        match self.data_get(key) {
+            Some(entry_ref) => {
+                if entry_ref.1.is_expired() {
+                    return Ok((0, vec![]));
+                }
+
+                match &entry_ref.1.data {
+                    DataType::SortedSet(ss) => {
+                        // Collect all members with scores and paginate
+                        // by_score stores ((OrderedFloat(score), member), ())
+                        let all_members: Vec<(Bytes, f64)> = ss
+                            .by_score
+                            .iter()
+                            .map(|((score, member), _)| (member.clone(), score.0))
+                            .collect();
+
+                        let total = all_members.len();
+                        let start = cursor as usize;
+                        if start >= total {
+                            return Ok((0, vec![]));
+                        }
+
+                        let end = (start + count).min(total);
+                        let mut result: Vec<Bytes> = Vec::new();
+
+                        for (member, score) in &all_members[start..end] {
+                            let matches =
+                                pattern.map_or(true, |p| crate::storage::match_pattern(p, member));
+                            if matches {
+                                result.push(member.clone());
+                                result.push(Bytes::from(score.to_string()));
+                            }
+                        }
+
+                        let next_cursor = if end >= total { 0 } else { end as u64 };
+                        Ok((next_cursor, result))
+                    }
+                    DataType::SortedSetPacked(lp) => {
+                        // Collect all members with scores using ziter for proper decoding
+                        let all_members: Vec<(Bytes, f64)> = lp.ziter().collect();
+
+                        let total = all_members.len();
+                        let start = cursor as usize;
+                        if start >= total {
+                            return Ok((0, vec![]));
+                        }
+
+                        let end = (start + count).min(total);
+                        let mut result: Vec<Bytes> = Vec::new();
+
+                        for (member, score) in &all_members[start..end] {
+                            let matches =
+                                pattern.map_or(true, |p| crate::storage::match_pattern(p, member));
+                            if matches {
+                                result.push(member.clone());
+                                result.push(Bytes::from(score.to_string()));
+                            }
+                        }
+
+                        let next_cursor = if end >= total { 0 } else { end as u64 };
+                        Ok((next_cursor, result))
+                    }
+                    _ => Err(Error::WrongType),
+                }
+            }
+            None => Ok((0, vec![])),
+        }
+    }
 }
 
 /// Helper for lexicographic range matching

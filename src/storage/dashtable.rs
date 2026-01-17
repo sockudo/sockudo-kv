@@ -207,6 +207,19 @@ impl<T> DashTable<T> {
         }
     }
 
+    /// Iterate over a specific shard
+    pub fn for_each_in_shard<F>(&self, shard_idx: usize, mut f: F)
+    where
+        F: FnMut(&T),
+    {
+        if shard_idx < self.shards.len() {
+            let guard = self.shards[shard_idx].read();
+            for item in guard.iter() {
+                f(item);
+            }
+        }
+    }
+
     /// Provides an iterator over the shards.
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {

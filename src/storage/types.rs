@@ -20,6 +20,8 @@ pub enum DataType {
     Set(DashSet<Bytes>),
     /// IntSet - memory optimized integer set
     IntSet(super::intset::IntSet),
+    /// SetPacked - memory-efficient listpack for small sets (< 128 entries)
+    SetPacked(super::listpack::Listpack),
     /// Hash - field-value pairs (full DashTable for large hashes)
     Hash(DashTable<(Bytes, Bytes)>),
     /// HashPacked - memory-efficient listpack for small hashes (< 512 entries)
@@ -63,6 +65,7 @@ impl std::fmt::Debug for DataType {
             DataType::List(l) => f.debug_tuple("List").field(l).finish(),
             DataType::Set(s) => f.debug_tuple("Set").field(s).finish(),
             DataType::IntSet(s) => f.debug_tuple("IntSet").field(s).finish(),
+            DataType::SetPacked(lp) => f.debug_tuple("SetPacked").field(lp).finish(),
             DataType::Hash(_) => f.debug_struct("Hash").finish(), // DashTable doesn't impl Debug
             DataType::HashPacked(lp) => f.debug_tuple("HashPacked").field(lp).finish(),
             DataType::SortedSet(z) => f.debug_tuple("SortedSet").field(z).finish(),
@@ -94,6 +97,7 @@ impl DataType {
             DataType::List(_) => "list",
             DataType::Set(_) => "set",
             DataType::IntSet(_) => "set",
+            DataType::SetPacked(_) => "set",
             DataType::Hash(_) | DataType::HashPacked(_) => "hash",
             DataType::SortedSet(_) | DataType::SortedSetPacked(_) => "zset",
             DataType::Stream(_) => "stream",

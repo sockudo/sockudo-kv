@@ -195,6 +195,17 @@ pub(crate) fn write_value(rdb: &mut Vec<u8>, key: Option<&Bytes>, data: &DataTyp
                 write_string(rdb, &Bytes::from(s));
             }
         }
+        DataType::SetPacked(lp) => {
+            // Serialize as regular SET for compatibility
+            rdb.push(RDB_TYPE_SET);
+            if let Some(k) = key {
+                write_string(rdb, k);
+            }
+            write_length(rdb, lp.len());
+            for (member, _) in lp.iter() {
+                write_string(rdb, &member);
+            }
+        }
         DataType::Hash(hash) => {
             rdb.push(RDB_TYPE_HASH);
             if let Some(k) = key {

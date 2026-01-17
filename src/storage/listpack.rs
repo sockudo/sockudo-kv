@@ -367,6 +367,60 @@ impl Listpack {
         self.ziter().position(|(m, _)| m.as_ref() == member)
     }
 
+    // ==================== Set Operations ====================
+
+    /// Check if listpack is at capacity for set usage
+    #[inline]
+    pub fn set_at_capacity(&self) -> bool {
+        self.count as usize >= LISTPACK_HASH_MAX_ENTRIES
+    }
+
+    /// Insert a set member (uses empty value)
+    /// Returns true if new member was added, false if already existed
+    #[inline]
+    pub fn sinsert(&mut self, member: &[u8]) -> bool {
+        if self.find_key(member).is_some() {
+            return false; // Already exists
+        }
+        // Insert with empty value
+        self.insert(member, &[]);
+        true
+    }
+
+    /// Check if a member exists in the set
+    #[inline]
+    pub fn scontains(&self, member: &[u8]) -> bool {
+        self.find_key(member).is_some()
+    }
+
+    /// Remove a set member
+    /// Returns true if removed, false if not found
+    #[inline]
+    pub fn sremove(&mut self, member: &[u8]) -> bool {
+        self.remove(member).is_some()
+    }
+
+    /// Iterate over all set members
+    #[inline]
+    pub fn siter(&self) -> impl Iterator<Item = Bytes> + '_ {
+        self.iter().map(|(member, _)| member)
+    }
+
+    /// Convert to a Vec of members (for upgrading to DashSet)
+    #[inline]
+    pub fn to_set_vec(&self) -> Vec<Bytes> {
+        self.siter().collect()
+    }
+
+    /// Create from iterator of members
+    pub fn from_set_iter<I: IntoIterator<Item = Bytes>>(iter: I) -> Self {
+        let mut lp = Self::new();
+        for member in iter {
+            lp.sinsert(&member);
+        }
+        lp
+    }
+
     // ==================== Conversion Methods ====================
 
     /// Convert to a Vec of key-value pairs (for upgrading to DashTable)

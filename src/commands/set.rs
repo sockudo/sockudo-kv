@@ -21,6 +21,7 @@ pub fn execute(store: &Store, cmd: &[u8], args: &[Bytes]) -> Result<RespValue> {
         b"SINTERSTORE" => cmd_sinterstore(store, args),
         b"SUNIONSTORE" => cmd_sunionstore(store, args),
         b"SMOVE" => cmd_smove(store, args),
+        b"SSCAN" => cmd_sscan(store, args),
         _ => Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd).into_owned(),
         )),
@@ -221,4 +222,50 @@ fn cmd_smove(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     }
     let moved = store.smove(&args[0], args[1].clone(), args[2].clone())?;
     Ok(RespValue::integer(if moved { 1 } else { 0 }))
+}
+
+/// SSCAN key cursor [MATCH pattern] [COUNT count]
+fn cmd_sscan(store: &Store, args: &[Bytes]) -> Result<RespValue> {
+    if args.len() < 2 {
+        return Err(Error::WrongArity("SSCAN"));
+    }
+
+    let cursor: u64 = std::str::from_utf8(&args[1])
+        .map_err(|_| Error::NotInteger)?
+        .parse()
+        .map_err(|_| Error::NotInteger)?;
+
+    let mut pattern: Option<&[u8]> = None;
+    let mut count: usize = 10;
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].to_ascii_uppercase().as_slice() {
+            b"MATCH" => {
+                if i + 1 >= args.len() {
+                    return Err(Error::Syntax);
+                }
+                pattern = Some(&args[i + 1]);
+                i += 2;
+            }
+            b"COUNT" => {
+                if i + 1 >= args.len() {
+                    return Err(Error::Syntax);
+                }
+                count = std::str::from_utf8(&args[i + 1])
+                    .map_err(|_| Error::NotInteger)?
+                    .parse()
+                    .map_err(|_| Error::NotInteger)?;
+                i += 2;
+            }
+            _ => return Err(Error::Syntax),
+        }
+    }
+
+    let (next_cursor, members) = store.sscan(&args[0], cursor, pattern, count)?;
+
+    Ok(RespValue::array(vec![
+        RespValue::bulk(Bytes::from(next_cursor.to_string())),
+        RespValue::array(members.into_iter().map(RespValue::bulk).collect()),
+    ]))
 }

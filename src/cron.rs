@@ -81,6 +81,11 @@ async fn cron_tick(server_state: &Arc<ServerState>, multi_store: &Arc<MultiStore
 
 /// Active expiration cycle - sample random keys and delete expired ones
 fn active_expire_cycle(server_state: &ServerState, multi_store: &Arc<MultiStore>) {
+    // Check if active expiration is disabled (via DEBUG SET-ACTIVE-EXPIRE 0)
+    if !server_state.active_expire_enabled.load(Ordering::Relaxed) {
+        return;
+    }
+
     let effort = server_state.active_expire_effort.load(Ordering::Relaxed);
     let use_lazy = server_state.lazyfree_lazy_expire.load(Ordering::Relaxed);
 

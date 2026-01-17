@@ -438,6 +438,8 @@ pub struct ServerState {
     pub maxmemory_eviction_tenacity: AtomicU32,
     /// Active expiration scan intensity 1-10 (default 1)
     pub active_expire_effort: AtomicU32,
+    /// Whether active expiration is enabled (for DEBUG SET-ACTIVE-EXPIRE)
+    pub active_expire_enabled: AtomicBool,
 
     // === Lazy Free Config ===
     /// Use async delete during eviction
@@ -582,6 +584,7 @@ impl ServerState {
             maxmemory_samples: AtomicUsize::new(5),
             maxmemory_eviction_tenacity: AtomicU32::new(10),
             active_expire_effort: AtomicU32::new(1),
+            active_expire_enabled: AtomicBool::new(true),
 
             lazyfree_lazy_eviction: AtomicBool::new(false),
             lazyfree_lazy_expire: AtomicBool::new(false),

@@ -189,6 +189,7 @@ impl Store {
             }
             DataType::HashPacked(lp) => DataType::HashPacked(lp.clone()),
             DataType::SortedSetPacked(lp) => DataType::SortedSetPacked(lp.clone()),
+            DataType::SetPacked(lp) => DataType::SetPacked(lp.clone()),
             #[cfg(feature = "bloom")]
             DataType::BloomFilter(bf) => DataType::BloomFilter(bf.clone()),
             #[cfg(feature = "bloom")]
@@ -327,26 +328,42 @@ impl Store {
     }
 
     /// SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
+    ///
+    /// This implementation uses the cursor as a shard index.
+    /// It returns all keys in the current shard and moves to the next shard.
+    /// This is a simple implementation that respects the stateless nature of SCAN.
     pub fn scan(
         &self,
         cursor: u64,
         pattern: Option<&[u8]>,
-        count: usize,
+        _count: usize, // We ignore count and return one shard at a time
         type_filter: Option<&[u8]>,
     ) -> (u64, Vec<Bytes>) {
         let mut keys = Vec::new();
-        let mut scanned = 0;
-        let mut next_cursor = cursor;
+        let mut expired_keys = Vec::new();
+        let shard_idx = cursor as usize;
+        let shards_len = self.data.shards_len();
 
-        self.data.for_each(|kv| {
-            if scanned >= count {
-                return;
-            }
-            if kv.1.is_expired() {
-                return;
-            }
+        if shard_idx >= shards_len {
+            return (0, keys);
+        }
 
+        self.data.for_each_in_shard(shard_idx, |kv| {
+            // Pattern filter comes first - keys not matching pattern are skipped entirely
+            // and do NOT trigger passive expiration (Redis behavior)
             let matches_pattern = pattern.map_or(true, |p| match_pattern(p, &kv.0));
+            if !matches_pattern {
+                return;
+            }
+
+            // Expiration check comes after pattern but before type filter
+            // Expired keys matching pattern trigger passive expiration
+            if kv.1.is_expired() {
+                expired_keys.push(kv.0.clone());
+                return;
+            }
+
+            // Type filter comes last
             let matches_type = type_filter.map_or(true, |tf| {
                 let type_name = match &kv.1.data {
                     DataType::String(_) => "string",
@@ -359,17 +376,21 @@ impl Store {
                 type_name.as_bytes() == tf
             });
 
-            if matches_pattern && matches_type {
+            if matches_type {
                 keys.push(kv.0.clone());
             }
-            scanned += 1;
         });
 
-        if scanned < count {
-            next_cursor = 0;
-        } else {
-            next_cursor += scanned as u64;
+        // Passive expiration: delete expired keys encountered during scan
+        for key in expired_keys {
+            self.del(&key);
         }
+
+        let next_cursor = if shard_idx + 1 < shards_len {
+            (shard_idx + 1) as u64
+        } else {
+            0
+        };
 
         (next_cursor, keys)
     }
@@ -450,6 +471,7 @@ impl Store {
             }
             DataType::List(_) => "quicklist",
             DataType::Set(_) => "hashtable",
+            DataType::SetPacked(_) => "listpack",
             DataType::IntSet(_) => "intset",
             DataType::Hash(_) => "hashtable",
             DataType::HashPacked(_) => "listpack",
@@ -593,6 +615,10 @@ impl Store {
                 // Listpack: compact storage
                 32 + lp.len() * 12
             }
+            DataType::SetPacked(lp) => {
+                // Listpack: compact storage for small sets
+                32 + lp.len() * 10
+            }
             DataType::Stream(st) => {
                 // Stream: radix tree + consumer groups
                 let entries_len = st.entries.len();
@@ -661,7 +687,8 @@ impl Store {
             DataType::String(_) | DataType::RawString(_) => 0u8,
             DataType::List(_) => 1,
             DataType::Set(_) => 2,
-            DataType::IntSet(_) => 2, // Dump as regular set
+            DataType::IntSet(_) => 2,    // Dump as regular set
+            DataType::SetPacked(_) => 2, // Dump as regular set
             DataType::Hash(_) | DataType::HashPacked(_) => 3,
             DataType::SortedSet(_) | DataType::SortedSetPacked(_) => 4,
             DataType::Stream(_) => 5,

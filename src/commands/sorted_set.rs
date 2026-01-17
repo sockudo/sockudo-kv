@@ -60,6 +60,7 @@ pub fn execute(store: &Store, cmd: &[u8], args: &[Bytes]) -> Result<RespValue> {
         b"ZPOPMIN" => cmd_zpopmin(store, args),
         b"ZPOPMAX" => cmd_zpopmax(store, args),
         b"ZMSCORE" => cmd_zmscore(store, args),
+        b"ZSCAN" => cmd_zscan(store, args),
         _ => Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd).into_owned(),
         )),
@@ -321,4 +322,50 @@ fn build_pop_response(results: Vec<(Bytes, f64)>) -> Result<RespValue> {
         resp.push(RespValue::bulk_string(&score.to_string()));
     }
     Ok(RespValue::array(resp))
+}
+
+/// ZSCAN key cursor [MATCH pattern] [COUNT count]
+fn cmd_zscan(store: &Store, args: &[Bytes]) -> Result<RespValue> {
+    if args.len() < 2 {
+        return Err(Error::WrongArity("ZSCAN"));
+    }
+
+    let cursor: u64 = std::str::from_utf8(&args[1])
+        .map_err(|_| Error::NotInteger)?
+        .parse()
+        .map_err(|_| Error::NotInteger)?;
+
+    let mut pattern: Option<&[u8]> = None;
+    let mut count: usize = 10;
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].to_ascii_uppercase().as_slice() {
+            b"MATCH" => {
+                if i + 1 >= args.len() {
+                    return Err(Error::Syntax);
+                }
+                pattern = Some(&args[i + 1]);
+                i += 2;
+            }
+            b"COUNT" => {
+                if i + 1 >= args.len() {
+                    return Err(Error::Syntax);
+                }
+                count = std::str::from_utf8(&args[i + 1])
+                    .map_err(|_| Error::NotInteger)?
+                    .parse()
+                    .map_err(|_| Error::NotInteger)?;
+                i += 2;
+            }
+            _ => return Err(Error::Syntax),
+        }
+    }
+
+    let (next_cursor, items) = store.zscan(&args[0], cursor, pattern, count)?;
+
+    Ok(RespValue::array(vec![
+        RespValue::bulk(Bytes::from(next_cursor.to_string())),
+        RespValue::array(items.into_iter().map(RespValue::bulk).collect()),
+    ]))
 }
