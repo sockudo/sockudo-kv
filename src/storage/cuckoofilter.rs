@@ -310,33 +310,49 @@ impl CuckooFilter {
         self.add(item)
     }
 
-    /// Cuckoo insertion with random kicks
-    /// Standard algorithm: swap immediately, try to find home for displaced item
-    fn cuckoo_insert(&mut self, mut index: usize, mut fp: u32) -> bool {
-        for _ in 0..self.max_iterations {
-            // Pick a random slot to swap with
-            let slot_idx = fastrand::usize(..self.bucket_size);
+    /// Cuckoo insertion with deterministic kicks (Redis-style)
+    /// Uses rotating victim slot selection to allow rollback on failure
+    fn cuckoo_insert(&mut self, start_index: usize, start_fp: u32) -> bool {
+        let mut index = start_index;
+        let mut fp = start_fp;
+        let mut victim_slot = 0usize;
 
-            // Swap our fingerprint in, get the old one out
-            let old_fp = self.buckets[index].get(slot_idx);
-            self.buckets[index].set(slot_idx, fp);
+        // Forward phase: try to find a home for our fingerprint
+        for _ in 0..self.max_iterations {
+            // Swap our fingerprint with the victim slot
+            let old_fp = self.buckets[index].get(victim_slot);
+            self.buckets[index].set(victim_slot, fp);
             fp = old_fp;
 
             // Calculate alternate index for the displaced fingerprint
             index = alt_index(index, fp, self.num_buckets);
 
-            // Try to insert the displaced fingerprint
+            // Try to insert the displaced fingerprint in an empty slot
             if self.buckets[index].insert(fp) {
                 self.count += 1;
                 return true;
             }
+
+            // Rotate victim slot deterministically for rollback capability
+            victim_slot = (victim_slot + 1) % self.bucket_size;
         }
 
-        // Couldn't place the last fingerprint, but our original IS in the filter
-        // This is expected behavior when filter is nearly full
-        // We still count it as added since our item is in there
-        self.count += 1;
-        true
+        // Failed to find space - rollback all swaps to restore filter integrity
+        // Run the same sequence in reverse
+        for _ in 0..self.max_iterations {
+            // Reverse the victim slot rotation
+            victim_slot = (victim_slot + self.bucket_size - 1) % self.bucket_size;
+
+            // Calculate the previous bucket (alt_index is symmetric: alt(alt(i, fp), fp) = i)
+            index = alt_index(index, fp, self.num_buckets);
+
+            // Swap back
+            let old_fp = self.buckets[index].get(victim_slot);
+            self.buckets[index].set(victim_slot, fp);
+            fp = old_fp;
+        }
+
+        false
     }
 
     /// Check if item might exist in the filter
