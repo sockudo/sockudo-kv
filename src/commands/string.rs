@@ -413,7 +413,8 @@ fn cmd_msetex(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         Ok(n) => n,
         Err(_) => return Err(Error::Custom("invalid numkeys value".into())),
     };
-    if numkeys_i64 <= 0 {
+    // Redis uses i32 range for numkeys, values > i32::MAX are invalid
+    if numkeys_i64 <= 0 || numkeys_i64 > i32::MAX as i64 {
         return Err(Error::Custom("invalid numkeys value".into()));
     }
 
