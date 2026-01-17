@@ -27,6 +27,14 @@ pub fn execute(store: &Store, cmd: &[u8], args: &[Bytes]) -> Result<RespValue> {
     }
 }
 
+#[inline]
+fn resp_array<I>(iter: I) -> RespValue
+where
+    I: IntoIterator<Item = Bytes>,
+{
+    RespValue::array(iter.into_iter().map(RespValue::bulk).collect())
+}
+
 /// SADD key member [member ...]
 fn cmd_sadd(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.len() < 2 {
@@ -73,10 +81,7 @@ fn cmd_smembers(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.len() != 1 {
         return Err(Error::WrongArity("SMEMBERS"));
     }
-    let members = store.smembers(&args[0]);
-    Ok(RespValue::array(
-        members.into_iter().map(RespValue::bulk).collect(),
-    ))
+    Ok(resp_array(store.smembers(&args[0])))
 }
 
 /// SCARD key
@@ -106,17 +111,13 @@ fn cmd_spop(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     let result = store.spop(&args[0], count);
 
     if args.len() == 1 {
-        // Single pop returns bulk string or null
         if let Some(member) = result.into_iter().next() {
             Ok(RespValue::bulk(member))
         } else {
             Ok(RespValue::null())
         }
     } else {
-        // With count, return array
-        Ok(RespValue::array(
-            result.into_iter().map(RespValue::bulk).collect(),
-        ))
+        Ok(resp_array(result))
     }
 }
 
@@ -127,7 +128,6 @@ fn cmd_srandmember(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     }
 
     if args.len() == 1 {
-        // Single random member
         let result = store.srandmember(&args[0], 1);
         if let Some(member) = result.into_iter().next() {
             Ok(RespValue::bulk(member))
@@ -136,10 +136,7 @@ fn cmd_srandmember(store: &Store, args: &[Bytes]) -> Result<RespValue> {
         }
     } else {
         let count = parse_int(&args[1])?;
-        let result = store.srandmember(&args[0], count);
-        Ok(RespValue::array(
-            result.into_iter().map(RespValue::bulk).collect(),
-        ))
+        Ok(resp_array(store.srandmember(&args[0], count)))
     }
 }
 
@@ -156,10 +153,7 @@ fn cmd_sdiff(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::WrongArity("SDIFF"));
     }
-    let result = store.sdiff(args);
-    Ok(RespValue::array(
-        result.into_iter().map(RespValue::bulk).collect(),
-    ))
+    Ok(resp_array(store.sdiff(args)))
 }
 
 /// SINTER key [key ...]
@@ -167,10 +161,7 @@ fn cmd_sinter(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::WrongArity("SINTER"));
     }
-    let result = store.sinter(args);
-    Ok(RespValue::array(
-        result.into_iter().map(RespValue::bulk).collect(),
-    ))
+    Ok(resp_array(store.sinter(args)))
 }
 
 /// SUNION key [key ...]
@@ -178,10 +169,7 @@ fn cmd_sunion(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::WrongArity("SUNION"));
     }
-    let result = store.sunion(args);
-    Ok(RespValue::array(
-        result.into_iter().map(RespValue::bulk).collect(),
-    ))
+    Ok(resp_array(store.sunion(args)))
 }
 
 /// SDIFFSTORE destination key [key ...]

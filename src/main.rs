@@ -722,11 +722,13 @@ sockudo-kv v7.0.0 - High-performance Redis-compatible server
         tasks.spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((socket, addr)) => {
+                    Ok((mut socket, addr)) => {
                         // Check maxclients limit
                         if !clients.can_accept() {
                             // Send error response and close connection immediately
-                            let _ = socket.try_write(b"-ERR max number of clients reached\r\n");
+                            let _ = socket
+                                .write_all(b"-ERR max number of clients reached\r\n")
+                                .await;
                             server_state
                                 .rejected_connections
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -855,7 +857,6 @@ sockudo-kv v7.0.0 - High-performance Redis-compatible server
 
     Ok(())
 }
-
 #[inline(always)]
 async fn handle_client(
     mut socket: TcpStream,
@@ -904,6 +905,12 @@ async fn handle_client(
     result
 }
 
+fn handle_client_write_error(msg: &str, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(b"-");
+    buf.extend_from_slice(msg.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+}
+
 async fn handle_client_inner<S>(
     socket: &mut S,
     multi_store: &Arc<sockudo_kv::storage::MultiStore>,
@@ -923,7 +930,9 @@ where
     let mut buf = BytesMut::with_capacity(READ_BUF_SIZE);
     let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
     let mut in_pubsub_mode = false;
+    let mut cmd_name_upper = Vec::with_capacity(32);
 
+    let require_auth = config.requirepass.is_some();
     loop {
         tokio::select! {
             biased;
@@ -955,28 +964,34 @@ where
                                 client.touch();
 
                                 // Apply command renaming from config
-                                // rename_command maps original -> renamed (or empty to disable)
-                                let cmd_name_str = String::from_utf8_lossy(cmd.name()).to_uppercase();
-                                if let Some(renamed) = config.rename_command.get(&cmd_name_str) {
-                                    if renamed.is_empty() {
-                                        // Command is disabled
-                                        write_buf.extend_from_slice(b"-ERR unknown command '");
-                                        write_buf.extend_from_slice(cmd.name());
-                                        write_buf.extend_from_slice(b"', with args beginning with: ");
-                                        if !cmd.args.is_empty() {
-                                            write_buf.extend_from_slice(&cmd.args[0]);
+                                if !config.rename_command.is_empty() {
+                                    cmd_name_upper.clear();
+                                    cmd_name_upper.extend(cmd.name().iter().map(|b| b.to_ascii_uppercase()));
+
+                                    if let Ok(cmd_name_str) = std::str::from_utf8(&cmd_name_upper) {
+                                        if let Some(renamed) = config.rename_command.get(cmd_name_str) {
+                                            if renamed.is_empty() {
+                                                // Command is disabled
+                                                write_buf.extend_from_slice(b"-ERR unknown command '");
+                                                write_buf.extend_from_slice(cmd.name());
+                                                write_buf.extend_from_slice(b"', with args beginning with: ");
+                                                if !cmd.args.is_empty() {
+                                                    write_buf.extend_from_slice(&cmd.args[0]);
+                                                }
+                                                write_buf.extend_from_slice(b"\r\n");
+                                                continue;
+                                            }
+                                            // Replace command name with renamed version
+                                            cmd = Command {
+                                                name: bytes::Bytes::from(renamed.as_bytes().to_vec()),
+                                                args: cmd.args,
+                                            };
                                         }
-                                        write_buf.extend_from_slice(b"\r\n");
-                                        continue;
                                     }
-                                    // Replace command name with renamed version
-                                    cmd = Command {
-                                        name: bytes::Bytes::from(renamed.as_bytes().to_vec()),
-                                        args: cmd.args,
-                                    };
                                 }
 
                                 let cmd_name = cmd.name();
+                                let is_write = is_write_command(cmd_name);
 
                                 // Protected Mode Check
                                 let is_loopback = match client.addr.ip() {
@@ -1000,8 +1015,7 @@ where
                                     }
                                 }
 
-                                // Check authentication
-                                if config.requirepass.is_some() && !client.is_authenticated() {
+                                if require_auth && !client.is_authenticated() {
                                     let is_allowed = cmd.is_command(b"AUTH")
                                         || cmd.is_command(b"HELLO")
                                         || cmd.is_command(b"QUIT");
@@ -1038,7 +1052,7 @@ where
                                 // Check replica_read_only - reject writes on replicas
                                 if config.replica_read_only
                                     && replication.role() == sockudo_kv::replication::ReplicationRole::Replica
-                                    && is_write_command(cmd_name)
+                                    && is_write
                                 {
                                     write_buf.extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");
                                     continue;
@@ -1047,7 +1061,7 @@ where
                                 // Check min_replicas_to_write - quorum for writes
                                 if config.min_replicas_to_write > 0
                                     && replication.is_master()
-                                    && is_write_command(cmd_name)
+                                    && is_write
                                 {
                                     let good_replicas = replication.count_good_replicas(config.min_replicas_max_lag);
                                     if good_replicas < config.min_replicas_to_write as usize {
@@ -1071,31 +1085,18 @@ where
                                             in_pubsub_mode = pubsub.is_subscribed(sub_id);
                                             client.in_pubsub.store(in_pubsub_mode, std::sync::atomic::Ordering::Relaxed);
                                         }
-                                        Err(e) => {
-                                            write_buf.extend_from_slice(b"-");
-                                            write_buf.extend_from_slice(e.to_string().as_bytes());
-                                            write_buf.extend_from_slice(b"\r\n");
-                                        }
+                                        Err(e) => handle_client_write_error(&e.to_string(), &mut write_buf),
                                     }
                                 } else if cmd.is_command(b"PUBLISH") || cmd.is_command(b"PUBSUB") || cmd.is_command(b"SPUBLISH") {
-                                    // Handle PUBLISH and PUBSUB commands
                                     match pubsub_execute(pubsub, cmd_name, &cmd.args) {
-                                        Ok(response) => {
-                                            response.write_to(&mut write_buf);
-                                        }
-                                        Err(e) => {
-                                            write_buf.extend_from_slice(b"-");
-                                            write_buf.extend_from_slice(e.to_string().as_bytes());
-                                            write_buf.extend_from_slice(b"\r\n");
-                                        }
+                                        Ok(response) => response.write_to(&mut write_buf),
+                                        Err(e) => handle_client_write_error(&e.to_string(), &mut write_buf),
                                     }
                                 } else if in_pubsub_mode && !is_allowed_in_pubsub_mode(cmd_name) {
-                                    // Error: only (P)SUBSCRIBE/(P)UNSUBSCRIBE/PING/QUIT allowed
                                     write_buf.extend_from_slice(
                                         b"-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context\r\n"
                                     );
                                 } else if is_connection_command(cmd_name) {
-                                    // Handle connection commands
                                     match connection::execute(client, clients, server_state, cmd_name, &cmd.args) {
                                         Ok(ConnectionResult::Response(response)) => {
                                             if client.should_reply() {
@@ -1107,22 +1108,14 @@ where
                                             socket.write_all(&write_buf).await?;
                                             return Ok(());
                                         }
-                                        Ok(ConnectionResult::NoReply) => {
-                                            // Don't write anything
-                                        }
-                                        Err(e) => {
-                                            write_buf.extend_from_slice(b"-");
-                                            write_buf.extend_from_slice(e.to_string().as_bytes());
-                                            write_buf.extend_from_slice(b"\r\n");
-                                        }
+                                        Ok(ConnectionResult::NoReply) => {}
+                                        Err(e) => handle_client_write_error(&e.to_string(), &mut write_buf),
                                     }
                                 } else if let Some(queued_response) = handle_multi_queue(client, cmd_name, &cmd.args) {
-                                    // Command was queued in MULTI mode
                                     if client.should_reply() {
                                         queued_response.write_to(&mut write_buf);
                                     }
                                 } else if is_transaction_command(cmd_name) {
-                                    // Handle transaction commands (MULTI/EXEC/DISCARD/WATCH/UNWATCH)
                                     let store = multi_store.db(client.current_db());
                                     match transaction::execute(client, &store, cmd_name, &cmd.args) {
                                         Ok(TransactionResult::Response(response)) => {
@@ -1135,23 +1128,17 @@ where
                                                 write_buf.extend_from_slice(b"+QUEUED\r\n");
                                             }
                                         }
-                                        Err(e) => {
-                                            write_buf.extend_from_slice(b"-");
-                                            write_buf.extend_from_slice(e.to_string().as_bytes());
-                                            write_buf.extend_from_slice(b"\r\n");
-                                        }
+                                        Err(e) => handle_client_write_error(&e.to_string(), &mut write_buf),
                                     }
                                 } else {
-                                    // Normal command processing
-
-                                    // Check stop-writes-on-bgsave-error
                                     if config.stop_writes_on_bgsave_error
                                         && server_state.last_bgsave_status.load(std::sync::atomic::Ordering::Relaxed)
-                                        && is_write_command(cmd_name)
+                                        && is_write
                                     {
                                         write_buf.extend_from_slice(b"-MISCONF Redis is configured to save RDB snapshots, but is currently not able to persist on disk. Commands that may modify the data set are disabled. Please check Redis logs for details about the error.\r\n");
                                         continue;
                                     }
+
                                     if cmd.is_command(b"SYNC") || cmd.is_command(b"PSYNC") {
                                         // SYNC/PSYNC: Enter replica streaming mode
                                         // First, flush any pending writes
@@ -1234,11 +1221,7 @@ where
                                                     response.write_to(&mut write_buf);
                                                 }
                                             }
-                                            Err(e) => {
-                                                write_buf.extend_from_slice(b"-");
-                                                write_buf.extend_from_slice(e.to_string().as_bytes());
-                                                write_buf.extend_from_slice(b"\r\n");
-                                            }
+                                            Err(e) => handle_client_write_error(&e.to_string(), &mut write_buf),
                                         }
                                     } else {
                                         let store = multi_store.db(client.current_db());
@@ -1256,17 +1239,11 @@ where
                                     }
                                 }
                             }
-                            Err(e) => {
-                                write_buf.extend_from_slice(b"-");
-                                write_buf.extend_from_slice(e.to_string().as_bytes());
-                                write_buf.extend_from_slice(b"\r\n");
-                            }
+                            Err(e) => handle_client_write_error(&e.to_string(), &mut write_buf),
                         },
                         Ok(None) => break, // Need more data
                         Err(e) => {
-                            write_buf.extend_from_slice(b"-");
-                            write_buf.extend_from_slice(e.to_string().as_bytes());
-                            write_buf.extend_from_slice(b"\r\n");
+                            handle_client_write_error(&e.to_string(), &mut write_buf);
                             socket.write_all(&write_buf).await?;
                             return Ok(());
                         }
@@ -1456,6 +1433,14 @@ fn pubsub_message_to_resp(msg: PubSubMessage) -> sockudo_kv::protocol::RespValue
         ]),
     }
 }
+/// Parse a DB index from args with consistent error handling
+#[inline]
+fn parse_db_index(arg: &bytes::Bytes) -> Result<usize, RespValue> {
+    std::str::from_utf8(arg)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or_else(|| RespValue::error("ERR invalid DB index"))
+}
 
 /// Handle SWAPDB command - O(1) database swap
 fn handle_swapdb(
@@ -1466,20 +1451,13 @@ fn handle_swapdb(
         return RespValue::error("ERR wrong number of arguments for 'swapdb' command");
     }
 
-    let db1 = match std::str::from_utf8(&args[0])
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(v) => v,
-        None => return RespValue::error("ERR invalid DB index"),
+    let db1 = match parse_db_index(&args[0]) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-
-    let db2 = match std::str::from_utf8(&args[1])
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(v) => v,
-        None => return RespValue::error("ERR invalid DB index"),
+    let db2 = match parse_db_index(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
     if multi_store.swap_db(db1, db2) {
@@ -1495,12 +1473,9 @@ fn handle_select(client: &Arc<ClientState>, db_count: usize, args: &[bytes::Byte
         return RespValue::error("ERR wrong number of arguments for 'select' command");
     }
 
-    let db_index = match std::str::from_utf8(&args[0])
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(v) => v,
-        None => return RespValue::error("ERR invalid DB index"),
+    let db_index = match parse_db_index(&args[0]) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
     if db_index >= db_count {
