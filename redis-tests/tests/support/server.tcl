@@ -433,25 +433,34 @@ proc run_external_server_test {code overrides} {
         }
     }
 
+    set test_error ""
+    set test_errorInfo ""
     if {[catch {set retval [uplevel 2 $code]} error]} {
+        set test_error $error
+        set test_errorInfo $::errorInfo
+    }
+
+    # Always restore configs, even after errors (to prevent test pollution)
+    # First restore from saved_config (initial state before overrides)
+    dict for {param val} $saved_config {
+        # some may fail, specifically immutable ones.
+        catch {r config set $param $val}
+    }
+
+    # Now handle any error that occurred
+    if {$test_error ne ""} {
         if {$::durable} {
-            set msg [string range $error 10 end]
+            set msg [string range $test_error 10 end]
             lappend details $msg
-            lappend details $::errorInfo
+            lappend details $test_errorInfo
             lappend ::tests_failed $details
 
             incr ::num_failed
             send_data_packet $::test_server_fd err [join $details "\n"]
         } else {
             # Re-raise, let handler up the stack take care of this.
-            error $error $::errorInfo
+            error $test_error $test_errorInfo
         }
-    }
-
-    # restore overrides
-    dict for {param val} $saved_config {
-        # some may fail, specifically immutable ones.
-        catch {r config set $param $val}
     }
 
     set srv [lpop ::servers]
