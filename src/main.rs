@@ -155,7 +155,7 @@ pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Show ASCII logo if always_show_logo is enabled
     if config.always_show_logo {
-        let image = ImageReader::open("src/img/sockudo-pfp-removebg-preview.png")
+        let image = ImageReader::open("img/sockudo-logo.png")
             .unwrap()
             .decode()
             .unwrap();
