@@ -986,7 +986,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_equal 0 [r exists mykey]
 
         r set mykey "hello"
-        set wrong_digest [format %x [expr [scan [r digest mykey] %x] + 1]]
+        set wrong_digest [format %016x [expr [scan [r digest mykey] %x] + 1]]
         assert_equal 0 [r delex mykey IFDEQ $wrong_digest]
         assert_equal 1 [r exists mykey]
         assert_equal "hello" [r get mykey]
@@ -994,7 +994,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
 
     test {DELEX basic usage with IFDNE} {
         r set mykey "hello"
-        set wrong_digest [format %x [expr [scan [r digest mykey] %x] + 1]]
+        set wrong_digest [format %016x [expr [scan [r digest mykey] %x] + 1]]
         assert_equal 1 [r delex mykey IFDNE $wrong_digest]
         assert_equal 0 [r exists mykey]
 
@@ -1223,7 +1223,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
 
     test {Extended SET with IFDEQ - key exists but digest doesn't match} {
         r set mykey "hello"
-        set wrong_digest [format %x [expr [scan [r digest mykey] %x] + 1]]
+        set wrong_digest [format %016x [expr [scan [r digest mykey] %x] + 1]]
         assert_equal {} [r set mykey "world" IFDEQ $wrong_digest]
         assert_equal "hello" [r get mykey]
     }
@@ -1237,7 +1237,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
 
     test {Extended SET with IFDNE - key exists and digest doesn't match} {
         r set mykey "hello"
-        set wrong_digest [format %x [expr [scan [r digest mykey] %x] + 1]]
+        set wrong_digest [format %016x [expr [scan [r digest mykey] %x] + 1]]
         assert_equal "OK" [r set mykey "world" IFDNE $wrong_digest]
         assert_equal "world" [r get mykey]
     }
@@ -1301,7 +1301,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
 
     test {Extended SET with IFDEQ and GET - key exists but digest doesn't match} {
         r set mykey "hello"
-        set wrong_digest [format %x [expr [scan [r digest mykey] %x] + 1]]
+        set wrong_digest [format %016x [expr [scan [r digest mykey] %x] + 1]]
         assert_equal "hello" [r set mykey "world" IFDEQ $wrong_digest GET]
         assert_equal "hello" [r get mykey]
     }
@@ -1315,7 +1315,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
 
     test {Extended SET with IFDNE and GET - key exists and digest doesn't match} {
         r set mykey "hello"
-        set wrong_digest [format %x [expr [scan [r digest mykey] %x] + 1]]
+        set wrong_digest [format %016x [expr [scan [r digest mykey] %x] + 1]]
         assert_equal "hello" [r set mykey "world" IFDNE $wrong_digest GET]
         assert_equal "world" [r get mykey]
     }
@@ -1358,7 +1358,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
 
     test {Extended SET with IFDNE and expiration} {
         r set mykey "hello"
-        set wrong_digest [format %x [expr [scan [r digest mykey] %x] + 1]]
+        set wrong_digest [format %016x [expr [scan [r digest mykey] %x] + 1]]
         assert_equal "OK" [r set mykey "world" IFDNE $wrong_digest EX 10]
         assert_equal "world" [r get mykey]
         assert_range [r ttl mykey] 5 10
@@ -1490,7 +1490,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
     test {Extended SET with negative digest} {
         r set mykey "test"
         set digest [r digest mykey]
-        set wrong_digest [format %x [expr [scan [r digest mykey] %x] + 1]]
+        set wrong_digest [format %016x [expr [scan [r digest mykey] %x] + 1]]
         assert_equal "OK" [r set mykey "world" IFDNE $wrong_digest]
         assert_equal "world" [r get mykey]
     }
