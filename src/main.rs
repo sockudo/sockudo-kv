@@ -1191,25 +1191,41 @@ where
                                             }
                                         }
                                     } else if cmd.is_command(b"BGSAVE") {
-                                        use sockudo_kv::replication::rdb::generate_rdb_with_config;
-                                        let rdb_config = RdbConfig {
-                                            compression: config.rdbcompression,
-                                            checksum: config.rdbchecksum,
-                                        };
-                                        let rdb_data = generate_rdb_with_config(multi_store, rdb_config);
-                                        let rdb_path = Path::new(&config.dir).join(&config.dbfilename);
-                                        match save_rdb_file(&rdb_path, &rdb_data, config.rdb_save_incremental_fsync) {
-                                            Ok(_) => {
-                                                server_state.last_save_time.store(server_state.now_unix(), std::sync::atomic::Ordering::Relaxed);
-                                                server_state.last_bgsave_status.store(false, std::sync::atomic::Ordering::Relaxed);
-                                                write_buf.extend_from_slice(b"+Background saving started\r\n");
-                                            }
-                                            Err(e) => {
-                                                server_state.last_bgsave_status.store(true, std::sync::atomic::Ordering::Relaxed);
-                                                write_buf.extend_from_slice(b"-ERR Failed to save: ");
-                                                write_buf.extend_from_slice(e.to_string().as_bytes());
-                                                write_buf.extend_from_slice(b"\r\n");
-                                            }
+                                        // Check if a background save is already in progress
+                                        if server_state.rdb_bgsave_in_progress.load(std::sync::atomic::Ordering::Relaxed) {
+                                            write_buf.extend_from_slice(b"-ERR Background save already in progress\r\n");
+                                        } else {
+                                            // Set flag to indicate save is in progress
+                                            server_state.rdb_bgsave_in_progress.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                                            // Clone what we need for the background task
+                                            let multi_store_clone = multi_store.clone();
+                                            let server_state_clone = server_state.clone();
+                                            let rdb_config = RdbConfig {
+                                                compression: config.rdbcompression,
+                                                checksum: config.rdbchecksum,
+                                            };
+                                            let rdb_path = Path::new(&config.dir).join(&config.dbfilename);
+                                            let incremental_fsync = config.rdb_save_incremental_fsync;
+
+                                            // Spawn background task
+                                            tokio::spawn(async move {
+                                                use sockudo_kv::replication::rdb::generate_rdb_with_config;
+                                                let rdb_data = generate_rdb_with_config(&multi_store_clone, rdb_config);
+                                                match save_rdb_file(&rdb_path, &rdb_data, incremental_fsync) {
+                                                    Ok(_) => {
+                                                        server_state_clone.last_save_time.store(server_state_clone.now_unix(), std::sync::atomic::Ordering::Relaxed);
+                                                        server_state_clone.last_bgsave_status.store(false, std::sync::atomic::Ordering::Relaxed);
+                                                    }
+                                                    Err(_e) => {
+                                                        server_state_clone.last_bgsave_status.store(true, std::sync::atomic::Ordering::Relaxed);
+                                                    }
+                                                }
+                                                // Clear the in-progress flag
+                                                server_state_clone.rdb_bgsave_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+                                            });
+
+                                            write_buf.extend_from_slice(b"+Background saving started\r\n");
                                         }
                                     } else if cmd.is_command(b"SELECT") {
                                         // SELECT needs to validate against db count

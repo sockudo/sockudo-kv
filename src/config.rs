@@ -161,6 +161,8 @@ pub struct ServerConfig {
     pub rdbchecksum: bool,
     pub sanitize_dump_payload: String, // "no", "yes", "clients"
     pub rdb_del_sync_files: bool,
+    pub rdb_key_save_delay: i64, // Delay in microseconds between key saves (for testing)
+    pub key_load_delay: i64,     // Delay in microseconds between key loads (for testing)
 
     // --- Replication ---
     /// Master host:port if replica
@@ -418,6 +420,8 @@ impl Default for ServerConfig {
             rdbchecksum: true,
             sanitize_dump_payload: "no".to_string(),
             rdb_del_sync_files: false,
+            rdb_key_save_delay: 0,
+            key_load_delay: 0,
 
             // Replication
             replicaof: None,

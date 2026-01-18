@@ -180,11 +180,16 @@ impl<T> DashTable<T> {
     }
 
     /// Remove an entry and return its value.
-    pub fn remove(&self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<T> {
+    pub fn remove(
+        &self,
+        hash: u64,
+        eq: impl FnMut(&T) -> bool,
+        hasher: impl Fn(&T) -> u64,
+    ) -> Option<T> {
         let shard_idx = self.determine_shard(hash);
         let mut guard = self.shards[shard_idx].write();
 
-        match guard.entry(hash, eq, |_| unreachable!()) {
+        match guard.entry(hash, eq, hasher) {
             hash_table::Entry::Occupied(e) => {
                 let val = e.remove().0;
                 self.size.fetch_sub(1, Ordering::Relaxed);

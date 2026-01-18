@@ -213,7 +213,7 @@ impl Dispatcher {
 
         // Info command
         if cmd.is_command(b"INFO") {
-            return Ok(cmd_info(store, args));
+            return Ok(cmd_info(store, args, server));
         }
 
         // Generic commands
@@ -372,7 +372,7 @@ impl Dispatcher {
                 Err(Error::UnknownCommand(_)) => {}
                 Err(e) => return Err(e),
             }
-            match set::execute(store, cmd_name, args) {
+            match set::execute(store, cmd_name, args, server, replication) {
                 Ok(resp) => return Ok(resp),
                 Err(Error::UnknownCommand(_)) => {}
                 Err(e) => return Err(e),
@@ -513,6 +513,9 @@ impl Dispatcher {
                         {
                             // Hash commands handle their own propagation in hash.rs
                             // Skip standard propagation to avoid double propagation
+                        } else if cmd.is_command(b"SPOP") {
+                            // SPOP handles its own propagation in set.rs
+                            // When key is deleted, it propagates DEL or UNLINK instead
                         } else if cmd.is_command(b"GETEX") {
                             // Rewrite GETEX based on options
                             // GETEX key [EX seconds | PX ms | EXAT | PXAT | PERSIST]
@@ -660,7 +663,7 @@ fn cmd_type(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     )))
 }
 
-fn cmd_info(store: &Store, args: &[Bytes]) -> RespValue {
+fn cmd_info(store: &Store, args: &[Bytes], server: Option<&Arc<ServerState>>) -> RespValue {
     // Return minimal INFO response for redis-benchmark compatibility
     let section = if args.is_empty() {
         b"all"
@@ -672,26 +675,87 @@ fn cmd_info(store: &Store, args: &[Bytes]) -> RespValue {
 
     let is_all =
         section.eq_ignore_ascii_case(b"all") || section.eq_ignore_ascii_case(b"everything");
+    let is_default = section.eq_ignore_ascii_case(b"default");
 
-    if section.eq_ignore_ascii_case(b"server") || is_all {
+    if section.eq_ignore_ascii_case(b"server") || is_all || is_default {
         info.push_str("# Server\r\nredis_version:7.0.0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\n");
     }
 
-    if section.eq_ignore_ascii_case(b"replication") || is_all {
+    if section.eq_ignore_ascii_case(b"persistence") || is_all || is_default {
+        if !info.is_empty() && !info.ends_with("\r\n\r\n") {
+            info.push_str("\r\n");
+        }
+        info.push_str("# Persistence\r\n");
+        info.push_str("loading:0\r\n");
+        info.push_str("async_loading:0\r\n");
+        info.push_str("current_cow_peak:0\r\n");
+        info.push_str("current_cow_size:0\r\n");
+        info.push_str("current_cow_size_age:0\r\n");
+        info.push_str("current_fork_perc:0.00\r\n");
+        info.push_str("current_save_keys_processed:0\r\n");
+        info.push_str("current_save_keys_total:0\r\n");
+        info.push_str("rdb_changes_since_last_save:0\r\n");
+
+        // Get rdb_bgsave_in_progress from server state
+        let bgsave_in_progress = server
+            .map(|s| {
+                s.rdb_bgsave_in_progress
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .unwrap_or(false);
+        info.push_str(&format!(
+            "rdb_bgsave_in_progress:{}\r\n",
+            if bgsave_in_progress { 1 } else { 0 }
+        ));
+
+        info.push_str("rdb_last_save_time:0\r\n");
+        info.push_str("rdb_last_bgsave_status:ok\r\n");
+        info.push_str("rdb_last_bgsave_time_sec:-1\r\n");
+        info.push_str("rdb_current_bgsave_time_sec:-1\r\n");
+        info.push_str("rdb_saves:0\r\n");
+        info.push_str("rdb_last_cow_size:0\r\n");
+        info.push_str("rdb_last_load_keys_expired:0\r\n");
+        info.push_str("rdb_last_load_keys_loaded:0\r\n");
+        info.push_str("aof_enabled:0\r\n");
+
+        // Get aof_rewrite_in_progress from server state
+        let aof_rewrite_in_progress = server
+            .map(|s| {
+                s.aof_rewrite_in_progress
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .unwrap_or(false);
+        info.push_str(&format!(
+            "aof_rewrite_in_progress:{}\r\n",
+            if aof_rewrite_in_progress { 1 } else { 0 }
+        ));
+
+        info.push_str("aof_rewrite_scheduled:0\r\n");
+        info.push_str("aof_last_rewrite_time_sec:-1\r\n");
+        info.push_str("aof_current_rewrite_time_sec:-1\r\n");
+        info.push_str("aof_last_bgrewrite_status:ok\r\n");
+        info.push_str("aof_rewrites:0\r\n");
+        info.push_str("aof_last_write_status:ok\r\n");
+        info.push_str("aof_last_cow_size:0\r\n");
+        info.push_str("module_fork_in_progress:0\r\n");
+        info.push_str("module_fork_last_cow_size:0\r\n");
+    }
+
+    if section.eq_ignore_ascii_case(b"replication") || is_all || is_default {
         if !info.is_empty() && !info.ends_with("\r\n\r\n") {
             info.push_str("\r\n");
         }
         info.push_str("# Replication\r\nrole:master\r\nconnected_slaves:0\r\n");
     }
 
-    if section.eq_ignore_ascii_case(b"stats") || is_all {
+    if section.eq_ignore_ascii_case(b"stats") || is_all || is_default {
         if !info.is_empty() && !info.ends_with("\r\n\r\n") {
             info.push_str("\r\n");
         }
         info.push_str("# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\n");
     }
 
-    if section.eq_ignore_ascii_case(b"keyspace") || is_all {
+    if section.eq_ignore_ascii_case(b"keyspace") || is_all || is_default {
         if !info.is_empty() && !info.ends_with("\r\n\r\n") {
             info.push_str("\r\n");
         }

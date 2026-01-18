@@ -529,7 +529,10 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "no",
         getter: bool_getter!(lazyfree_lazy_server_del),
         setter: bool_setter!(lazyfree_lazy_server_del),
-        applier: None,
+        applier: Some(|s, c| {
+            s.lazyfree_lazy_server_del
+                .store(c.lazyfree_lazy_server_del, Ordering::Relaxed);
+        }),
     },
     ConfigEntry {
         name: "lazyfree-lazy-user-del",
@@ -1272,6 +1275,26 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         default_value: "yes",
         getter: bool_getter!(rdb_save_incremental_fsync),
         setter: bool_setter!(rdb_save_incremental_fsync),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "rdb-key-save-delay",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Integer,
+        default_value: "0",
+        getter: int_getter!(rdb_key_save_delay),
+        setter: int_setter!(rdb_key_save_delay, i64),
+        applier: None,
+    },
+    ConfigEntry {
+        name: "key-load-delay",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Integer,
+        default_value: "0",
+        getter: int_getter!(key_load_delay),
+        setter: int_setter!(key_load_delay, i64),
         applier: None,
     },
     // === Replication ===

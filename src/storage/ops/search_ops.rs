@@ -1423,7 +1423,7 @@ impl Store {
         let indexes = self.search_indexes();
 
         let h = calculate_hash(name);
-        let removed = indexes.remove(h, |kv| kv.0 == name);
+        let removed = indexes.remove(h, |kv| kv.0 == name, |kv| calculate_hash(&kv.0));
         if removed.is_none() {
             return Err(Error::Custom("Unknown Index name".into()));
         }
@@ -1551,7 +1551,10 @@ impl Store {
     pub fn ft_aliasdel(&self, alias: &[u8]) -> Result<()> {
         let aliases = self.search_aliases();
         let h = calculate_hash(alias);
-        if aliases.remove(h, |kv| kv.0 == alias).is_none() {
+        if aliases
+            .remove(h, |kv| kv.0 == alias, |kv| calculate_hash(&kv.0))
+            .is_none()
+        {
             return Err(Error::Custom("Alias does not exist".into()));
         }
         Ok(())

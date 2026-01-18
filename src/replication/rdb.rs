@@ -5,6 +5,7 @@
 use bytes::Bytes;
 
 use crate::storage::dashtable::{DashTable, calculate_hash};
+use crate::storage::intset::IntSet;
 use crate::storage::{DataType, Entry, SortedSetData, now_ms};
 
 /// RDB opcodes
@@ -20,6 +21,7 @@ pub const RDB_TYPE_LIST: u8 = 1;
 pub const RDB_TYPE_SET: u8 = 2;
 pub const RDB_TYPE_ZSET: u8 = 5; // ZSET with scores as strings
 pub const RDB_TYPE_HASH: u8 = 4;
+pub const RDB_TYPE_SET_INTSET: u8 = 11; // Set encoded as intset
 pub const RDB_TYPE_LIST_QUICKLIST: u8 = 14;
 pub const RDB_TYPE_HASH_LISTPACK: u8 = 16;
 pub const RDB_TYPE_SET_LISTPACK: u8 = 20;
@@ -184,16 +186,66 @@ pub(crate) fn write_value(rdb: &mut Vec<u8>, key: Option<&Bytes>, data: &DataTyp
             }
         }
         DataType::IntSet(set) => {
-            // Serialize as regular SET of strings for compatibility
-            rdb.push(RDB_TYPE_SET);
+            // Serialize as RDB_TYPE_SET_INTSET with proper intset binary format
+            rdb.push(RDB_TYPE_SET_INTSET);
             if let Some(k) = key {
                 write_string(rdb, k);
             }
-            write_length(rdb, set.len());
+
+            // Determine the encoding based on min/max values
+            let mut min_val: i64 = 0;
+            let mut max_val: i64 = 0;
+            let mut first = true;
             for item in set.iter() {
-                let s = item.to_string();
-                write_string(rdb, &Bytes::from(s));
+                if first {
+                    min_val = item;
+                    max_val = item;
+                    first = false;
+                } else {
+                    if item < min_val {
+                        min_val = item;
+                    }
+                    if item > max_val {
+                        max_val = item;
+                    }
+                }
             }
+
+            // Choose encoding: 2 (int16), 4 (int32), or 8 (int64)
+            let encoding: u32 = if min_val >= i16::MIN as i64 && max_val <= i16::MAX as i64 {
+                2
+            } else if min_val >= i32::MIN as i64 && max_val <= i32::MAX as i64 {
+                4
+            } else {
+                8
+            };
+
+            // Build the intset binary blob
+            let len = set.len() as u32;
+            let blob_size = 4 + 4 + (len as usize) * (encoding as usize);
+            let mut intset_blob = Vec::with_capacity(blob_size);
+
+            // Write encoding (4 bytes, little-endian)
+            intset_blob.extend_from_slice(&encoding.to_le_bytes());
+            // Write length (4 bytes, little-endian)
+            intset_blob.extend_from_slice(&len.to_le_bytes());
+
+            // Collect and sort the integers (intset is always sorted)
+            let mut sorted: Vec<i64> = set.iter().collect();
+            sorted.sort();
+
+            // Write integers in the chosen encoding
+            for val in sorted {
+                match encoding {
+                    2 => intset_blob.extend_from_slice(&(val as i16).to_le_bytes()),
+                    4 => intset_blob.extend_from_slice(&(val as i32).to_le_bytes()),
+                    8 => intset_blob.extend_from_slice(&val.to_le_bytes()),
+                    _ => unreachable!(),
+                }
+            }
+
+            // Write as a string (Redis stores intset blob as string)
+            write_string(rdb, &Bytes::from(intset_blob));
         }
         DataType::SetPacked(lp) => {
             // Serialize as regular SET for compatibility
@@ -759,14 +811,134 @@ pub fn load_rdb(data: &[u8], multi_store: &crate::storage::MultiStore) -> Result
                 let (set_len, slen) = read_length(&data[cursor..])?;
                 cursor += slen;
 
-                let set = dashmap::DashSet::new();
+                // Read all members and check if they can be stored as intset
+                let mut members = Vec::with_capacity(set_len);
+                let mut all_integers = true;
+                let mut integers = Vec::with_capacity(set_len);
+
                 for _ in 0..set_len {
                     let (member, mlen) = read_string(&data[cursor..])?;
                     cursor += mlen;
-                    set.insert(member);
+
+                    // Try to parse as integer
+                    if all_integers {
+                        if let Ok(s) = std::str::from_utf8(&member) {
+                            // Check for leading zeros (should not be stored as int)
+                            let bytes = s.as_bytes();
+                            let has_leading_zero = if bytes.is_empty() {
+                                false
+                            } else if bytes[0] == b'0' && bytes.len() > 1 {
+                                true
+                            } else if bytes[0] == b'-' && bytes.len() > 2 && bytes[1] == b'0' {
+                                true
+                            } else {
+                                false
+                            };
+
+                            if !has_leading_zero {
+                                if let Ok(i) = s.parse::<i64>() {
+                                    integers.push(i);
+                                } else {
+                                    all_integers = false;
+                                }
+                            } else {
+                                all_integers = false;
+                            }
+                        } else {
+                            all_integers = false;
+                        }
+                    }
+                    members.push(member);
                 }
 
-                store.data_insert(key.clone(), Entry::new(DataType::Set(set)));
+                // Choose optimal encoding based on config and content
+                // Default thresholds: intset <= 512, listpack <= 128 entries and <= 64 byte values
+                if all_integers && set_len <= 512 {
+                    // Use IntSet
+                    let mut intset = IntSet::new();
+                    for i in integers {
+                        intset.insert(i);
+                    }
+                    store.data_insert(key.clone(), Entry::new(DataType::IntSet(intset)));
+                } else if set_len <= 128 && members.iter().all(|m| m.len() <= 64) {
+                    // Use SetPacked (listpack) for small sets with small values
+                    let mut lp = crate::storage::listpack::Listpack::new();
+                    for member in members {
+                        lp.insert(&member, &[]);
+                    }
+                    store.data_insert(key.clone(), Entry::new(DataType::SetPacked(lp)));
+                } else {
+                    // Use hashtable set
+                    let set = dashmap::DashSet::new();
+                    for member in members {
+                        set.insert(member);
+                    }
+                    store.data_insert(key.clone(), Entry::new(DataType::Set(set)));
+                }
+                store
+                    .key_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            RDB_TYPE_SET_INTSET => {
+                let (key, klen) = read_string(&data[cursor..])?;
+                cursor += klen;
+
+                // Read the intset blob (stored as string)
+                let (blob, blen) = read_string(&data[cursor..])?;
+                cursor += blen;
+
+                if blob.len() < 8 {
+                    return Err("Invalid intset blob: too short".into());
+                }
+
+                // Parse intset header
+                let encoding = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+                let length = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
+
+                let mut intset = IntSet::new();
+                let mut offset = 8;
+
+                for _ in 0..length {
+                    let val: i64 = match encoding {
+                        2 => {
+                            if offset + 2 > blob.len() {
+                                return Err("Invalid intset blob: truncated".into());
+                            }
+                            i16::from_le_bytes([blob[offset], blob[offset + 1]]) as i64
+                        }
+                        4 => {
+                            if offset + 4 > blob.len() {
+                                return Err("Invalid intset blob: truncated".into());
+                            }
+                            i32::from_le_bytes([
+                                blob[offset],
+                                blob[offset + 1],
+                                blob[offset + 2],
+                                blob[offset + 3],
+                            ]) as i64
+                        }
+                        8 => {
+                            if offset + 8 > blob.len() {
+                                return Err("Invalid intset blob: truncated".into());
+                            }
+                            i64::from_le_bytes([
+                                blob[offset],
+                                blob[offset + 1],
+                                blob[offset + 2],
+                                blob[offset + 3],
+                                blob[offset + 4],
+                                blob[offset + 5],
+                                blob[offset + 6],
+                                blob[offset + 7],
+                            ])
+                        }
+                        _ => return Err(format!("Invalid intset encoding: {}", encoding).into()),
+                    };
+                    offset += encoding as usize;
+                    intset.insert(val);
+                }
+
+                store.data_insert(key.clone(), Entry::new(DataType::IntSet(intset)));
                 store
                     .key_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

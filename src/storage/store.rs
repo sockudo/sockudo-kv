@@ -350,7 +350,8 @@ impl Store {
     #[inline]
     pub(crate) fn data_remove(&self, key: &[u8]) -> Option<(Bytes, Entry)> {
         let h = calculate_hash(key);
-        self.data.remove(h, |kv| kv.0 == key)
+        self.data
+            .remove(h, |kv| kv.0 == key, |kv| calculate_hash(&kv.0))
     }
 
     #[inline]

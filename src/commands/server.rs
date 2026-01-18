@@ -1547,8 +1547,11 @@ fn cmd_debug(
                 let entry = &entry_ref.value.1;
                 let encoding = match entry.data {
                     crate::storage::DataType::String(_) => "embstr", // or raw
+                    crate::storage::DataType::RawString(_) => "raw",
                     crate::storage::DataType::List(_) => "quicklist",
                     crate::storage::DataType::Set(_) => "hashtable",
+                    crate::storage::DataType::IntSet(_) => "intset",
+                    crate::storage::DataType::SetPacked(_) => "listpack",
                     crate::storage::DataType::Hash(_) => "hashtable",
                     crate::storage::DataType::HashPacked(_) => "listpack",
                     crate::storage::DataType::SortedSet(_) => "skiplist",
