@@ -217,6 +217,17 @@ proc test {name code {okpattern undefined} {tags {}}} {
 
     send_data_packet $::test_server_fd testing $name
 
+    # Save config before test (for external server mode) to restore after test
+    # This prevents config pollution between tests
+    set saved_test_config {}
+    if {$::external} {
+        catch {
+            foreach {param val} [r config get *] {
+                dict set saved_test_config $param $val
+            }
+        }
+    }
+
     set failed false
     set test_start_time [clock milliseconds]
     if {[catch {set retval [uplevel 1 $code]} error]} {
@@ -272,5 +283,15 @@ proc test {name code {okpattern undefined} {tags {}}} {
             send_data_packet $::test_server_fd err "Detected a memory leak in test '$name': $output"
         }
     }
+
+    # Restore config after test (for external server mode) to prevent pollution
+    if {$::external && [dict size $saved_test_config] > 0} {
+        catch {
+            dict for {param val} $saved_test_config {
+                catch {r config set $param $val}
+            }
+        }
+    }
+
     set ::cur_test $prev_test
 }
