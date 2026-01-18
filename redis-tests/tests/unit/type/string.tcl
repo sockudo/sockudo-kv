@@ -880,7 +880,8 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
     }
 
     test {DIGEST with unicode characters} {
-        r set mykey "Hello 世界"
+        # Use UTF-8 byte sequence for "Hello 世界" to avoid TCL 9 encoding issues
+        r set mykey [encoding convertto utf-8 "Hello \u4e16\u754c"]
         set digest [r digest mykey]
         assert {[regexp {^[0-9a-f]{16}$} $digest]}
     }
