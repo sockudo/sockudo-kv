@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
+use image::io::Reader as ImageReader;
+use image_ascii::TextGenerator;
 use mimalloc::MiMalloc;
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -153,14 +155,17 @@ pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Show ASCII logo if always_show_logo is enabled
     if config.always_show_logo {
+        let image = ImageReader::open("src/img/sockudo-pfp-removebg-preview.png")
+            .unwrap()
+            .decode()
+            .unwrap();
+
+        let scaled = image.resize_exact(50, 25, image::imageops::FilterType::Lanczos3);
+        let result: String = TextGenerator::new(&scaled).generate().replace('.', " ");
+        println!("{}\n", result);
+
         println!(
             r"
- ____             _               _              _  ____     __
-/ ___|  ___   ___| | ___   _   __| | ___        | |/ /\ \   / /
-\___ \ / _ \ / __| |/ / | | | / _` |/ _ \  _____| ' /  \ \ / /
- ___) | (_) | (__|   <| |_| || (_| | (_) ||_____| . \   \ V /
-|____/ \___/ \___|_|\_\\__,_| \__,_|\___/       |_|\_\   \_/
-
 sockudo-kv v7.0.0 - High-performance Redis-compatible server
 "
         );
