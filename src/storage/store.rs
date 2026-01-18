@@ -118,6 +118,13 @@ impl Store {
         store
     }
 
+    /// Create a new QuickList with the current list-max-listpack-size config
+    #[inline]
+    pub fn new_quicklist(&self) -> crate::storage::quicklist::QuickList {
+        let fill = self.encoding.read().list_max_listpack_size;
+        crate::storage::quicklist::QuickList::with_fill(fill)
+    }
+
     // ==================== Core Generic Operations ====================
 
     /// Check if key exists (and not expired)

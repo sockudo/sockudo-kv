@@ -1545,10 +1545,17 @@ fn cmd_debug(
             let key = &args[1];
             if let Some(entry_ref) = store.data_get(key) {
                 let entry = &entry_ref.value.1;
-                let encoding = match entry.data {
+                let encoding = match &entry.data {
                     crate::storage::DataType::String(_) => "embstr", // or raw
                     crate::storage::DataType::RawString(_) => "raw",
-                    crate::storage::DataType::List(_) => "quicklist",
+                    crate::storage::DataType::List(list) => {
+                        // Redis 7.0+: single-node lists report "listpack", multi-node report "quicklist"
+                        if list.node_count() <= 1 {
+                            "listpack"
+                        } else {
+                            "quicklist"
+                        }
+                    }
                     crate::storage::DataType::Set(_) => "hashtable",
                     crate::storage::DataType::IntSet(_) => "intset",
                     crate::storage::DataType::SetPacked(_) => "listpack",

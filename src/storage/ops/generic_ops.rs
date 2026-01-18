@@ -469,7 +469,14 @@ impl Store {
                 // RawString is always "raw" encoding (modified by SETRANGE/APPEND)
                 "raw"
             }
-            DataType::List(_) => "quicklist",
+            DataType::List(list) => {
+                // Redis 7.0+: single-node lists report "listpack", multi-node report "quicklist"
+                if list.node_count() <= 1 {
+                    "listpack"
+                } else {
+                    "quicklist"
+                }
+            }
             DataType::Set(_) => "hashtable",
             DataType::SetPacked(_) => "listpack",
             DataType::IntSet(_) => "intset",
@@ -847,7 +854,7 @@ impl Store {
             1 => {
                 let (count, new_pos) = read_varint(data, pos).map_err(|e| e.to_string())?;
                 pos = new_pos;
-                let mut list = crate::storage::quicklist::QuickList::new();
+                let mut list = self.new_quicklist();
                 for _ in 0..count {
                     let (len, next_pos) = read_varint(data, pos).map_err(|e| e.to_string())?;
                     pos = next_pos;

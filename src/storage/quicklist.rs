@@ -1,9 +1,37 @@
 use bytes::Bytes;
 use std::collections::VecDeque;
 
-const BLOCK_SIZE: usize = 8 * 1024; // 8KB config
+/// Default sizes for different fill values (negative means size-based)
+/// -1 = 4KB, -2 = 8KB, -3 = 16KB, -4 = 32KB, -5 = 64KB
+const SIZE_4KB: usize = 4 * 1024;
+const SIZE_8KB: usize = 8 * 1024;
+const SIZE_16KB: usize = 16 * 1024;
+const SIZE_32KB: usize = 32 * 1024;
+const SIZE_64KB: usize = 64 * 1024;
 
-/// A packed block of list items
+/// Convert fill value to max size per node
+fn fill_to_max_size(fill: i32) -> usize {
+    match fill {
+        -1 => SIZE_4KB,
+        -2 => SIZE_8KB,
+        -3 => SIZE_16KB,
+        -4 => SIZE_32KB,
+        -5 => SIZE_64KB,
+        n if n < -5 => SIZE_64KB, // Treat < -5 as -5
+        _ => usize::MAX,          // Positive fill means count-based, not size-based
+    }
+}
+
+/// Convert fill value to max entries per node (for positive fill values)
+fn fill_to_max_entries(fill: i32) -> usize {
+    if fill <= 0 {
+        usize::MAX // Size-based, no entry limit
+    } else {
+        fill as usize
+    }
+}
+
+/// A packed block of list items (listpack node)
 /// Format: [count: u16] [item1_len: varint] [item1_data] ...
 #[derive(Clone, Debug)]
 pub struct PackedBlock {
@@ -37,12 +65,23 @@ impl PackedBlock {
         self.data.len()
     }
 
-    pub fn free_space(&self) -> usize {
-        if self.data.len() >= BLOCK_SIZE {
-            0
-        } else {
-            BLOCK_SIZE - self.data.len()
+    /// Check if block can accept more items given the fill constraints
+    pub fn can_insert(&self, item_size: usize, fill: i32) -> bool {
+        let max_size = fill_to_max_size(fill);
+        let max_entries = fill_to_max_entries(fill);
+
+        // Check entry count limit
+        if self.count as usize >= max_entries {
+            return false;
         }
+
+        // Check size limit (estimate: varint overhead max 9 bytes + item size)
+        let needed = item_size + 9;
+        if self.data.len() + needed > max_size {
+            return false;
+        }
+
+        true
     }
 
     /// Push item to back
@@ -80,8 +119,6 @@ impl PackedBlock {
 
         // We need to find the last item start position
         // This is slow: O(N) to walk from start.
-        // For optimization, we could store offsets?
-        // For now, walk.
         let mut pos = 2;
         for _ in 0..self.count - 1 {
             let (len, next) = read_varint(&self.data, pos).ok()?;
@@ -171,16 +208,53 @@ impl<'a> Iterator for PackedBlockIter<'a> {
     }
 }
 
-/// A double-linked list of packed blocks
-#[derive(Clone, Debug, Default)]
+/// A double-linked list of packed blocks (quicklist)
+///
+/// The `fill` parameter controls how nodes are sized:
+/// - Positive values (1, 2, 3, ...): max number of entries per node
+/// - Negative values: max size per node (-1=4KB, -2=8KB, -3=16KB, -4=32KB, -5=64KB)
+/// - 0 is treated as 1
+#[derive(Clone, Debug)]
 pub struct QuickList {
     blocks: VecDeque<PackedBlock>,
     len: usize,
+    fill: i32,
+}
+
+impl Default for QuickList {
+    fn default() -> Self {
+        Self {
+            blocks: VecDeque::new(),
+            len: 0,
+            fill: -2, // Default: 8KB per node
+        }
+    }
 }
 
 impl QuickList {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a new QuickList with a specific fill value
+    pub fn with_fill(fill: i32) -> Self {
+        // Normalize fill: 0 is treated as 1
+        let fill = if fill == 0 { 1 } else { fill };
+        Self {
+            blocks: VecDeque::new(),
+            len: 0,
+            fill,
+        }
+    }
+
+    /// Set the fill value (used when config changes)
+    pub fn set_fill(&mut self, fill: i32) {
+        self.fill = if fill == 0 { 1 } else { fill };
+    }
+
+    /// Get the current fill value
+    pub fn fill(&self) -> i32 {
+        self.fill
     }
 
     pub fn len(&self) -> usize {
@@ -191,17 +265,40 @@ impl QuickList {
         self.len == 0
     }
 
+    /// Returns the number of internal blocks (nodes) in the quicklist.
+    pub fn node_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Check if this list should be considered "listpack" encoding.
+    /// In Redis 7.0+:
+    /// - If there's only 1 node AND the node doesn't exceed size limits, it's "listpack"
+    /// - If there are multiple nodes OR a single oversized node, it's "quicklist"
+    pub fn is_listpack_encoding(&self) -> bool {
+        if self.blocks.len() > 1 {
+            return false;
+        }
+        if self.blocks.len() == 1 {
+            let block = &self.blocks[0];
+            let max_size = fill_to_max_size(self.fill);
+            let max_entries = fill_to_max_entries(self.fill);
+            // If the block exceeds limits, it's a "plain node" -> quicklist encoding
+            if block.size_bytes() > max_size || block.len() > max_entries {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn push_back(&mut self, item: Bytes) {
         if let Some(tail) = self.blocks.back_mut() {
-            // Estimate size: varint overhead (max 9) + len
-            let needed = item.len() + 9;
-            if tail.free_space() >= needed {
+            if tail.can_insert(item.len(), self.fill) {
                 tail.push_back(&item);
                 self.len += 1;
                 return;
             }
         }
-        // New block
+        // New block needed
         let mut block = PackedBlock::new();
         block.push_back(&item);
         self.blocks.push_back(block);
@@ -210,14 +307,13 @@ impl QuickList {
 
     pub fn push_front(&mut self, item: Bytes) {
         if let Some(head) = self.blocks.front_mut() {
-            let needed = item.len() + 9;
-            if head.free_space() >= needed {
+            if head.can_insert(item.len(), self.fill) {
                 head.push_front(&item);
                 self.len += 1;
                 return;
             }
         }
-        // New block
+        // New block needed
         let mut block = PackedBlock::new();
         block.push_front(&item);
         self.blocks.push_front(block);
@@ -236,14 +332,13 @@ impl QuickList {
 
         if let Some(v) = val {
             self.len -= 1;
-            if self.blocks.back().unwrap().is_empty() {
+            if self.blocks.back().is_some_and(|b| b.is_empty()) {
                 self.blocks.pop_back();
             }
             Some(v)
         } else {
             // Tail was empty? Should be swept.
             self.blocks.pop_back();
-            // Try again recurse?
             self.pop_back()
         }
     }
@@ -260,7 +355,7 @@ impl QuickList {
 
         if let Some(v) = val {
             self.len -= 1;
-            if self.blocks.front().unwrap().is_empty() {
+            if self.blocks.front().is_some_and(|b| b.is_empty()) {
                 self.blocks.pop_front();
             }
             Some(v)
@@ -305,7 +400,7 @@ impl QuickList {
         self.len = 0;
     }
 
-    // Insert at index (slow)
+    // Insert at index
     pub fn insert(&mut self, index: usize, item: Bytes) {
         if index >= self.len {
             self.push_back(item);
@@ -316,48 +411,62 @@ impl QuickList {
             return;
         }
 
-        // Find block and split it? or insert into it?
-        // Simplest MVP: Convert to VecDeque, insert, convert back? No.
-        // Split block at index.
+        // Find block containing the index
         let mut block_idx = 0;
         let mut offset = index;
 
         for (i, block) in self.blocks.iter().enumerate() {
             let count = block.len();
             if offset <= count {
-                // Found block
                 block_idx = i;
                 break;
             }
             offset -= count;
         }
 
-        // We are at `offset` inside `block_idx`.
-        // Check if block has space
-        // This is complex for MVP.
-        // FALLBACK: Deconstruct whole block, insert, reconstruct.
-        // Since block size is small (8KB), this is fine.
-
+        // Extract all items from the block
         let block = &mut self.blocks[block_idx];
-        // Extract all items
         let mut items: Vec<Bytes> = block.iter().collect();
         items.insert(offset, item);
 
-        // Rebuild block(s) from these items
-        let mut new_block = PackedBlock::new();
-        // If items overflow 8KB, we might need multiple blocks?
-        // For now assume they fit or we split.
-        // Let's just create one block. If it overflows, `push_back` will resize buffer (Vec does).
-        // Wait, PackedBlock logic uses `BLOCK_SIZE` only for `free_space` check.
-        // `push_back` just appends.
-        // So we can make an oversized block temporarily.
+        // Rebuild block(s) respecting fill constraints
+        self.rebuild_block(block_idx, items);
+        self.len += 1;
+    }
 
-        for it in items {
-            new_block.push_back(&it);
+    /// Rebuild a block from items, potentially splitting into multiple blocks
+    fn rebuild_block(&mut self, block_idx: usize, items: Vec<Bytes>) {
+        if items.is_empty() {
+            self.blocks.remove(block_idx);
+            return;
         }
 
-        self.blocks[block_idx] = new_block;
-        self.len += 1;
+        // Create new blocks from items
+        let mut new_blocks: Vec<PackedBlock> = Vec::new();
+        let mut current_block = PackedBlock::new();
+
+        for item in items {
+            if current_block.can_insert(item.len(), self.fill) {
+                current_block.push_back(&item);
+            } else {
+                // Current block is full, start a new one
+                if !current_block.is_empty() {
+                    new_blocks.push(current_block);
+                }
+                current_block = PackedBlock::new();
+                current_block.push_back(&item);
+            }
+        }
+
+        if !current_block.is_empty() {
+            new_blocks.push(current_block);
+        }
+
+        // Replace the old block with new blocks
+        self.blocks.remove(block_idx);
+        for (i, block) in new_blocks.into_iter().enumerate() {
+            self.blocks.insert(block_idx + i, block);
+        }
     }
 
     pub fn set(&mut self, index: usize, item: Bytes) -> bool {
@@ -377,17 +486,12 @@ impl QuickList {
             offset -= count;
         }
 
-        // Update in block
-        // Deconstruct/reconstruct
+        // Update in block - rebuild to respect fill constraints
         let block = &mut self.blocks[block_idx];
         let mut items: Vec<Bytes> = block.iter().collect();
         items[offset] = item;
 
-        let mut new_block = PackedBlock::new();
-        for it in items {
-            new_block.push_back(&it);
-        }
-        self.blocks[block_idx] = new_block;
+        self.rebuild_block(block_idx, items);
         true
     }
 
@@ -408,19 +512,17 @@ impl QuickList {
         }
 
         // Remove from block
-        // Since we don't have random remove in PackedBlock yet
-        // We deconstruct/reconstruct
         let block = &mut self.blocks[block_idx];
         let mut items: Vec<Bytes> = block.iter().collect();
         let val = items.remove(offset);
 
-        let mut new_block = PackedBlock::new();
-        for it in items {
-            new_block.push_back(&it);
-        }
-        if new_block.is_empty() {
+        if items.is_empty() {
             self.blocks.remove(block_idx);
         } else {
+            let mut new_block = PackedBlock::new();
+            for it in items {
+                new_block.push_back(&it);
+            }
             self.blocks[block_idx] = new_block;
         }
         self.len -= 1;
@@ -477,4 +579,44 @@ fn read_varint(data: &[u8], mut pos: usize) -> Result<(u64, usize), ()> {
         shift += 7;
     }
     Err(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quicklist_with_fill_1() {
+        // fill=1 means max 1 entry per node
+        let mut list = QuickList::with_fill(1);
+        list.push_back(Bytes::from("a"));
+        list.push_back(Bytes::from("b"));
+        list.push_back(Bytes::from("c"));
+
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.node_count(), 3); // Each item in its own node
+        assert!(!list.is_listpack_encoding()); // quicklist encoding
+    }
+
+    #[test]
+    fn test_quicklist_with_fill_negative() {
+        // fill=-2 means 8KB per node
+        let mut list = QuickList::with_fill(-2);
+        list.push_back(Bytes::from("a"));
+        list.push_back(Bytes::from("b"));
+        list.push_back(Bytes::from("c"));
+
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.node_count(), 1); // All fit in one node
+        assert!(list.is_listpack_encoding()); // listpack encoding
+    }
+
+    #[test]
+    fn test_quicklist_fill_0_treated_as_1() {
+        let mut list = QuickList::with_fill(0);
+        list.push_back(Bytes::from("a"));
+        list.push_back(Bytes::from("b"));
+
+        assert_eq!(list.node_count(), 2); // fill=0 treated as fill=1
+    }
 }

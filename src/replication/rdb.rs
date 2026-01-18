@@ -793,7 +793,7 @@ pub fn load_rdb(data: &[u8], multi_store: &crate::storage::MultiStore) -> Result
                 let (list_len, llen) = read_length(&data[cursor..])?;
                 cursor += llen;
 
-                let mut list = crate::storage::quicklist::QuickList::new();
+                let mut list = store.new_quicklist();
                 for _ in 0..list_len {
                     let (item, ilen) = read_string(&data[cursor..])?;
                     cursor += ilen;

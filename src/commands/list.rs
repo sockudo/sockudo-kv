@@ -28,6 +28,8 @@ pub fn execute(store: &Store, cmd: &[u8], args: &[Bytes]) -> Result<RespValue> {
         b"LTRIM" => cmd_ltrim(store, args),
         b"LINSERT" => cmd_linsert(store, args),
         b"LPOS" => cmd_lpos(store, args),
+        b"LMOVE" => cmd_lmove(store, args),
+        b"RPOPLPUSH" => cmd_rpoplpush(store, args),
         _ => Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd).into_owned(),
         )),
@@ -86,14 +88,23 @@ fn cmd_rpushx(store: &Store, args: &[Bytes]) -> Result<RespValue> {
 
 /// LPOP key [count]
 fn cmd_lpop(store: &Store, args: &[Bytes]) -> Result<RespValue> {
-    if args.is_empty() {
+    if args.is_empty() || args.len() > 2 {
         return Err(Error::WrongArity("LPOP"));
     }
     let count = if args.len() > 1 {
-        parse_int(&args[1])? as usize
+        let c = parse_int(&args[1])?;
+        if c < 0 {
+            return Err(Error::Other("value is out of range, must be positive"));
+        }
+        c as usize
     } else {
         1
     };
+
+    // count=0 returns empty array (not null)
+    if count == 0 && args.len() > 1 {
+        return Ok(RespValue::array(vec![]));
+    }
 
     match store.lpop(&args[0], count) {
         Some(values) if args.len() == 1 => {
@@ -110,16 +121,73 @@ fn cmd_lpop(store: &Store, args: &[Bytes]) -> Result<RespValue> {
     }
 }
 
+/// LMOVE source destination LEFT|RIGHT LEFT|RIGHT
+/// Atomically returns and removes the first/last element of the source list,
+/// and pushes the element at the first/last element of the destination list.
+fn cmd_lmove(store: &Store, args: &[Bytes]) -> Result<RespValue> {
+    if args.len() != 4 {
+        return Err(Error::WrongArity("LMOVE"));
+    }
+
+    let source = &args[0];
+    let destination = &args[1];
+    let wherefrom = parse_direction(&args[2])?;
+    let whereto = parse_direction(&args[3])?;
+
+    match store.lmove(source, destination, wherefrom, whereto)? {
+        Some(value) => Ok(RespValue::bulk(value)),
+        None => Ok(RespValue::null()),
+    }
+}
+
+/// RPOPLPUSH source destination (deprecated, use LMOVE)
+/// Atomically returns and removes the last element of the source list,
+/// and pushes the element at the first element of the destination list.
+fn cmd_rpoplpush(store: &Store, args: &[Bytes]) -> Result<RespValue> {
+    if args.len() != 2 {
+        return Err(Error::WrongArity("RPOPLPUSH"));
+    }
+
+    let source = &args[0];
+    let destination = &args[1];
+
+    // RPOPLPUSH is equivalent to LMOVE source destination RIGHT LEFT
+    match store.lmove(source, destination, false, true)? {
+        Some(value) => Ok(RespValue::bulk(value)),
+        None => Ok(RespValue::null()),
+    }
+}
+
+/// Parse LEFT/RIGHT direction argument
+fn parse_direction(arg: &[u8]) -> Result<bool> {
+    if arg.eq_ignore_ascii_case(b"LEFT") {
+        Ok(true)
+    } else if arg.eq_ignore_ascii_case(b"RIGHT") {
+        Ok(false)
+    } else {
+        Err(Error::Syntax)
+    }
+}
+
 /// RPOP key [count]
 fn cmd_rpop(store: &Store, args: &[Bytes]) -> Result<RespValue> {
-    if args.is_empty() {
+    if args.is_empty() || args.len() > 2 {
         return Err(Error::WrongArity("RPOP"));
     }
     let count = if args.len() > 1 {
-        parse_int(&args[1])? as usize
+        let c = parse_int(&args[1])?;
+        if c < 0 {
+            return Err(Error::Other("value is out of range, must be positive"));
+        }
+        c as usize
     } else {
         1
     };
+
+    // count=0 returns empty array (not null)
+    if count == 0 && args.len() > 1 {
+        return Ok(RespValue::array(vec![]));
+    }
 
     match store.rpop(&args[0], count) {
         Some(values) if args.len() == 1 => Ok(RespValue::bulk(values.into_iter().next().unwrap())),
@@ -235,7 +303,13 @@ fn cmd_lpos(store: &Store, args: &[Bytes]) -> Result<RespValue> {
             }
             rank = parse_int(&args[i])?;
             if rank == 0 {
-                return Err(Error::Other("RANK can't be zero"));
+                return Err(Error::Other(
+                    "RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list",
+                ));
+            }
+            // i64::MIN cannot be negated safely, treat as out of range
+            if rank == i64::MIN {
+                return Err(Error::Other("value is out of range"));
             }
         } else if opt.eq_ignore_ascii_case(b"COUNT") {
             i += 1;

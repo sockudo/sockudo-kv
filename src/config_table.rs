@@ -436,7 +436,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     },
     ConfigEntry {
         name: "list-max-listpack-size",
-        alias: None,
+        alias: Some("list-max-ziplist-size"), // Legacy Redis 6.x name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Integer,
         default_value: "-2",
@@ -459,7 +459,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     },
     ConfigEntry {
         name: "zset-max-listpack-entries",
-        alias: None,
+        alias: Some("zset-max-ziplist-entries"), // Legacy Redis 6.x name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Integer,
         default_value: "128",
@@ -469,7 +469,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     },
     ConfigEntry {
         name: "zset-max-listpack-value",
-        alias: None,
+        alias: Some("zset-max-ziplist-value"), // Legacy Redis 6.x name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Integer,
         default_value: "64",
@@ -588,7 +588,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     // === Replication ===
     ConfigEntry {
         name: "replica-read-only",
-        alias: None,
+        alias: Some("slave-read-only"), // Legacy Redis name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Bool,
         default_value: "yes",
@@ -1082,7 +1082,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     },
     ConfigEntry {
         name: "replica-ignore-maxmemory",
-        alias: None,
+        alias: Some("slave-ignore-maxmemory"), // Legacy Redis name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Bool,
         default_value: "yes",
@@ -1113,7 +1113,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     // === Lazy Free (additional) ===
     ConfigEntry {
         name: "replica-lazy-flush",
-        alias: None,
+        alias: Some("slave-lazy-flush"), // Legacy Redis name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Bool,
         default_value: "no",
@@ -1451,7 +1451,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     },
     ConfigEntry {
         name: "cluster-replica-validity-factor",
-        alias: None,
+        alias: Some("cluster-slave-validity-factor"), // Legacy Redis name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Integer,
         default_value: "10",
@@ -1491,7 +1491,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     },
     ConfigEntry {
         name: "cluster-replica-no-failover",
-        alias: None,
+        alias: Some("cluster-slave-no-failover"), // Legacy Redis name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Bool,
         default_value: "no",
@@ -2127,7 +2127,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     },
     ConfigEntry {
         name: "replica-announce-ip",
-        alias: None,
+        alias: Some("slave-announce-ip"), // Legacy Redis name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::String,
         default_value: "",
@@ -2144,7 +2144,7 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
     },
     ConfigEntry {
         name: "replica-announce-port",
-        alias: None,
+        alias: Some("slave-announce-port"), // Legacy Redis name
         flags: ConfigFlags::NONE,
         config_type: ConfigType::Integer,
         default_value: "0",

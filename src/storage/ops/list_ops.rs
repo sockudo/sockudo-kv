@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::storage::Store;
 use crate::storage::types::{DataType, Entry};
 
+#[allow(unused_imports)]
 use crate::storage::quicklist::QuickList;
 use std::sync::atomic::Ordering;
 
@@ -12,14 +13,16 @@ impl Store {
     // ==================== List operations ====================
 
     /// Push elements to the left (head) of the list
+    /// Elements are pushed in order, so LPUSH key a b c results in [c, b, a]
     #[inline]
     pub fn lpush(&self, key: Bytes, values: Vec<Bytes>) -> Result<usize> {
         match self.data_entry(&key) {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    let mut list = QuickList::new();
-                    for val in values.iter().rev() {
+                    let mut list = self.new_quicklist();
+                    // Push each element to head in order, so last element ends up at head
+                    for val in &values {
                         list.push_front(val.clone());
                     }
                     let len = list.len();
@@ -31,7 +34,10 @@ impl Store {
 
                 let result = match &mut entry.data {
                     DataType::List(list) => {
-                        for val in values.iter().rev() {
+                        // Update fill value in case config changed
+                        list.set_fill(self.encoding.read().list_max_listpack_size);
+                        // Push each element to head in order, so last element ends up at head
+                        for val in &values {
                             list.push_front(val.clone());
                         }
                         Ok(list.len())
@@ -44,8 +50,9 @@ impl Store {
                 result
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
-                let mut list = QuickList::new();
-                for val in values.iter().rev() {
+                let mut list = self.new_quicklist();
+                // Push each element to head in order, so last element ends up at head
+                for val in &values {
                     list.push_front(val.clone());
                 }
                 let len = list.len();
@@ -63,7 +70,7 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
-                    let mut list = QuickList::new();
+                    let mut list = self.new_quicklist();
                     for val in &values {
                         list.push_back(val.clone());
                     }
@@ -76,6 +83,8 @@ impl Store {
 
                 let result = match &mut entry.data {
                     DataType::List(list) => {
+                        // Update fill value in case config changed
+                        list.set_fill(self.encoding.read().list_max_listpack_size);
                         for val in &values {
                             list.push_back(val.clone());
                         }
@@ -89,7 +98,7 @@ impl Store {
                 result
             }
             crate::storage::dashtable::Entry::Vacant(e) => {
-                let mut list = QuickList::new();
+                let mut list = self.new_quicklist();
                 for val in &values {
                     list.push_back(val.clone());
                 }
@@ -445,6 +454,107 @@ impl Store {
                 }
             }
             crate::storage::dashtable::Entry::Vacant(_) => Ok(0),
+        }
+    }
+
+    /// LMOVE source destination LEFT|RIGHT LEFT|RIGHT
+    /// Atomically pops an element from source list and pushes to destination list.
+    /// Returns the element being moved, or None if source doesn't exist or is empty.
+    /// wherefrom: true = LEFT (pop from head), false = RIGHT (pop from tail)
+    /// whereto: true = LEFT (push to head), false = RIGHT (push to tail)
+    #[inline]
+    pub fn lmove(
+        &self,
+        source: &[u8],
+        destination: &[u8],
+        wherefrom: bool, // true = LEFT, false = RIGHT
+        whereto: bool,   // true = LEFT, false = RIGHT
+    ) -> Result<Option<Bytes>> {
+        // Handle same key case specially
+        if source == destination {
+            return self.lmove_same_key(source, wherefrom, whereto);
+        }
+
+        // Pop from source
+        let value = if wherefrom {
+            // LEFT = pop from head
+            match self.lpop(source, 1) {
+                Some(mut vals) if !vals.is_empty() => vals.remove(0),
+                _ => return Ok(None),
+            }
+        } else {
+            // RIGHT = pop from tail
+            match self.rpop(source, 1) {
+                Some(mut vals) if !vals.is_empty() => vals.remove(0),
+                _ => return Ok(None),
+            }
+        };
+
+        // Push to destination
+        if whereto {
+            // LEFT = push to head
+            self.lpush(Bytes::copy_from_slice(destination), vec![value.clone()])?;
+        } else {
+            // RIGHT = push to tail
+            self.rpush(Bytes::copy_from_slice(destination), vec![value.clone()])?;
+        }
+
+        Ok(Some(value))
+    }
+
+    /// Helper for LMOVE when source and destination are the same key
+    #[inline]
+    fn lmove_same_key(&self, key: &[u8], wherefrom: bool, whereto: bool) -> Result<Option<Bytes>> {
+        match self.data_entry(key) {
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                if entry.is_expired() {
+                    e.remove();
+                    return Ok(None);
+                }
+
+                let result = match &mut entry.data {
+                    DataType::List(list) => {
+                        if list.is_empty() {
+                            return Ok(None);
+                        }
+
+                        // Pop from source side
+                        let value = if wherefrom {
+                            list.pop_front()
+                        } else {
+                            list.pop_back()
+                        };
+
+                        if let Some(val) = value {
+                            // Push to destination side
+                            if whereto {
+                                list.push_front(val.clone());
+                            } else {
+                                list.push_back(val.clone());
+                            }
+                            Some(val)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => return Err(Error::WrongType),
+                };
+
+                if result.is_some() {
+                    entry.bump_version();
+                }
+
+                // Check if list became empty (shouldn't happen in same-key case, but be safe)
+                if let DataType::List(list) = &entry.data {
+                    if list.is_empty() {
+                        e.remove();
+                    }
+                }
+
+                Ok(result)
+            }
+            crate::storage::dashtable::Entry::Vacant(_) => Ok(None),
         }
     }
 

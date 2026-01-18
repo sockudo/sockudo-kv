@@ -583,7 +583,7 @@ fn sort_impl(store: &Store, args: &[Bytes], read_only: bool) -> Result<RespValue
 
     // STORE if requested
     if let Some(dest) = store_dest {
-        let mut list = crate::storage::quicklist::QuickList::new();
+        let mut list = store.new_quicklist();
         for val in &result {
             list.push_back(val.clone());
         }

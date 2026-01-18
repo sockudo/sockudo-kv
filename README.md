@@ -1,5 +1,8 @@
 # Sockudo-KV
 
+> [!WARNING]
+> **Early Development Status**: This project is currently in an early experimental stage of development. Features may be unstable, APIs might change, and it is not yet recommended for production use.
+
 A high-performance, Redis-compatible in-memory database written in Rust with ultra-low latency and lock-free data structures.
 
 ## Features
