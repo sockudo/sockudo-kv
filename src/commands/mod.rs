@@ -740,7 +740,12 @@ fn cmd_info(store: &Store, args: &[Bytes], server: Option<&Arc<ServerState>>) ->
     let is_default = section.eq_ignore_ascii_case(b"default");
 
     if section.eq_ignore_ascii_case(b"server") || is_all || is_default {
-        info.push_str("# Server\r\nredis_version:7.0.0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\n");
+        info.push_str("# Server\r\n");
+        info.push_str("redis_version:7.0.0\r\n");
+        info.push_str("redis_mode:standalone\r\n");
+        info.push_str("os:Linux\r\n");
+        info.push_str("arch_bits:64\r\n");
+        info.push_str(&format!("process_id:{}\r\n", std::process::id()));
     }
 
     if section.eq_ignore_ascii_case(b"memory") || is_all || is_default {

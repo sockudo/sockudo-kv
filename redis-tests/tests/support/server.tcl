@@ -156,7 +156,7 @@ proc ping_server {host port} {
     set retval 0
     if {[catch {
         if {$::tls} {
-            set fd [::tls::socket $host $port] 
+            set fd [::tls::socket $host $port]
         } else {
             set fd [socket $host $port]
         }
@@ -391,6 +391,12 @@ proc run_external_server_test {code overrides} {
         $client select 9
     }
 
+    # Get PID from external server via INFO command
+    set info [$client info server]
+    if {[regexp {process_id:(\d+)} $info -> pid]} {
+        dict set srv "pid" $pid
+    }
+
     set config {}
     dict set config "port" $::port
     dict set srv "config" $config
@@ -449,7 +455,7 @@ proc run_external_server_test {code overrides} {
     }
 
     set srv [lpop ::servers]
-    
+
     if {[dict exists $srv "client"]} {
         [dict get $srv "client"] close
     }
