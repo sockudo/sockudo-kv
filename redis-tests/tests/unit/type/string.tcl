@@ -298,7 +298,7 @@ start_server {tags {"string"}} {
     test {MSETEX - flexible argument parsing} {
         r del flex:1{t} flex:2{t}
         # Test flags before and after KEYS
-        r msetex 2 flex:1{t} val1 flex:2{t} val2 ex 3 nx 
+        r msetex 2 flex:1{t} val1 flex:2{t} val2 ex 3 nx
         r msetex 2 flex:3{t} val3 flex:4{t} val4 px 3000 xx
 
         assert_equal [r get flex:1{t}] "val1"
@@ -587,15 +587,15 @@ start_server {tags {"string"}} {
         assert_equal "" [r substr key 7 8]
         assert_equal "" [r substr nokey 0 1]
     }
-    
+
 if {[string match {*jemalloc*} [s mem_allocator]]} {
     test {trim on SET with big value} {
         # set a big value to trigger increasing the query buf
-        r set key [string repeat A 100000] 
+        r set key [string repeat A 100000]
         # set a smaller value but > PROTO_MBULK_BIG_ARG (32*1024) Redis will try to save the query buf itself on the DB.
         r set key [string repeat A 33000]
         # asset the value was trimmed
-        assert {[r memory usage key] < 42000}; # 42K to count for Jemalloc's additional memory overhead. 
+        assert {[r memory usage key] < 42000}; # 42K to count for Jemalloc's additional memory overhead.
     }
 } ;# if jemalloc
 
@@ -757,30 +757,30 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         set res {}
         lappend res [r get foo]
         assert_encoding "raw" foo
-        
+
         r set bar 12
         assert_encoding "int" bar
         lappend res [r get bar]
     } {12 12}
-    
+
     # coverage for kvobjComputeSize
     test {MEMORY USAGE - STRINGS} {
         set sizes {1 5 8 15 16 17 31 32 33 63 64 65 127 128 129 255 256 257}
         set hdrsize [expr {[s arch_bits] == 32 ? 12 : 16}]
-        
+
         foreach ksize $sizes {
             set key [string repeat "k" $ksize]
-            # OBJ_ENCODING_EMBSTR, OBJ_ENCODING_RAW        
+            # OBJ_ENCODING_EMBSTR, OBJ_ENCODING_RAW
             foreach vsize $sizes {
-                set value [string repeat "v" $vsize]                        
+                set value [string repeat "v" $vsize]
                 r set $key $value
                 set memory_used [r memory usage $key]
-                set min [expr $hdrsize + $ksize + $vsize] 
+                set min [expr $hdrsize + $ksize + $vsize]
                 assert_lessthan_equal $min $memory_used
                 set max [expr {32 > $min ? 64 : [expr $min * 2]}]
                 assert_morethan_equal $max $memory_used
             }
-            
+
             # OBJ_ENCODING_INT
             foreach value {1 100 10000 10000000} {
                 r set $key $value
@@ -789,10 +789,10 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
             }
         }
     }
-    
+
     if {[string match {*jemalloc*} [s mem_allocator]]} {
         test {Check MEMORY USAGE for embedded key strings with jemalloc} {
-        
+
             proc expected_mem {key val with_expire exp_mem_usage exp_debug_sdslen} {
                 r del $key
                 r set $key $val
@@ -800,8 +800,8 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
                 assert_equal $exp_mem_usage [r memory usage $key]
                 assert_equal $exp_debug_sdslen [r debug sdslen $key]
             }
-            
-            if {[s arch_bits] == 64} {  
+
+            if {[s arch_bits] == 64} {
                 # 16 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 5 (val) + 1 (\0) = 32bytes
                 expected_mem x234 y2345 0 32 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 32, val_sds_len:5, val_sds_avail:0, val_zmalloc: 0"
                 # 16 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 6 (val) + 1 (\0) = 33bytes
@@ -815,7 +815,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
                 expected_mem x234 y23456789 0 32 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 32, val_sds_len:9, val_sds_avail:0, val_zmalloc: 0"
                 # 12 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 10 (val) + 1 (\0) = 33bytes
                 expected_mem x234 y234567890 0 40 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 40, val_sds_len:10, val_sds_avail:7, val_zmalloc: 0"
-                # 12 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 17 (val) + 1 (\0) = 40bytes 
+                # 12 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 17 (val) + 1 (\0) = 40bytes
                 expected_mem x234 y2345678901234567 0 40 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 40, val_sds_len:17, val_sds_avail:0, val_zmalloc: 0"
                 # 12 (kvobj) + 8 (expiry) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 17 (val) + 1 (\0) = 48bytes
                 expected_mem x234 y2345678901234567 1 48 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 48, val_sds_len:17, val_sds_avail:0, val_zmalloc: 0"
@@ -826,28 +826,28 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
     test {DIGEST basic usage with plain string} {
         r set mykey "hello world"
         set digest [r digest mykey]
-        # Ensure reply is hex string
-        assert {[string is wideinteger -strict "0x$digest"]}
+        # Ensure reply is 16-char hex string (64-bit hash)
+        assert {[regexp {^[0-9a-f]{16}$} $digest]}
     }
 
     test {DIGEST with empty string} {
         r set mykey ""
         set digest [r digest mykey]
-        assert {[string is wideinteger -strict "0x$digest"]}
+        assert {[regexp {^[0-9a-f]{16}$} $digest]}
     }
 
     test {DIGEST with integer-encoded value} {
         r set mykey 12345
         assert_encoding int mykey
         set digest [r digest mykey]
-        assert {[string is wideinteger -strict "0x$digest"]}
+        assert {[regexp {^[0-9a-f]{16}$} $digest]}
     }
 
     test {DIGEST with negative integer} {
         r set mykey -999
         assert_encoding int mykey
         set digest [r digest mykey]
-        assert {[string is wideinteger -strict "0x$digest"]}
+        assert {[regexp {^[0-9a-f]{16}$} $digest]}
     }
 
     test {DIGEST returns consistent hash for same value} {
@@ -876,20 +876,20 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
     test {DIGEST with binary data} {
         r set mykey "\x00\x01\x02\x03\xff\xfe"
         set digest [r digest mykey]
-        assert {[string is wideinteger -strict "0x$digest"]}
+        assert {[regexp {^[0-9a-f]{16}$} $digest]}
     }
 
     test {DIGEST with unicode characters} {
         r set mykey "Hello 世界"
         set digest [r digest mykey]
-        assert {[string is wideinteger -strict "0x$digest"]}
+        assert {[regexp {^[0-9a-f]{16}$} $digest]}
     }
 
     test {DIGEST with very long string} {
         set longstring [string repeat "Lorem ipsum dolor sit amet. " 1000]
         r set mykey $longstring
         set digest [r digest mykey]
-        assert {[string is wideinteger -strict "0x$digest"]}
+        assert {[regexp {^[0-9a-f]{16}$} $digest]}
     }
 
     test {DIGEST against non-existing key} {
@@ -929,7 +929,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
     test {DIGEST with special characters and whitespace} {
         r set mykey "  spaces  \t\n\r"
         set digest [r digest mykey]
-        assert {[string is wideinteger -strict "0x$digest"]}
+        assert {[regexp {^[0-9a-f]{16}$} $digest]}
     }
 
     test {DIGEST consistency across SET operations} {
@@ -1089,7 +1089,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
     test {DELEX wrong number of arguments} {
         r del key1
         assert_error "*wrong number of arguments*" {r delex key1 IFEQ}
-   
+
         r set key1 x
         assert_error "*wrong number of arguments*" {r delex key1 IFEQ}
         assert_error "*wrong number of arguments*" {r delex key1 IFEQ value1 extra}
@@ -1429,11 +1429,11 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         r set mykey "hello"
         assert_equal "OK" [r set mykey "world" ifeq "hello"]
         assert_equal "world" [r get mykey]
-        
+
         r set mykey "hello"
         assert_equal "OK" [r set mykey "world" IfEq "hello"]
         assert_equal "world" [r get mykey]
-        
+
         r set mykey "hello"
         assert_equal "OK" [r set mykey "world" IFEQ "hello"]
         assert_equal "world" [r get mykey]
@@ -1451,7 +1451,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         set digest1 [r digest key1]
         set digest2 [r digest key2]
         assert_equal $digest1 $digest2
-        
+
         # Both should be settable with the same digest
         assert_equal "OK" [r set key1 "new1" IFDEQ $digest1]
         assert_equal "OK" [r set key2 "new2" IFDEQ $digest2]
@@ -1465,13 +1465,13 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         set digest1 [r digest key1]
         set digest2 [r digest key2]
         assert {$digest1 != $digest2}
-        
+
         # Should not be able to set with wrong digest
         assert_equal {} [r set key1 "new1" IFDEQ $digest2]
         assert_equal {} [r set key2 "new2" IFDEQ $digest1]
         assert_equal "value1" [r get key1]
         assert_equal "value2" [r get key2]
-        
+
         # Should be able to set with correct digest
         assert_equal "OK" [r set key1 "new1" IFDEQ $digest1]
         assert_equal "OK" [r set key2 "new2" IFDEQ $digest2]
