@@ -1053,11 +1053,13 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
     }
 
     test {DELEX with unicode characters} {
-        r set mykey "Hello 世界"
-        assert_equal 1 [r delex mykey IFEQ "Hello 世界"]
+        # Use encoding convertto for TCL 9 compatibility
+        set unicode_str [encoding convertto utf-8 "Hello 世界"]
+        r set mykey $unicode_str
+        assert_equal 1 [r delex mykey IFEQ $unicode_str]
         assert_equal 0 [r exists mykey]
 
-        r set mykey "Hello 世界"
+        r set mykey $unicode_str
         assert_equal 0 [r delex mykey IFEQ "Hello World"]
         assert_equal 1 [r exists mykey]
     }
@@ -1409,8 +1411,10 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
     }
 
     test {Extended SET with unicode characters and IFEQ} {
-        r set mykey "Hello 世界"
-        assert_equal "OK" [r set mykey "world" IFEQ "Hello 世界"]
+        # Use encoding convertto for TCL 9 compatibility
+        set unicode_str [encoding convertto utf-8 "Hello 世界"]
+        r set mykey $unicode_str
+        assert_equal "OK" [r set mykey "world" IFEQ $unicode_str]
         assert_equal "world" [r get mykey]
     }
 
