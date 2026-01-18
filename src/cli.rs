@@ -376,8 +376,10 @@ pub struct Cli {
     pub hash_max_listpack_entries: Option<usize>,
     #[arg(long)]
     pub hash_max_listpack_value: Option<usize>,
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub list_max_listpack_size: Option<i32>,
+    #[arg(long, hide = true, allow_hyphen_values = true)]
+    pub list_max_ziplist_size: Option<i32>,
     #[arg(long)]
     pub list_compress_depth: Option<u32>,
     #[arg(long)]
@@ -987,6 +989,9 @@ impl Cli {
         if let Some(v) = cli.list_max_listpack_size {
             config.list_max_listpack_size = v;
         }
+        if let Some(v) = cli.list_max_ziplist_size {
+            config.list_max_listpack_size = v;
+        }
         if let Some(v) = cli.list_compress_depth {
             config.list_compress_depth = v;
         }
@@ -1497,7 +1502,7 @@ fn parse_config_file(path: &Path, config: &mut ServerConfig) -> Result<(), Strin
             "hash-max-listpack-value" if !args.is_empty() => {
                 config.hash_max_listpack_value = parse_usize(&args[0], "hash-max-listpack-value")?
             }
-            "list-max-listpack-size" if !args.is_empty() => {
+            "list-max-listpack-size" | "list-max-ziplist-size" if !args.is_empty() => {
                 config.list_max_listpack_size = parse_i32(&args[0], "list-max-listpack-size")?
             }
             "list-compress-depth" if !args.is_empty() => {

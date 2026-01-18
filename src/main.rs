@@ -18,6 +18,10 @@ use tokio::task::JoinSet;
 use tokio::net::UnixListener;
 
 use sockudo_kv::PubSub;
+use sockudo_kv::blocking::{
+    BlockResult, BlockingOperation, PopDirection, format_mpop_response, format_pop_response,
+    is_blocking_list_command, parse_direction, parse_timeout, try_move, try_mpop, try_pop,
+};
 use sockudo_kv::client::ClientState;
 use sockudo_kv::client_manager::ClientManager;
 use sockudo_kv::cluster::ClusterService;
@@ -46,6 +50,15 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const READ_BUF_SIZE: usize = 64 * 1024;
 const WRITE_BUF_SIZE: usize = 64 * 1024;
+
+/// Write response to buffer using the client's protocol version
+#[inline]
+fn write_response(buf: &mut Vec<u8>, response: &RespValue, client: &ClientState) {
+    let protocol = client
+        .protocol_version
+        .load(std::sync::atomic::Ordering::Relaxed);
+    response.write_to_protocol(buf, protocol);
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -86,11 +99,14 @@ pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Initialize logging from config (loglevel, logfile, syslog)
-    if let Err(e) = sockudo_kv::logging::init_logging(&config) {
-        eprintln!("Warning: Failed to initialize logging: {}", e);
-        // Fall back to env_logger
-        env_logger::init();
-    }
+    // We must keep _guard alive for the duration of the program for non-blocking logging
+    let _logging_guard = match sockudo_kv::logging::init_logging(&config) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("Warning: Failed to initialize logging: {}", e);
+            None
+        }
+    };
 
     // Apply supervised mode (systemd/upstart notification)
     let supervised_mode: sockudo_kv::process_mgmt::SupervisedMode = config
@@ -907,6 +923,9 @@ async fn handle_client(
     pubsub.unregister(sub_id);
     clients.unregister(client.id);
 
+    // Clean up any blocking registration for this client
+    server_state.blocking.cleanup_client(client.id);
+
     result
 }
 
@@ -1085,7 +1104,7 @@ where
                                     match execute_subscribe(pubsub, sub_id, cmd_name, &cmd.args, acl_user.as_ref()) {
                                         Ok(responses) => {
                                             for response in responses {
-                                                response.write_to(&mut write_buf);
+                                                write_response(&mut write_buf, &response, client);
                                             }
                                             in_pubsub_mode = pubsub.is_subscribed(sub_id);
                                             client.in_pubsub.store(in_pubsub_mode, std::sync::atomic::Ordering::Relaxed);
@@ -1094,7 +1113,7 @@ where
                                     }
                                 } else if cmd.is_command(b"PUBLISH") || cmd.is_command(b"PUBSUB") || cmd.is_command(b"SPUBLISH") {
                                     match pubsub_execute(pubsub, cmd_name, &cmd.args) {
-                                        Ok(response) => response.write_to(&mut write_buf),
+                                        Ok(response) => write_response(&mut write_buf, &response, client),
                                         Err(e) => handle_client_write_error(&e.to_string(), &mut write_buf),
                                     }
                                 } else if in_pubsub_mode && !is_allowed_in_pubsub_mode(cmd_name) {
@@ -1105,11 +1124,11 @@ where
                                     match connection::execute(client, clients, server_state, cmd_name, &cmd.args) {
                                         Ok(ConnectionResult::Response(response)) => {
                                             if client.should_reply() {
-                                                response.write_to(&mut write_buf);
+                                                write_response(&mut write_buf, &response, client);
                                             }
                                         }
                                         Ok(ConnectionResult::Quit(response)) => {
-                                            response.write_to(&mut write_buf);
+                                            write_response(&mut write_buf, &response, client);
                                             socket.write_all(&write_buf).await?;
                                             return Ok(());
                                         }
@@ -1118,14 +1137,24 @@ where
                                     }
                                 } else if let Some(queued_response) = handle_multi_queue(client, cmd_name, &cmd.args) {
                                     if client.should_reply() {
-                                        queued_response.write_to(&mut write_buf);
+                                        write_response(&mut write_buf, &queued_response, client);
                                     }
                                 } else if is_transaction_command(cmd_name) {
                                     let store = multi_store.db(client.current_db());
                                     match transaction::execute(client, &store, cmd_name, &cmd.args) {
                                         Ok(TransactionResult::Response(response)) => {
                                             if client.should_reply() {
-                                                response.write_to(&mut write_buf);
+                                                write_response(&mut write_buf, &response, client);
+                                            }
+                                        }
+                                        Ok(TransactionResult::ResponseWithSignal(response, keys_to_signal)) => {
+                                            // Signal blocked clients for list push commands executed in EXEC
+                                            let db_index = client.current_db();
+                                            for key in keys_to_signal {
+                                                server_state.blocking.signal_key(db_index, &key);
+                                            }
+                                            if client.should_reply() {
+                                                write_response(&mut write_buf, &response, client);
                                             }
                                         }
                                         Ok(TransactionResult::Queued) => {
@@ -1166,7 +1195,7 @@ where
                                         // SWAPDB needs access to MultiStore
                                         let response = handle_swapdb(multi_store, &cmd.args);
                                         if client.should_reply() {
-                                            response.write_to(&mut write_buf);
+                                            write_response(&mut write_buf, &response, client);
                                         }
                                     } else if cmd.is_command(b"SAVE") {
                                         // Synchronous SAVE
@@ -1231,7 +1260,7 @@ where
                                         // SELECT needs to validate against db count
                                         let response = handle_select(client, multi_store.db_count(), &cmd.args);
                                         if client.should_reply() {
-                                            response.write_to(&mut write_buf);
+                                            write_response(&mut write_buf, &response, client);
                                         }
                                     } else if is_cluster_command(cmd_name) {
                                         // Handle cluster commands (CLUSTER, ASKING, READONLY, READWRITE)
@@ -1239,13 +1268,55 @@ where
                                         match cluster_cmd::execute(cluster_state, client, clients, replication, &store, cmd_name, &cmd.args) {
                                             Ok(response) => {
                                                 if client.should_reply() {
-                                                    response.write_to(&mut write_buf);
+                                                    write_response(&mut write_buf, &response, client);
                                                 }
                                             }
                                             Err(e) => handle_client_write_error(&e.to_string(), &mut write_buf),
                                         }
+                                    } else if is_blocking_list_command(cmd_name) {
+                                        // Handle blocking list commands (BLPOP, BRPOP, BLMOVE, BRPOPLPUSH, BLMPOP)
+                                        // Flush pending writes before potentially blocking
+                                        if !write_buf.is_empty() {
+                                            socket.write_all(&write_buf).await?;
+                                            write_buf.clear();
+                                        }
+
+                                        let response = handle_blocking_list_command(
+                                            multi_store,
+                                            server_state,
+                                            client,
+                                            cmd_name,
+                                            &cmd.args,
+                                        ).await;
+
+                                        match response {
+                                            Ok(resp) => {
+                                                if client.should_reply() {
+                                                    write_response(&mut write_buf, &resp, client);
+                                                    socket.write_all(&write_buf).await?;
+                                                    write_buf.clear();
+                                                }
+                                            }
+                                            Err(e) => {
+                                                handle_client_write_error(&e.to_string(), &mut write_buf);
+                                                socket.write_all(&write_buf).await?;
+                                                write_buf.clear();
+                                            }
+                                        }
                                     } else {
                                         let store = multi_store.db(client.current_db());
+
+                                        // Check if this is a list push command that might wake blocked clients
+                                        let is_list_push = cmd.is_command(b"LPUSH")
+                                            || cmd.is_command(b"RPUSH")
+                                            || cmd.is_command(b"LPUSHX")
+                                            || cmd.is_command(b"RPUSHX");
+                                        let push_key = if is_list_push && !cmd.args.is_empty() {
+                                            Some(cmd.args[0].clone())
+                                        } else {
+                                            None
+                                        };
+
                                         let response = Dispatcher::execute(
                                             multi_store,
                                             &store,
@@ -1254,8 +1325,21 @@ where
                                             Some(client),
                                             cmd,
                                         );
+
+                                        // Signal blocked clients if this was a successful list push
+                                        if let Some(key) = push_key {
+                                            // Check if the response indicates success (integer > 0)
+                                            let was_success = match &response {
+                                                RespValue::Integer(n) => *n > 0,
+                                                _ => false,
+                                            };
+                                            if was_success {
+                                                server_state.blocking.signal_key(client.current_db(), &key);
+                                            }
+                                        }
+
                                         if client.should_reply() {
-                                            response.write_to(&mut write_buf);
+                                            write_response(&mut write_buf, &response, client);
                                         }
                                     }
                                 }
@@ -1288,7 +1372,7 @@ where
                     Ok(msg) => {
                         // Convert message to RESP and write
                         let response = pubsub_message_to_resp(msg);
-                        response.write_to(&mut write_buf);
+                        write_response(&mut write_buf, &response, client);
                         socket.write_all(&write_buf).await?;
                         write_buf.clear();
                     }
@@ -1505,6 +1589,368 @@ fn handle_select(client: &Arc<ClientState>, db_count: usize, args: &[bytes::Byte
 
     client.select_db(db_index as u64);
     RespValue::ok()
+}
+
+/// Handle blocking list commands (BLPOP, BRPOP, BLMOVE, BRPOPLPUSH, BLMPOP)
+///
+/// These commands block until data is available or timeout expires.
+/// Uses event-driven wakeup via BlockingManager for efficiency.
+async fn handle_blocking_list_command(
+    multi_store: &Arc<sockudo_kv::storage::MultiStore>,
+    server_state: &Arc<ServerState>,
+    client: &Arc<ClientState>,
+    cmd_name: &[u8],
+    args: &[bytes::Bytes],
+) -> sockudo_kv::error::Result<RespValue> {
+    use sockudo_kv::error::Error;
+
+    let db_index = client.current_db();
+    let store = multi_store.db(db_index);
+
+    // Parse and execute based on command type
+    if cmd_name.eq_ignore_ascii_case(b"BLPOP") || cmd_name.eq_ignore_ascii_case(b"BRPOP") {
+        if args.len() < 2 {
+            return Err(Error::WrongArity(
+                if cmd_name.eq_ignore_ascii_case(b"BLPOP") {
+                    "BLPOP"
+                } else {
+                    "BRPOP"
+                },
+            ));
+        }
+
+        let timeout = parse_timeout(&args[args.len() - 1])?;
+        let keys: Vec<bytes::Bytes> = args[..args.len() - 1].to_vec();
+        let direction = if cmd_name.eq_ignore_ascii_case(b"BLPOP") {
+            PopDirection::Left
+        } else {
+            PopDirection::Right
+        };
+
+        // Try immediate pop
+        match try_pop(&store, &keys, direction)? {
+            Some((key, value)) => return Ok(format_pop_response(key, value)),
+            None => {}
+        }
+
+        // Need to block - register and wait
+        let operation = BlockingOperation::Pop {
+            keys: keys.clone(),
+            direction,
+        };
+        blocking_wait(
+            multi_store,
+            server_state,
+            client,
+            db_index,
+            operation,
+            timeout,
+            bytes::Bytes::copy_from_slice(cmd_name),
+        )
+        .await
+    } else if cmd_name.eq_ignore_ascii_case(b"BRPOPLPUSH") {
+        if args.len() != 3 {
+            return Err(Error::WrongArity("BRPOPLPUSH"));
+        }
+
+        let source = args[0].clone();
+        let destination = args[1].clone();
+        let timeout = parse_timeout(&args[2])?;
+
+        // Try immediate move
+        match try_move(
+            &store,
+            &source,
+            &destination,
+            PopDirection::Right,
+            PopDirection::Left,
+        )? {
+            Some(value) => return Ok(RespValue::bulk(value)),
+            None => {}
+        }
+
+        // Need to block
+        let operation = BlockingOperation::RPopLPush {
+            source,
+            destination,
+        };
+        blocking_wait(
+            multi_store,
+            server_state,
+            client,
+            db_index,
+            operation,
+            timeout,
+            bytes::Bytes::from_static(b"BRPOPLPUSH"),
+        )
+        .await
+    } else if cmd_name.eq_ignore_ascii_case(b"BLMOVE") {
+        if args.len() != 5 {
+            return Err(Error::WrongArity("BLMOVE"));
+        }
+
+        let source = args[0].clone();
+        let destination = args[1].clone();
+        let wherefrom = parse_direction(&args[2])?;
+        let whereto = parse_direction(&args[3])?;
+        let timeout = parse_timeout(&args[4])?;
+
+        // Try immediate move
+        match try_move(&store, &source, &destination, wherefrom, whereto)? {
+            Some(value) => return Ok(RespValue::bulk(value)),
+            None => {}
+        }
+
+        // Need to block
+        let operation = BlockingOperation::Move {
+            source,
+            destination,
+            wherefrom,
+            whereto,
+        };
+        blocking_wait(
+            multi_store,
+            server_state,
+            client,
+            db_index,
+            operation,
+            timeout,
+            bytes::Bytes::from_static(b"BLMOVE"),
+        )
+        .await
+    } else if cmd_name.eq_ignore_ascii_case(b"BLMPOP") {
+        // BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]
+        if args.len() < 4 {
+            return Err(Error::WrongArity("BLMPOP"));
+        }
+
+        let timeout = parse_timeout(&args[0])?;
+
+        let numkeys: usize = std::str::from_utf8(&args[1])
+            .map_err(|_| Error::NotInteger)?
+            .parse()
+            .map_err(|_| Error::NotInteger)?;
+
+        if numkeys == 0 {
+            return Err(Error::Other("numkeys must be positive"));
+        }
+
+        if args.len() < 2 + numkeys + 1 {
+            return Err(Error::Syntax);
+        }
+
+        let keys: Vec<bytes::Bytes> = args[2..2 + numkeys].to_vec();
+        let direction_idx = 2 + numkeys;
+        let direction = parse_direction(&args[direction_idx])?;
+
+        // Parse optional COUNT
+        let mut count: usize = 1;
+        let mut i = direction_idx + 1;
+        while i < args.len() {
+            if args[i].eq_ignore_ascii_case(b"COUNT") {
+                i += 1;
+                if i >= args.len() {
+                    return Err(Error::Syntax);
+                }
+                count = std::str::from_utf8(&args[i])
+                    .map_err(|_| Error::NotInteger)?
+                    .parse()
+                    .map_err(|_| Error::NotInteger)?;
+                if count == 0 {
+                    return Err(Error::Other("count must be positive"));
+                }
+            } else {
+                return Err(Error::Syntax);
+            }
+            i += 1;
+        }
+
+        // Try immediate pop
+        match try_mpop(&store, &keys, direction, count)? {
+            Some((key, values)) => return Ok(format_mpop_response(key, values)),
+            None => {}
+        }
+
+        // Need to block
+        let operation = BlockingOperation::MPop {
+            keys,
+            direction,
+            count,
+        };
+        blocking_wait(
+            multi_store,
+            server_state,
+            client,
+            db_index,
+            operation,
+            timeout,
+            bytes::Bytes::from_static(b"BLMPOP"),
+        )
+        .await
+    } else {
+        Err(Error::UnknownCommand(
+            String::from_utf8_lossy(cmd_name).into_owned(),
+        ))
+    }
+}
+
+/// Wait for a blocking operation to complete
+///
+/// Registers the client as blocked, sets up timeout, and waits for either:
+/// - Data to become available (signaled by BlockingManager)
+/// - Timeout to expire
+/// - Client to be unblocked (CLIENT UNBLOCK)
+///
+/// Uses a retry loop like Redis/Dragonfly to handle race conditions where
+/// another client may have consumed the data between signal and wakeup.
+async fn blocking_wait(
+    multi_store: &Arc<sockudo_kv::storage::MultiStore>,
+    server_state: &Arc<ServerState>,
+    client: &Arc<ClientState>,
+    db_index: usize,
+    operation: BlockingOperation,
+    timeout: Option<Duration>,
+    cmd_name: bytes::Bytes,
+) -> sockudo_kv::error::Result<RespValue> {
+    use tokio::time::Instant;
+
+    // Mark client as blocked
+    client.set_blocked(Some(cmd_name));
+
+    // Calculate deadline if timeout is specified
+    let deadline = timeout.map(|t| Instant::now() + t);
+
+    // Retry loop - handles race conditions where data is consumed by another client
+    loop {
+        // Register with blocking manager for this iteration
+        let rx = server_state
+            .blocking
+            .block_client(client.id, db_index, operation.clone());
+
+        // Calculate remaining timeout
+        let remaining = match deadline {
+            Some(dl) => {
+                let now = Instant::now();
+                if now >= dl {
+                    // Already timed out
+                    client.set_blocked(None);
+                    server_state.blocking.cleanup_client(client.id);
+                    return Ok(match &operation {
+                        BlockingOperation::Pop { .. } | BlockingOperation::MPop { .. } => {
+                            RespValue::null_array()
+                        }
+                        _ => RespValue::null(),
+                    });
+                }
+                Some(dl - now)
+            }
+            None => None,
+        };
+
+        // Wait for signal or timeout
+        let wait_result = if let Some(rem) = remaining {
+            tokio::time::timeout(rem, rx).await
+        } else {
+            // No timeout - wait indefinitely
+            Ok(rx.await)
+        };
+
+        match wait_result {
+            Ok(Ok(BlockResult::Ready)) => {
+                // Data might be available - try the operation
+                let store = multi_store.db(db_index);
+
+                let result = match &operation {
+                    BlockingOperation::Pop { keys, direction } => {
+                        match try_pop(&store, keys, *direction)? {
+                            Some((key, value)) => Some(format_pop_response(key, value)),
+                            None => None, // Data was taken by another client, retry
+                        }
+                    }
+                    BlockingOperation::MPop {
+                        keys,
+                        direction,
+                        count,
+                    } => match try_mpop(&store, keys, *direction, *count)? {
+                        Some((key, values)) => Some(format_mpop_response(key, values)),
+                        None => None, // Data was taken by another client, retry
+                    },
+                    BlockingOperation::Move {
+                        source,
+                        destination,
+                        wherefrom,
+                        whereto,
+                    } => {
+                        match try_move(&store, source, destination, *wherefrom, *whereto)? {
+                            Some(value) => {
+                                // Signal destination key - another blocked client might be waiting
+                                server_state.blocking.signal_key(db_index, destination);
+                                Some(RespValue::bulk(value))
+                            }
+                            None => None, // Data was taken by another client, retry
+                        }
+                    }
+                    BlockingOperation::RPopLPush {
+                        source,
+                        destination,
+                    } => {
+                        match try_move(
+                            &store,
+                            source,
+                            destination,
+                            PopDirection::Right,
+                            PopDirection::Left,
+                        )? {
+                            Some(value) => {
+                                // Signal destination key - another blocked client might be waiting
+                                server_state.blocking.signal_key(db_index, destination);
+                                Some(RespValue::bulk(value))
+                            }
+                            None => None, // Data was taken by another client, retry
+                        }
+                    }
+                };
+
+                if let Some(resp) = result {
+                    // Success - clear blocked state and return
+                    client.set_blocked(None);
+                    return Ok(resp);
+                }
+                // Data was consumed by another client - continue retry loop
+                // The loop will re-register and wait again
+            }
+            Ok(Ok(BlockResult::Timeout)) | Err(_) => {
+                // Timeout
+                client.set_blocked(None);
+                return Ok(match &operation {
+                    BlockingOperation::Pop { .. } | BlockingOperation::MPop { .. } => {
+                        RespValue::null_array()
+                    }
+                    _ => RespValue::null(),
+                });
+            }
+            Ok(Ok(BlockResult::Unblocked)) => {
+                // CLIENT UNBLOCK was called - return null
+                client.set_blocked(None);
+                return Ok(match &operation {
+                    BlockingOperation::Pop { .. } | BlockingOperation::MPop { .. } => {
+                        RespValue::null_array()
+                    }
+                    _ => RespValue::null(),
+                });
+            }
+            Ok(Err(_)) => {
+                // Channel closed (shouldn't happen normally)
+                client.set_blocked(None);
+                return Ok(match &operation {
+                    BlockingOperation::Pop { .. } | BlockingOperation::MPop { .. } => {
+                        RespValue::null_array()
+                    }
+                    _ => RespValue::null(),
+                });
+            }
+        }
+    }
 }
 
 /// Handle SYNC/PSYNC command - enters replica streaming mode

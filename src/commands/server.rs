@@ -1549,8 +1549,9 @@ fn cmd_debug(
                     crate::storage::DataType::String(_) => "embstr", // or raw
                     crate::storage::DataType::RawString(_) => "raw",
                     crate::storage::DataType::List(list) => {
-                        // Redis 7.0+: single-node lists report "listpack", multi-node report "quicklist"
-                        if list.node_count() <= 1 {
+                        // Redis 7.0+: use is_listpack_encoding() to properly determine encoding
+                        // based on node count AND node sizes relative to fill config
+                        if list.is_listpack_encoding() {
                             "listpack"
                         } else {
                             "quicklist"

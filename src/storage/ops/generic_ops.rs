@@ -470,8 +470,9 @@ impl Store {
                 "raw"
             }
             DataType::List(list) => {
-                // Redis 7.0+: single-node lists report "listpack", multi-node report "quicklist"
-                if list.node_count() <= 1 {
+                // Redis 7.0+: use is_listpack_encoding() to properly determine encoding
+                // based on node count AND whether the single node fits within limits
+                if list.is_listpack_encoding() {
                     "listpack"
                 } else {
                     "quicklist"

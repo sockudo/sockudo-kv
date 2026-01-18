@@ -112,13 +112,13 @@ impl Store {
 
     /// Pop element from the left (head) of the list
     #[inline]
-    pub fn lpop(&self, key: &[u8], count: usize) -> Option<Vec<Bytes>> {
+    pub fn lpop(&self, key: &[u8], count: usize) -> Result<Option<Vec<Bytes>>> {
         match self.data_entry(key) {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     e.remove();
-                    return None;
+                    return Ok(None);
                 }
 
                 let (result, is_empty) = match &mut entry.data {
@@ -133,7 +133,7 @@ impl Store {
                         }
                         (result, list.is_empty())
                     }
-                    _ => return None,
+                    _ => return Err(Error::WrongType),
                 };
 
                 if !result.is_empty() {
@@ -144,24 +144,24 @@ impl Store {
                 }
 
                 if result.is_empty() {
-                    None
+                    Ok(None)
                 } else {
-                    Some(result)
+                    Ok(Some(result))
                 }
             }
-            crate::storage::dashtable::Entry::Vacant(_) => None,
+            crate::storage::dashtable::Entry::Vacant(_) => Ok(None),
         }
     }
 
     /// Pop element from the right (tail) of the list
     #[inline]
-    pub fn rpop(&self, key: &[u8], count: usize) -> Option<Vec<Bytes>> {
+    pub fn rpop(&self, key: &[u8], count: usize) -> Result<Option<Vec<Bytes>>> {
         match self.data_entry(key) {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
                 if entry.is_expired() {
                     e.remove();
-                    return None;
+                    return Ok(None);
                 }
 
                 let (result, is_empty) = match &mut entry.data {
@@ -176,7 +176,7 @@ impl Store {
                         }
                         (result, list.is_empty())
                     }
-                    _ => return None,
+                    _ => return Err(Error::WrongType),
                 };
 
                 if !result.is_empty() {
@@ -187,39 +187,39 @@ impl Store {
                 }
 
                 if result.is_empty() {
-                    None
+                    Ok(None)
                 } else {
-                    Some(result)
+                    Ok(Some(result))
                 }
             }
-            crate::storage::dashtable::Entry::Vacant(_) => None,
+            crate::storage::dashtable::Entry::Vacant(_) => Ok(None),
         }
     }
 
     /// Get list length
     #[inline]
-    pub fn llen(&self, key: &[u8]) -> usize {
+    pub fn llen(&self, key: &[u8]) -> Result<usize> {
         match self.data_get(key) {
             Some(entry_ref) => {
                 if entry_ref.1.is_expired() {
-                    return 0;
+                    return Ok(0);
                 }
                 match entry_ref.1.data.as_list() {
-                    Some(list) => list.len(),
-                    None => 0,
+                    Some(list) => Ok(list.len()),
+                    None => Err(Error::WrongType),
                 }
             }
-            None => 0,
+            None => Ok(0),
         }
     }
 
     /// Get list range
     #[inline]
-    pub fn lrange(&self, key: &[u8], start: i64, stop: i64) -> Vec<Bytes> {
+    pub fn lrange(&self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Bytes>> {
         match self.data_get(key) {
             Some(entry_ref) => {
                 if entry_ref.1.is_expired() {
-                    return vec![];
+                    return Ok(vec![]);
                 }
                 match entry_ref.1.data.as_list() {
                     Some(list) => {
@@ -228,43 +228,43 @@ impl Store {
                         let stop = normalize_index(stop, len);
 
                         if start > stop || start >= len {
-                            return vec![];
+                            return Ok(vec![]);
                         }
 
                         let start = start.max(0) as usize;
                         let stop = (stop + 1).min(len) as usize;
 
-                        list.iter().skip(start).take(stop - start).collect()
+                        Ok(list.iter().skip(start).take(stop - start).collect())
                     }
-                    None => vec![],
+                    None => Err(Error::WrongType),
                 }
             }
-            None => vec![],
+            None => Ok(vec![]),
         }
     }
 
     /// Get element at index
     #[inline]
-    pub fn lindex(&self, key: &[u8], index: i64) -> Option<Bytes> {
+    pub fn lindex(&self, key: &[u8], index: i64) -> Result<Option<Bytes>> {
         match self.data_get(key) {
             Some(entry_ref) => {
                 if entry_ref.1.is_expired() {
-                    return None;
+                    return Ok(None);
                 }
                 match entry_ref.1.data.as_list() {
                     Some(list) => {
                         let len = list.len() as i64;
                         let index = normalize_index(index, len);
                         if index < 0 || index >= len {
-                            None
+                            Ok(None)
                         } else {
-                            list.get(index as usize)
+                            Ok(list.get(index as usize))
                         }
                     }
-                    None => None,
+                    None => Err(Error::WrongType),
                 }
             }
-            None => None,
+            None => Ok(None),
         }
     }
 
@@ -478,13 +478,13 @@ impl Store {
         // Pop from source
         let value = if wherefrom {
             // LEFT = pop from head
-            match self.lpop(source, 1) {
+            match self.lpop(source, 1)? {
                 Some(mut vals) if !vals.is_empty() => vals.remove(0),
                 _ => return Ok(None),
             }
         } else {
             // RIGHT = pop from tail
-            match self.rpop(source, 1) {
+            match self.rpop(source, 1)? {
                 Some(mut vals) if !vals.is_empty() => vals.remove(0),
                 _ => return Ok(None),
             }
@@ -571,16 +571,24 @@ impl Store {
         rank: i64,
         count: usize,
         maxlen: usize,
-    ) -> Option<Vec<i64>> {
-        let entry_ref = self.data_get(key)?;
+    ) -> Result<Option<Vec<i64>>> {
+        let entry_ref = match self.data_get(key) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
         if entry_ref.1.is_expired() {
-            return None;
+            return Ok(None);
         }
 
-        let list = entry_ref.1.data.as_list()?;
+        let list = match entry_ref.1.data.as_list() {
+            Some(l) => l,
+            None => return Err(Error::WrongType),
+        };
+
         let len = list.len();
         if len == 0 {
-            return Some(vec![]);
+            return Ok(Some(vec![]));
         }
 
         let limit = if maxlen == 0 { len } else { maxlen.min(len) };
@@ -624,7 +632,7 @@ impl Store {
             }
         }
 
-        Some(positions)
+        Ok(Some(positions))
     }
 }
 

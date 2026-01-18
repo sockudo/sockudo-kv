@@ -3,6 +3,7 @@
 //! This module contains all Redis-compatible command implementations organized by category.
 
 pub mod bitmap;
+pub mod blocking;
 pub mod cluster;
 pub mod connection;
 pub mod generic;
@@ -853,6 +854,20 @@ fn cmd_info(store: &Store, args: &[Bytes], server: Option<&Arc<ServerState>>) ->
             info.push_str("\r\n");
         }
         info.push_str("# Replication\r\nrole:master\r\nconnected_slaves:0\r\n");
+    }
+
+    if section.eq_ignore_ascii_case(b"clients") || is_all || is_default {
+        if !info.is_empty() && !info.ends_with("\r\n\r\n") {
+            info.push_str("\r\n");
+        }
+        info.push_str("# Clients\r\n");
+        info.push_str("connected_clients:0\r\n");
+        let blocked_clients = server
+            .map(|s| s.blocking.blocked_client_count())
+            .unwrap_or(0);
+        info.push_str(&format!("blocked_clients:{}\r\n", blocked_clients));
+        info.push_str("tracking_clients:0\r\n");
+        info.push_str("clients_in_timeout_table:0\r\n");
     }
 
     if section.eq_ignore_ascii_case(b"stats") || is_all || is_default {

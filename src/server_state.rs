@@ -538,6 +538,10 @@ pub struct ServerState {
     pub repl_backlog_size: AtomicU64,
     pub repl_backlog_off: AtomicU64,
     pub repl_backlog_histlen: AtomicU64,
+
+    // === Blocking Commands ===
+    /// Manager for blocked clients (BLPOP, BRPOP, etc.)
+    pub blocking: crate::blocking::BlockingManager,
 }
 
 impl ServerState {
@@ -651,6 +655,9 @@ impl ServerState {
             repl_backlog_size: AtomicU64::new(1024 * 1024), // 1MB default
             repl_backlog_off: AtomicU64::new(0),
             repl_backlog_histlen: AtomicU64::new(0),
+
+            // Blocking commands
+            blocking: crate::blocking::BlockingManager::new(),
         };
 
         // Create default user

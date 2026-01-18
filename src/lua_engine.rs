@@ -540,7 +540,7 @@ fn lua_value_to_resp(_lua: &Lua, value: Value) -> Result<RespValue, String> {
 /// Convert RespValue to Lua value
 fn resp_to_lua_value(lua: &Lua, resp: &RespValue, protected: bool) -> LuaResult<Value> {
     match resp {
-        RespValue::Null => Ok(Value::Nil),
+        RespValue::Null | RespValue::NullArray => Ok(Value::Nil),
         RespValue::Integer(i) => Ok(Value::Integer(*i)),
         RespValue::SimpleString(s) | RespValue::BulkString(s) => {
             let lua_str = lua.create_string(s.as_ref())?;
@@ -563,6 +563,16 @@ fn resp_to_lua_value(lua: &Lua, resp: &RespValue, protected: bool) -> LuaResult<
             for (i, val) in arr.iter().enumerate() {
                 let lua_val = resp_to_lua_value(lua, val, protected)?;
                 table.set(i + 1, lua_val)?;
+            }
+            Ok(Value::Table(table))
+        }
+        RespValue::Map(pairs) => {
+            // Convert map to Lua table with string keys
+            let table = lua.create_table()?;
+            for (key, val) in pairs.iter() {
+                let lua_key = resp_to_lua_value(lua, key, protected)?;
+                let lua_val = resp_to_lua_value(lua, val, protected)?;
+                table.set(lua_key, lua_val)?;
             }
             Ok(Value::Table(table))
         }

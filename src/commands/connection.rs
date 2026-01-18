@@ -43,7 +43,7 @@ pub fn execute(
         b"RESET" => Ok(ConnectionResult::Response(cmd_reset(client))),
         b"SELECT" => cmd_select(client, args).map(ConnectionResult::Response),
         b"AUTH" => cmd_auth(client, server_state, args).map(ConnectionResult::Response),
-        b"CLIENT" => cmd_client(client, manager, args),
+        b"CLIENT" => cmd_client(client, manager, server_state, args),
         b"HELLO" => cmd_hello(client, manager, server_state, args).map(ConnectionResult::Response),
         _ => Err(Error::UnknownCommand(
             String::from_utf8_lossy(cmd).into_owned(),
@@ -160,6 +160,7 @@ fn cmd_auth(
 fn cmd_client(
     client: &Arc<ClientState>,
     manager: &Arc<ClientManager>,
+    server_state: &Arc<ServerState>,
     args: &[Bytes],
 ) -> Result<ConnectionResult> {
     if args.is_empty() {
@@ -269,7 +270,7 @@ fn cmd_client(
             Ok(ConnectionResult::Response(RespValue::ok()))
         }
 
-        b"UNBLOCK" => cmd_client_unblock(manager, subargs),
+        b"UNBLOCK" => cmd_client_unblock(server_state, subargs),
 
         _ => Err(Error::Custom(format!(
             "ERR unknown subcommand '{}'. Try CLIENT HELP.",
@@ -673,7 +674,7 @@ fn format_tracking_info(tracking: &TrackingState) -> RespValue {
 }
 
 /// CLIENT UNBLOCK client-id [TIMEOUT|ERROR]
-fn cmd_client_unblock(manager: &Arc<ClientManager>, args: &[Bytes]) -> Result<ConnectionResult> {
+fn cmd_client_unblock(server_state: &Arc<ServerState>, args: &[Bytes]) -> Result<ConnectionResult> {
     if args.is_empty() {
         return Err(Error::WrongArity("CLIENT UNBLOCK"));
     }
@@ -684,26 +685,17 @@ fn cmd_client_unblock(manager: &Arc<ClientManager>, args: &[Bytes]) -> Result<Co
         .map_err(|_| Error::NotInteger)?;
 
     // Parse optional TIMEOUT|ERROR mode
-    let _error_mode = if args.len() > 1 {
+    let error_mode = if args.len() > 1 {
         args[1].eq_ignore_ascii_case(b"ERROR")
     } else {
         false
     };
 
-    // Look up the client
-    match manager.get_client(client_id) {
-        Some(_client) => {
-            // Client exists - check if blocked and unblock
-            // Full blocking command implementation would set a blocked flag
-            // and use a channel/notify to wake the client
-            // For now, return 0 as blocking commands aren't fully implemented
-            Ok(ConnectionResult::Response(RespValue::integer(0)))
-        }
-        None => {
-            // Client doesn't exist
-            Ok(ConnectionResult::Response(RespValue::integer(0)))
-        }
-    }
+    // Try to unblock the client via BlockingManager
+    let unblocked = server_state.blocking.unblock_client(client_id, error_mode);
+    Ok(ConnectionResult::Response(RespValue::integer(
+        if unblocked { 1 } else { 0 },
+    )))
 }
 
 // ==================== HELLO Command ====================
@@ -773,25 +765,37 @@ fn cmd_hello(
         }
     }
 
-    // Build HELLO response
-    let response = vec![
-        RespValue::bulk_string("server"),
-        RespValue::bulk_string("sockudo-kv"),
-        RespValue::bulk_string("version"),
-        RespValue::bulk_string("7.0.0"),
-        RespValue::bulk_string("proto"),
-        RespValue::integer(protover),
-        RespValue::bulk_string("id"),
-        RespValue::integer(client.id as i64),
-        RespValue::bulk_string("mode"),
-        RespValue::bulk_string("standalone"),
-        RespValue::bulk_string("role"),
-        RespValue::bulk_string("master"),
-        RespValue::bulk_string("modules"),
-        RespValue::array(vec![]),
+    // Build HELLO response as a map (key-value pairs)
+    let pairs = vec![
+        (
+            RespValue::bulk_string("server"),
+            RespValue::bulk_string("sockudo-kv"),
+        ),
+        (
+            RespValue::bulk_string("version"),
+            RespValue::bulk_string("7.0.0"),
+        ),
+        (
+            RespValue::bulk_string("proto"),
+            RespValue::integer(protover),
+        ),
+        (
+            RespValue::bulk_string("id"),
+            RespValue::integer(client.id as i64),
+        ),
+        (
+            RespValue::bulk_string("mode"),
+            RespValue::bulk_string("standalone"),
+        ),
+        (
+            RespValue::bulk_string("role"),
+            RespValue::bulk_string("master"),
+        ),
+        (RespValue::bulk_string("modules"), RespValue::array(vec![])),
     ];
 
-    Ok(RespValue::array(response))
+    // Return as Map (serialized appropriately based on protocol version)
+    Ok(RespValue::map(pairs))
 }
 
 #[cfg(test)]

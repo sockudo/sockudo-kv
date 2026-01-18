@@ -222,8 +222,16 @@ proc test {name code {okpattern undefined} {tags {}}} {
     set saved_test_config {}
     if {$::external} {
         catch {
+            # Temporarily disable readraw to properly read CONFIG GET response
+            set was_readraw [r readingraw]
+            if {$was_readraw} {
+                r readraw 0
+            }
             foreach {param val} [r config get *] {
                 dict set saved_test_config $param $val
+            }
+            if {$was_readraw} {
+                r readraw 1
             }
         }
     }

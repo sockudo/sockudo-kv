@@ -15,6 +15,8 @@ use crate::storage::Store;
 pub enum TransactionResult {
     /// Normal response
     Response(RespValue),
+    /// Normal response with keys to signal for blocked clients (after EXEC)
+    ResponseWithSignal(RespValue, Vec<Bytes>),
     /// Queue command and return QUEUED
     Queued,
 }
@@ -69,6 +71,17 @@ fn cmd_multi(client: &Arc<ClientState>) -> Result<TransactionResult> {
     Ok(TransactionResult::Response(RespValue::ok()))
 }
 
+/// Check if command is a list push command that could wake blocked clients
+#[inline]
+fn is_list_push_command(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(b"LPUSH")
+        || cmd.eq_ignore_ascii_case(b"RPUSH")
+        || cmd.eq_ignore_ascii_case(b"LPUSHX")
+        || cmd.eq_ignore_ascii_case(b"RPUSHX")
+        || cmd.eq_ignore_ascii_case(b"LMOVE")
+        || cmd.eq_ignore_ascii_case(b"RPOPLPUSH")
+}
+
 /// EXEC - Execute all queued commands
 fn cmd_exec(client: &Arc<ClientState>, store: &Arc<Store>) -> Result<TransactionResult> {
     // Take the multi state
@@ -103,10 +116,26 @@ fn cmd_exec(client: &Arc<ClientState>, store: &Arc<Store>) -> Result<Transaction
         ));
     }
 
-    // Execute all queued commands
+    // Execute all queued commands, tracking keys to signal for blocked clients
     let mut results = Vec::with_capacity(multi_state.commands.len());
+    let mut keys_to_signal: Vec<Bytes> = Vec::new();
 
     for queued in multi_state.commands {
+        // Track list push commands to signal blocked clients after EXEC
+        let push_key = if is_list_push_command(&queued.name) && !queued.args.is_empty() {
+            // For LMOVE/RPOPLPUSH, the destination key is args[1]
+            if queued.name.eq_ignore_ascii_case(b"LMOVE")
+                || queued.name.eq_ignore_ascii_case(b"RPOPLPUSH")
+            {
+                queued.args.get(1).cloned()
+            } else {
+                // For LPUSH/RPUSH/LPUSHX/RPUSHX, the key is args[0]
+                Some(queued.args[0].clone())
+            }
+        } else {
+            None
+        };
+
         // Create a Command from the queued command
         let cmd = Command {
             name: queued.name,
@@ -115,10 +144,44 @@ fn cmd_exec(client: &Arc<ClientState>, store: &Arc<Store>) -> Result<Transaction
 
         // Execute the command
         let result = Dispatcher::execute_basic(store, cmd);
+
+        // Check if list push was successful (returns integer > 0)
+        if let Some(key) = push_key {
+            let was_success = match &result {
+                RespValue::Integer(n) => *n > 0,
+                // LMOVE/RPOPLPUSH return bulk string on success
+                RespValue::BulkString(_) => true,
+                _ => false,
+            };
+            if was_success && !keys_to_signal.contains(&key) {
+                keys_to_signal.push(key);
+            }
+        }
+
         results.push(result);
     }
 
-    Ok(TransactionResult::Response(RespValue::Array(results)))
+    // Filter keys_to_signal: only signal keys that still exist as non-empty lists
+    // This handles cases like MULTI/LPUSH/DEL/SET/EXEC where the key type changed
+    keys_to_signal.retain(|key| {
+        if let Some(key_type) = store.key_type(key) {
+            if key_type == "list" {
+                // Check if list is non-empty
+                return store.llen(key).unwrap_or(0) > 0;
+            }
+        }
+        false
+    });
+
+    // Return keys to signal so main.rs can wake blocked clients
+    if keys_to_signal.is_empty() {
+        Ok(TransactionResult::Response(RespValue::Array(results)))
+    } else {
+        Ok(TransactionResult::ResponseWithSignal(
+            RespValue::Array(results),
+            keys_to_signal,
+        ))
+    }
 }
 
 /// DISCARD - Discard all queued commands

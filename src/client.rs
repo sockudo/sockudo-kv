@@ -186,6 +186,8 @@ pub struct ClientState {
     pub readonly: AtomicBool,
     /// Protocol version (2 or 3)
     pub protocol_version: AtomicU8,
+    /// Blocked state - command name client is blocked on (empty if not blocked)
+    pub blocked_cmd: parking_lot::RwLock<Option<Bytes>>,
 }
 
 impl ClientState {
@@ -219,7 +221,26 @@ impl ClientState {
             asking: AtomicBool::new(false),
             readonly: AtomicBool::new(false),
             protocol_version: AtomicU8::new(2),
+            blocked_cmd: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Check if client is blocked
+    #[inline]
+    pub fn is_blocked(&self) -> bool {
+        self.blocked_cmd.read().is_some()
+    }
+
+    /// Set blocked state
+    #[inline]
+    pub fn set_blocked(&self, cmd: Option<Bytes>) {
+        *self.blocked_cmd.write() = cmd;
+    }
+
+    /// Get blocked command name
+    #[inline]
+    pub fn blocked_command(&self) -> Option<Bytes> {
+        self.blocked_cmd.read().clone()
     }
 
     /// Check if in MULTI mode
@@ -402,14 +423,31 @@ impl ClientState {
         let user = self.user.read();
         let user_str = String::from_utf8_lossy(&user);
 
+        // Build flags string: N=normal, b=blocked
+        let mut flags = String::new();
+        if self.is_blocked() {
+            flags.push('b');
+        }
+        if flags.is_empty() {
+            flags.push('N');
+        }
+
+        // Get blocked command name if any
+        let cmd_str = self
+            .blocked_command()
+            .map(|b| String::from_utf8_lossy(&b).to_ascii_lowercase())
+            .unwrap_or_else(|| "NULL".to_string());
+
         format!(
-            "id={} addr={} fd=0 name={} age={} idle={} flags=N db={} sub=0 psub=0 ssub=0 multi=-1 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd=NULL user={} redir={} resp=2 lib-name={} lib-ver={}\n",
+            "id={} addr={} fd=0 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user={} redir={} resp=2 lib-name={} lib-ver={}\n",
             self.id,
             self.addr,
             name_str,
             self.age_secs(),
             self.idle_secs(),
+            flags,
             self.db(),
+            cmd_str,
             user_str,
             self.tracking.redirect_id.load(Ordering::Relaxed),
             lib_name_str,
