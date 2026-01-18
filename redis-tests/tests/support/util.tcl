@@ -603,7 +603,7 @@ proc wait_load_handlers_disconnected {{level 0}} {
     }
 }
 
-proc K { x y } { set x } 
+proc K { x y } { set x }
 
 # Shuffle a list with Fisher-Yates algorithm.
 proc lshuffle {list} {
@@ -671,7 +671,8 @@ proc get_child_pid {idx} {
         set fd [open "|ps --ppid $pid -o pid" "r"]
         set child_pid [string trim [lindex [split [read $fd] \n] 1]]
     }
-    close $fd
+    # Use catch to handle case where pgrep/ps returns non-zero (no child processes)
+    catch {close $fd}
 
     return $child_pid
 }
