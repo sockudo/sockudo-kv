@@ -56,6 +56,68 @@ use crate::storage::{MultiStore, Store};
 use bytes::Bytes;
 use std::sync::Arc;
 
+// FFI for mimalloc memory stats
+unsafe extern "C" {
+    fn mi_process_info(
+        elapsed_msecs: *mut usize,
+        user_msecs: *mut usize,
+        system_msecs: *mut usize,
+        current_rss: *mut usize,
+        peak_rss: *mut usize,
+        current_commit: *mut usize,
+        peak_commit: *mut usize,
+        page_faults: *mut usize,
+    );
+}
+
+/// Get memory statistics from mimalloc allocator
+/// Returns (used_memory, peak_rss, current_rss)
+fn get_mimalloc_memory_stats() -> (usize, usize, usize) {
+    let mut elapsed_msecs: usize = 0;
+    let mut user_msecs: usize = 0;
+    let mut system_msecs: usize = 0;
+    let mut current_rss: usize = 0;
+    let mut peak_rss: usize = 0;
+    let mut current_commit: usize = 0;
+    let mut peak_commit: usize = 0;
+    let mut page_faults: usize = 0;
+
+    unsafe {
+        mi_process_info(
+            &mut elapsed_msecs,
+            &mut user_msecs,
+            &mut system_msecs,
+            &mut current_rss,
+            &mut peak_rss,
+            &mut current_commit,
+            &mut peak_commit,
+            &mut page_faults,
+        );
+    }
+
+    // current_commit is the total bytes allocated (used_memory equivalent)
+    // current_rss is the resident set size
+    // peak_rss is the peak resident set size
+    (current_commit, peak_rss, current_rss)
+}
+
+/// Format memory size in human-readable format
+fn format_memory_human(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = KB * 1024;
+    const GB: usize = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2}G", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2}M", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2}K", bytes as f64 / KB as f64)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
 /// Command dispatcher - routes commands to appropriate handlers
 pub struct Dispatcher;
 
@@ -679,6 +741,46 @@ fn cmd_info(store: &Store, args: &[Bytes], server: Option<&Arc<ServerState>>) ->
 
     if section.eq_ignore_ascii_case(b"server") || is_all || is_default {
         info.push_str("# Server\r\nredis_version:7.0.0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\n");
+    }
+
+    if section.eq_ignore_ascii_case(b"memory") || is_all || is_default {
+        if !info.is_empty() && !info.ends_with("\r\n\r\n") {
+            info.push_str("\r\n");
+        }
+        info.push_str("# Memory\r\n");
+
+        // Get memory stats from mimalloc
+        let (used_memory, peak_rss, current_rss) = get_mimalloc_memory_stats();
+
+        info.push_str(&format!("used_memory:{}\r\n", used_memory));
+        info.push_str(&format!(
+            "used_memory_human:{}\r\n",
+            format_memory_human(used_memory)
+        ));
+        info.push_str(&format!("used_memory_rss:{}\r\n", current_rss));
+        info.push_str(&format!(
+            "used_memory_rss_human:{}\r\n",
+            format_memory_human(current_rss)
+        ));
+        info.push_str(&format!("used_memory_peak:{}\r\n", peak_rss));
+        info.push_str(&format!(
+            "used_memory_peak_human:{}\r\n",
+            format_memory_human(peak_rss)
+        ));
+        info.push_str("used_memory_overhead:0\r\n");
+        info.push_str("used_memory_startup:0\r\n");
+        info.push_str(&format!("used_memory_dataset:{}\r\n", used_memory));
+        info.push_str("used_memory_dataset_perc:100.00%\r\n");
+        info.push_str("total_system_memory:0\r\n");
+        info.push_str("total_system_memory_human:0B\r\n");
+        info.push_str("used_memory_lua:0\r\n");
+        info.push_str("used_memory_lua_human:0B\r\n");
+        info.push_str("maxmemory:0\r\n");
+        info.push_str("maxmemory_human:0B\r\n");
+        info.push_str("maxmemory_policy:noeviction\r\n");
+        info.push_str("mem_fragmentation_ratio:1.00\r\n");
+        info.push_str("mem_fragmentation_bytes:0\r\n");
+        info.push_str("mem_allocator:mimalloc\r\n");
     }
 
     if section.eq_ignore_ascii_case(b"persistence") || is_all || is_default {

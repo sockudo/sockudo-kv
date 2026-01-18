@@ -1,4 +1,4 @@
 /target
 
 # Ignore performance test scripts
-perf_test.sh
+perf_test.shdump.rdb
