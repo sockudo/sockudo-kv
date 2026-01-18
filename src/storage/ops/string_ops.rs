@@ -53,6 +53,44 @@ impl Store {
             }
         })
     }
+    #[inline]
+    fn update_string_value(entry: &mut Entry, value: Bytes) {
+        match &mut entry.data {
+            DataType::String(s) => {
+                *s = value;
+            }
+            _ => {
+                entry.data = DataType::String(value);
+            }
+        }
+    }
+
+    #[inline]
+    fn set_with_expire_at(&self, key: Bytes, value: Bytes, expire_at_ms: i64) {
+        match self.data_entry(&key) {
+            crate::storage::dashtable::Entry::Vacant(e) => {
+                let key_for_index = key.clone();
+                e.insert((
+                    key,
+                    Entry::with_expire(DataType::String(value), expire_at_ms),
+                ));
+                self.key_count.fetch_add(1, Ordering::Relaxed);
+                self.expiration_index.add(key_for_index, expire_at_ms);
+            }
+            crate::storage::dashtable::Entry::Occupied(mut e) => {
+                let entry = &mut e.get_mut().1;
+                let old_expire = entry.expire_at_ms();
+
+                Self::update_string_value(entry, value);
+                entry.set_expire_at(expire_at_ms);
+                entry.bump_version();
+
+                let key_bytes = e.get().0.clone();
+                self.expiration_index
+                    .update(key_bytes, old_expire, expire_at_ms);
+            }
+        }
+    }
 
     /// Set string value
     #[inline]
@@ -64,14 +102,7 @@ impl Store {
             }
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 let entry = &mut e.get_mut().1;
-                match &mut entry.data {
-                    DataType::String(s) => {
-                        *s = value;
-                    }
-                    _ => {
-                        entry.data = DataType::String(value);
-                    }
-                }
+                Self::update_string_value(entry, value);
                 entry.persist();
                 entry.bump_version();
             }
@@ -82,75 +113,13 @@ impl Store {
     #[inline]
     pub fn set_ex(&self, key: Bytes, value: Bytes, expire_ms: i64) {
         let expire_at = now_ms() + expire_ms;
-        match self.data_entry(&key) {
-            crate::storage::dashtable::Entry::Vacant(e) => {
-                e.insert((
-                    key.clone(),
-                    Entry::with_expire(DataType::String(value), expire_at),
-                ));
-                self.key_count.fetch_add(1, Ordering::Relaxed);
-
-                // Add to expiration index
-                self.expiration_index.add(key, expire_at);
-            }
-            crate::storage::dashtable::Entry::Occupied(mut e) => {
-                let entry = &mut e.get_mut().1;
-                let old_expire = entry.expire_at_ms();
-
-                match &mut entry.data {
-                    DataType::String(s) => {
-                        *s = value;
-                    }
-                    _ => {
-                        entry.data = DataType::String(value);
-                    }
-                }
-                entry.set_expire_at(expire_at);
-                entry.bump_version();
-
-                // Update expiration index
-                let key_bytes = e.get().0.clone();
-                self.expiration_index
-                    .update(key_bytes, old_expire, expire_at);
-            }
-        }
+        self.set_with_expire_at(key, value, expire_at);
     }
 
     /// Set with expiration at timestamp (milliseconds)
     #[inline]
     pub fn set_exat(&self, key: Bytes, value: Bytes, expire_at_ms: i64) {
-        match self.data_entry(&key) {
-            crate::storage::dashtable::Entry::Vacant(e) => {
-                e.insert((
-                    key.clone(),
-                    Entry::with_expire(DataType::String(value), expire_at_ms),
-                ));
-                self.key_count.fetch_add(1, Ordering::Relaxed);
-
-                // Add to expiration index
-                self.expiration_index.add(key, expire_at_ms);
-            }
-            crate::storage::dashtable::Entry::Occupied(mut e) => {
-                let entry = &mut e.get_mut().1;
-                let old_expire = entry.expire_at_ms();
-
-                match &mut entry.data {
-                    DataType::String(s) => {
-                        *s = value;
-                    }
-                    _ => {
-                        entry.data = DataType::String(value);
-                    }
-                }
-                entry.set_expire_at(expire_at_ms);
-                entry.bump_version();
-
-                // Update expiration index
-                let key_bytes = e.get().0.clone();
-                self.expiration_index
-                    .update(key_bytes, old_expire, expire_at_ms);
-            }
-        }
+        self.set_with_expire_at(key, value, expire_at_ms);
     }
 
     /// Set if not exists
@@ -160,7 +129,7 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(mut e) => {
                 if e.get().1.is_expired() {
                     let entry = &mut e.get_mut().1;
-                    entry.data = DataType::String(value);
+                    Self::update_string_value(entry, value);
                     entry.persist();
                     entry.bump_version();
                     true
