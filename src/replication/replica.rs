@@ -10,6 +10,7 @@ use super::ReplicationManager;
 use super::rdb::load_rdb;
 use crate::config::ServerConfig;
 use crate::protocol::{Parser, RespValue};
+use crate::server_state::ServerState;
 use crate::storage::MultiStore;
 
 /// Stream type for replication connection
@@ -56,6 +57,7 @@ pub async fn connect_to_master(
     port: u16,
     tls_config: Option<Arc<ClientConfig>>,
     config: Arc<ServerConfig>,
+    server_state: Option<Arc<ServerState>>,
 ) -> Result<(), String> {
     let addr = format!("{}:{}", host, port);
 
@@ -189,6 +191,9 @@ pub async fn connect_to_master(
 
     // Mark as connected
     repl.master_link_status.store(true, Ordering::Relaxed);
+    if let Some(ref server) = server_state {
+        server.replication_connected.store(true, Ordering::Relaxed);
+    }
 
     // Configurable ACK interval (default: repl_ping_replica_period, typically 10s)
     let ack_period = config.repl_ping_replica_period.max(1);
@@ -230,6 +235,9 @@ pub async fn connect_to_master(
                     Ok(0) => {
                         // Connection closed
                         repl.master_link_status.store(false, Ordering::Relaxed);
+                        if let Some(ref server) = server_state {
+                            server.replication_connected.store(false, Ordering::Relaxed);
+                        }
                         break;
                     }
                     Ok(_n) => {
@@ -288,6 +296,9 @@ pub async fn connect_to_master(
                     }
                     Err(e) => {
                         repl.master_link_status.store(false, Ordering::Relaxed);
+                        if let Some(ref server) = server_state {
+                            server.replication_connected.store(false, Ordering::Relaxed);
+                        }
                         return Err(format!("Read error: {}", e));
                     }
                 }

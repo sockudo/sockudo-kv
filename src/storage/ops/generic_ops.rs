@@ -162,14 +162,20 @@ impl Store {
             DataType::VectorSet(vs) => {
                 let new_vs = VectorSetData {
                     dim: vs.dim,
+                    original_dim: vs.original_dim,
                     reduced_dim: vs.reduced_dim,
+                    projection_matrix: vs.projection_matrix.clone(),
                     quant: vs.quant,
+                    q8_stats: vs.q8_stats,
+                    packed_vectors: None, // Don't clone packed vectors - can be rebuilt
                     nodes: vs
                         .nodes
                         .iter()
                         .map(|n| crate::storage::types::VectorNode {
                             element: n.element.clone(),
                             vector: n.vector.clone(),
+                            norm: n.norm,
+                            inv_norm: n.inv_norm,
                             vector_q8: n.vector_q8.clone(),
                             vector_bin: n.vector_bin.clone(),
                             attributes: n.attributes.clone(),
@@ -660,8 +666,42 @@ impl Store {
             }
             DataType::TimeSeries(ts) => ts.memory_usage(),
             DataType::VectorSet(vs) => {
-                // VectorSet: HNSW graph
-                64 + vs.len() * (vs.dim * 4 + 64)
+                // VectorSet: HNSW graph structure + vectors + attributes
+                let base_size = 64; // VectorSetData struct overhead
+                let mut node_size = 0;
+                for node in &vs.nodes {
+                    // Vector data: dim * 4 bytes (f32)
+                    node_size += node.vector.len() * 4;
+                    // Element name
+                    node_size += node.element.len() + 24; // Bytes overhead
+                    // Q8 quantized vector if present
+                    if let Some(ref q8) = node.vector_q8 {
+                        node_size += q8.len();
+                    }
+                    // Binary quantized vector if present
+                    if let Some(ref bin) = node.vector_bin {
+                        node_size += bin.len() * 8;
+                    }
+                    // Attributes (JSON) if present
+                    if let Some(ref attr) = node.attributes {
+                        let attr_str = sonic_rs::to_string(attr.as_ref()).unwrap_or_default();
+                        node_size += attr_str.len() + 32;
+                    }
+                    // HNSW connections
+                    for conns in &node.connections {
+                        node_size += conns.len() * 4 + 24; // Vec overhead + u32 per connection
+                    }
+                    node_size += 64; // VectorNode struct overhead
+                }
+                // Element index (HashMap)
+                let index_size = vs.element_index.len() * 64;
+                // Projection matrix if present
+                let proj_size = vs
+                    .projection_matrix
+                    .as_ref()
+                    .map(|m| m.len() * 4)
+                    .unwrap_or(0);
+                base_size + node_size + index_size + proj_size
             }
             #[cfg(feature = "bloom")]
             DataType::BloomFilter(bf) => bf.size_bytes() + 32,

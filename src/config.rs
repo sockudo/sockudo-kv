@@ -293,6 +293,10 @@ pub struct ServerConfig {
     pub active_defrag_cycle_min: u32,
     pub active_defrag_cycle_max: u32,
     pub active_defrag_max_scan_fields: u32,
+
+    // --- Vector Set ---
+    /// Force single-threaded execution for vector set operations (default: no)
+    pub vset_force_single_threaded_execution: bool,
 }
 
 /// Get platform-appropriate default pidfile path
@@ -535,6 +539,9 @@ impl Default for ServerConfig {
             active_defrag_cycle_min: 1,
             active_defrag_cycle_max: 25,
             active_defrag_max_scan_fields: 1000,
+
+            // Vector Set
+            vset_force_single_threaded_execution: false,
         }
     }
 }

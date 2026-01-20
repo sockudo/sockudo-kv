@@ -28,6 +28,9 @@ pub mod timeseries_ops;
 #[cfg(feature = "vector")]
 pub mod vector_ops;
 
+#[cfg(feature = "vector")]
+pub mod simd_distance;
+
 // RedisBloom-like probabilistic data structures
 #[cfg(feature = "bloom")]
 pub mod bloom_ops;

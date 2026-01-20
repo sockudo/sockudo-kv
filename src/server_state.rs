@@ -534,10 +534,12 @@ pub struct ServerState {
     pub master_replid: RwLock<String>,
     pub master_replid2: RwLock<String>,
     pub master_repl_offset: AtomicU64,
+    pub slave_repl_offset: AtomicU64,
     pub second_repl_offset: AtomicU64,
     pub repl_backlog_size: AtomicU64,
     pub repl_backlog_off: AtomicU64,
     pub repl_backlog_histlen: AtomicU64,
+    pub replication_connected: AtomicBool,
 
     // === Blocking Commands ===
     /// Manager for blocked clients (BLPOP, BRPOP, etc.)
@@ -651,10 +653,12 @@ impl ServerState {
             master_replid: RwLock::new(generate_replid()),
             master_replid2: RwLock::new(String::from("0000000000000000000000000000000000000000")),
             master_repl_offset: AtomicU64::new(0),
+            slave_repl_offset: AtomicU64::new(0),
             second_repl_offset: AtomicU64::new(0),
             repl_backlog_size: AtomicU64::new(1024 * 1024), // 1MB default
             repl_backlog_off: AtomicU64::new(0),
             repl_backlog_histlen: AtomicU64::new(0),
+            replication_connected: AtomicBool::new(false),
 
             // Blocking commands
             blocking: crate::blocking::BlockingManager::new(),

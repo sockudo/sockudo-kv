@@ -576,6 +576,8 @@ fn resp_to_lua_value(lua: &Lua, resp: &RespValue, protected: bool) -> LuaResult<
             }
             Ok(Value::Table(table))
         }
+        RespValue::Boolean(b) => Ok(Value::Boolean(*b)),
+        RespValue::Double(d) => Ok(Value::Number(*d)),
     }
 }
 

@@ -2460,6 +2460,17 @@ pub static CONFIG_TABLE: &[ConfigEntry] = &[
         },
         applier: None,
     },
+    // === Vector Set ===
+    ConfigEntry {
+        name: "vset-force-single-threaded-execution",
+        alias: None,
+        flags: ConfigFlags::NONE,
+        config_type: ConfigType::Bool,
+        default_value: "no",
+        getter: bool_getter!(vset_force_single_threaded_execution),
+        setter: bool_setter!(vset_force_single_threaded_execution),
+        applier: None,
+    },
 ];
 
 /// Find a config entry by name or alias

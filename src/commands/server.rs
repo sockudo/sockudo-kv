@@ -2139,11 +2139,11 @@ fn cmd_replconf(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> 
 }
 
 fn cmd_replicaof(server: &Arc<ServerState>, args: &[Bytes]) -> Result<RespValue> {
-    if args.len() < 3 {
+    if args.len() < 2 {
         return Err(Error::WrongArity("REPLICAOF"));
     }
-    let host = std::str::from_utf8(&args[1]).map_err(|_| Error::Syntax)?;
-    let port_str = std::str::from_utf8(&args[2]).map_err(|_| Error::Syntax)?;
+    let host = std::str::from_utf8(&args[0]).map_err(|_| Error::Syntax)?;
+    let port_str = std::str::from_utf8(&args[1]).map_err(|_| Error::Syntax)?;
 
     if host.eq_ignore_ascii_case("NO") && port_str.eq_ignore_ascii_case("ONE") {
         *server.role.write() = Role::Master;
@@ -2280,14 +2280,19 @@ fn compute_key_digest(key: &[u8], entry: &crate::storage::Entry) -> [u8; 20] {
         s.finalize()
     };
 
-    // Value hash - use RDB serialization
-    let val_hash = {
-        let mut buf = Vec::new();
-        // Use RDB serialization.
-        crate::replication::rdb::write_value(&mut buf, None, &entry.data, true);
-        let mut s = Sha1Writer::new();
-        let _ = s.write(&buf);
-        s.finalize()
+    // Value hash - special handling for VectorSet (Redis-compatible)
+    // VectorSet digest only hashes vectors and elements, NOT the HNSW structure
+    // This ensures primary and replica have matching digests even with different graph structures
+    let val_hash = match &entry.data {
+        crate::storage::DataType::VectorSet(vs) => compute_vectorset_digest(vs),
+        _ => {
+            // For other types, use RDB serialization
+            let mut buf = Vec::new();
+            crate::replication::rdb::write_value(&mut buf, None, &entry.data, true);
+            let mut s = Sha1Writer::new();
+            let _ = s.write(&buf);
+            s.finalize()
+        }
     };
 
     // Combine hashes.
@@ -2307,6 +2312,55 @@ fn compute_key_digest(key: &[u8], entry: &crate::storage::Entry) -> [u8; 20] {
     }
 
     digest
+}
+
+/// Compute digest for VectorSet - Redis-compatible approach
+/// Only hashes vectors, elements, and attributes - NOT the HNSW graph structure (levels, connections)
+/// This ensures primary and replica have matching digests even with different random levels
+fn compute_vectorset_digest(vs: &crate::storage::VectorSetData) -> [u8; 20] {
+    let mut final_digest = [0u8; 20];
+
+    // Hash dimension and node count
+    {
+        let mut s = Sha1Writer::new();
+        let _ = s.write(&vs.dim.to_le_bytes());
+        let _ = s.write(&vs.nodes.len().to_le_bytes());
+        // Include quantization type
+        let _ = s.write(&[vs.quant as u8]);
+        let d = s.finalize();
+        for i in 0..20 {
+            final_digest[i] ^= d[i];
+        }
+    }
+
+    // Hash each node's data (element, vector, attributes) - but NOT level or connections
+    // Use XOR for order-independent combining (like Redis's DigestEndSequence)
+    for node in &vs.nodes {
+        let mut s = Sha1Writer::new();
+
+        // Hash element name
+        let _ = s.write(&node.element);
+
+        // Hash vector components
+        for &v in &node.vector {
+            let _ = s.write(&v.to_le_bytes());
+        }
+
+        // Hash attributes if present
+        if let Some(attrs) = &node.attributes {
+            let json_str = sonic_rs::to_string(attrs.as_ref()).unwrap_or_default();
+            let _ = s.write(json_str.as_bytes());
+        }
+
+        let node_hash = s.finalize();
+
+        // XOR combine for order-independent result
+        for i in 0..20 {
+            final_digest[i] ^= node_hash[i];
+        }
+    }
+
+    final_digest
 }
 
 #[cfg(test)]

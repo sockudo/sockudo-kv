@@ -692,6 +692,7 @@ sockudo-kv v7.0.0 - High-performance Redis-compatible server
         let host = master_host.clone();
         let port = *master_port;
         let config_clone = config.clone();
+        let server_state_clone = server_state.clone();
 
         let tls_config = if config.tls_replication {
             match sockudo_kv::tls::load_client_tls_config(
@@ -719,6 +720,7 @@ sockudo-kv v7.0.0 - High-performance Redis-compatible server
                     port,
                     tls_config.clone(),
                     config_clone.clone(),
+                    Some(server_state_clone.clone()),
                 )
                 .await
                 {
@@ -1123,6 +1125,12 @@ where
                                 } else if is_connection_command(cmd_name) {
                                     match connection::execute(client, clients, server_state, cmd_name, &cmd.args) {
                                         Ok(ConnectionResult::Response(response)) => {
+                                            // Propagate SELECT for replication
+                                            if cmd.is_command(b"SELECT") && !matches!(response, sockudo_kv::protocol::RespValue::Error(_)) {
+                                                let mut parts = vec![bytes::Bytes::from_static(b"SELECT")];
+                                                parts.extend(cmd.args.iter().cloned());
+                                                replication.propagate(&parts);
+                                            }
                                             if client.should_reply() {
                                                 write_response(&mut write_buf, &response, client);
                                             }

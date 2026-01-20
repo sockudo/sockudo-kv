@@ -1129,6 +1129,10 @@ pub struct VectorNode {
     pub element: Bytes,
     /// Vector data (stored as f32 for SIMD efficiency)
     pub vector: Vec<f32>,
+    /// Precomputed L2 norm of the vector (for fast cosine distance)
+    pub norm: f32,
+    /// Precomputed 1/norm (for fast normalization in cosine distance)
+    pub inv_norm: f32,
     /// Quantized vector for Q8 (optional)
     pub vector_q8: Option<Vec<i8>>,
     /// Binary quantized vector (optional)
@@ -1143,6 +1147,11 @@ pub struct VectorNode {
 
 impl VectorNode {
     pub fn new(element: Bytes, vector: Vec<f32>, level: u8, quant: VectorQuantization) -> Self {
+        // Compute norm using SIMD-optimized sum of squares
+        let sum_sq: f32 = vector.iter().map(|&x| x * x).sum();
+        let norm = sum_sq.sqrt();
+        let inv_norm = if norm > 1e-10 { 1.0 / norm } else { 0.0 };
+
         let vector_q8 = if quant == VectorQuantization::Q8 {
             Some(Self::quantize_q8(&vector))
         } else {
@@ -1158,12 +1167,53 @@ impl VectorNode {
         Self {
             element,
             vector,
+            norm,
+            inv_norm,
             vector_q8,
             vector_bin,
             attributes: None,
             connections: vec![Vec::new(); level as usize + 1],
             level,
         }
+    }
+
+    /// Update vector and recompute norm (called when vector is modified)
+    #[inline]
+    pub fn update_vector(&mut self, new_vector: Vec<f32>) {
+        let sum_sq: f32 = new_vector.iter().map(|&x| x * x).sum();
+        self.norm = sum_sq.sqrt();
+        self.inv_norm = if self.norm > 1e-10 {
+            1.0 / self.norm
+        } else {
+            0.0
+        };
+        self.vector = new_vector;
+    }
+
+    /// Update vector with Q8 quantization using global stats
+    #[inline]
+    pub fn update_vector_with_q8(&mut self, new_vector: Vec<f32>, stats: &Q8GlobalStats) {
+        let sum_sq: f32 = new_vector.iter().map(|&x| x * x).sum();
+        self.norm = sum_sq.sqrt();
+        self.inv_norm = if self.norm > 1e-10 {
+            1.0 / self.norm
+        } else {
+            0.0
+        };
+        self.vector_q8 = Some(stats.quantize(&new_vector));
+        self.vector = new_vector;
+    }
+
+    /// Check if this is a zero/near-zero vector
+    #[inline]
+    pub fn is_zero_vector(&self) -> bool {
+        self.norm < 1e-10
+    }
+
+    /// Quantize vector using global stats (for Q8 mode)
+    #[inline]
+    pub fn quantize_with_global_stats(&mut self, stats: &Q8GlobalStats) {
+        self.vector_q8 = Some(stats.quantize(&self.vector));
     }
 
     /// Quantize to 8-bit signed integers
@@ -1200,15 +1250,230 @@ impl VectorNode {
     }
 }
 
+/// Global Q8 quantization statistics for consistent quantization across all vectors
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Q8GlobalStats {
+    /// Global minimum value across all vectors
+    pub min: f32,
+    /// Global maximum value across all vectors
+    pub max: f32,
+    /// Precomputed scale factor: 255.0 / (max - min)
+    pub scale: f32,
+    /// Precomputed inverse scale: (max - min) / 255.0
+    pub inv_scale: f32,
+    /// Number of vectors used to compute statistics
+    pub sample_count: u32,
+    /// Whether statistics need recalculation (after many updates)
+    pub needs_recalc: bool,
+}
+
+impl Q8GlobalStats {
+    /// Create new stats from initial vector
+    pub fn from_vector(vector: &[f32]) -> Self {
+        let (min, max) = vector
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), &v| {
+                (min.min(v), max.max(v))
+            });
+        let range = max - min;
+        let scale = if range.abs() < 1e-10 {
+            1.0
+        } else {
+            255.0 / range
+        };
+        let inv_scale = if range.abs() < 1e-10 {
+            0.0
+        } else {
+            range / 255.0
+        };
+
+        Self {
+            min,
+            max,
+            scale,
+            inv_scale,
+            sample_count: 1,
+            needs_recalc: false,
+        }
+    }
+
+    /// Update statistics with a new vector (running min/max)
+    pub fn update(&mut self, vector: &[f32]) {
+        let (v_min, v_max) = vector
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), &v| {
+                (min.min(v), max.max(v))
+            });
+
+        let changed = v_min < self.min || v_max > self.max;
+        if changed {
+            self.min = self.min.min(v_min);
+            self.max = self.max.max(v_max);
+            let range = self.max - self.min;
+            self.scale = if range.abs() < 1e-10 {
+                1.0
+            } else {
+                255.0 / range
+            };
+            self.inv_scale = if range.abs() < 1e-10 {
+                0.0
+            } else {
+                range / 255.0
+            };
+            // Mark that existing vectors may need re-quantization
+            self.needs_recalc = self.sample_count > 1;
+        }
+        self.sample_count += 1;
+    }
+
+    /// Quantize a vector using global statistics
+    #[inline]
+    pub fn quantize(&self, vector: &[f32]) -> Vec<i8> {
+        vector
+            .iter()
+            .map(|&v| ((v - self.min) * self.scale - 128.0).clamp(-128.0, 127.0) as i8)
+            .collect()
+    }
+
+    /// Dequantize a Q8 vector back to f32
+    #[inline]
+    pub fn dequantize(&self, q8: &[i8]) -> Vec<f32> {
+        q8.iter()
+            .map(|&v| (v as f32 + 128.0) * self.inv_scale + self.min)
+            .collect()
+    }
+}
+
+/// Cache-efficient packed vector storage
+/// Stores all vectors contiguously in memory for better cache locality during distance computations
+#[derive(Debug, Default)]
+pub struct PackedVectors {
+    /// Contiguous storage for all vector data: [v0_d0, v0_d1, ..., v0_dn, v1_d0, ...]
+    pub data: Vec<f32>,
+    /// Contiguous storage for precomputed norms: [norm0, norm1, ...]
+    pub norms: Vec<f32>,
+    /// Contiguous storage for inverse norms: [inv_norm0, inv_norm1, ...]
+    pub inv_norms: Vec<f32>,
+    /// Number of vectors stored
+    pub count: usize,
+    /// Dimension of each vector
+    pub dim: usize,
+}
+
+impl PackedVectors {
+    /// Create new packed storage with given dimension
+    pub fn new(dim: usize) -> Self {
+        Self {
+            data: Vec::new(),
+            norms: Vec::new(),
+            inv_norms: Vec::new(),
+            count: 0,
+            dim,
+        }
+    }
+
+    /// Create with pre-allocated capacity
+    pub fn with_capacity(dim: usize, capacity: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(dim * capacity),
+            norms: Vec::with_capacity(capacity),
+            inv_norms: Vec::with_capacity(capacity),
+            count: 0,
+            dim,
+        }
+    }
+
+    /// Add a vector and return its index
+    #[inline]
+    pub fn push(&mut self, vector: &[f32]) -> usize {
+        debug_assert_eq!(vector.len(), self.dim);
+        let idx = self.count;
+        self.data.extend_from_slice(vector);
+
+        // Compute and store norm
+        let sum_sq: f32 = vector.iter().map(|&x| x * x).sum();
+        let norm = sum_sq.sqrt();
+        let inv_norm = if norm > 1e-10 { 1.0 / norm } else { 0.0 };
+        self.norms.push(norm);
+        self.inv_norms.push(inv_norm);
+
+        self.count += 1;
+        idx
+    }
+
+    /// Get vector slice by index (cache-friendly access)
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<&[f32]> {
+        if idx >= self.count {
+            return None;
+        }
+        let start = idx * self.dim;
+        let end = start + self.dim;
+        Some(&self.data[start..end])
+    }
+
+    /// Get norm by index
+    #[inline]
+    pub fn get_norm(&self, idx: usize) -> Option<f32> {
+        self.norms.get(idx).copied()
+    }
+
+    /// Get inverse norm by index
+    #[inline]
+    pub fn get_inv_norm(&self, idx: usize) -> Option<f32> {
+        self.inv_norms.get(idx).copied()
+    }
+
+    /// Update vector at index
+    #[inline]
+    pub fn update(&mut self, idx: usize, vector: &[f32]) {
+        debug_assert!(idx < self.count);
+        debug_assert_eq!(vector.len(), self.dim);
+        let start = idx * self.dim;
+        self.data[start..start + self.dim].copy_from_slice(vector);
+
+        // Recompute norm
+        let sum_sq: f32 = vector.iter().map(|&x| x * x).sum();
+        let norm = sum_sq.sqrt();
+        self.norms[idx] = norm;
+        self.inv_norms[idx] = if norm > 1e-10 { 1.0 / norm } else { 0.0 };
+    }
+
+    /// Get multiple vectors for batch processing (very cache-friendly)
+    #[inline]
+    pub fn get_batch(&self, indices: &[usize]) -> Vec<&[f32]> {
+        indices.iter().filter_map(|&idx| self.get(idx)).collect()
+    }
+
+    /// Prefetch vector data for upcoming access (hint to CPU cache)
+    #[inline]
+    pub fn prefetch(&self, idx: usize) {
+        if idx < self.count {
+            let start = idx * self.dim;
+            // Touch the memory to bring it into cache
+            let _ = self.data.get(start);
+        }
+    }
+}
+
 /// HNSW-based vector set for similarity search
 #[derive(Debug)]
 pub struct VectorSetData {
-    /// Vector dimension
+    /// Vector dimension (after projection if REDUCE was used)
     pub dim: usize,
+    /// Original dimension before projection (for VSIM query projection)
+    pub original_dim: Option<usize>,
     /// Reduced dimension for queries (optional PCA/random projection)
     pub reduced_dim: Option<usize>,
+    /// Random projection matrix for dimension reduction (original_dim x reduced_dim)
+    /// Stored as flattened row-major: projection[i * reduced_dim + j] = matrix[i][j]
+    pub projection_matrix: Option<Vec<f32>>,
     /// Quantization type
     pub quant: VectorQuantization,
+    /// Global Q8 quantization statistics (for consistent quantization)
+    pub q8_stats: Option<Q8GlobalStats>,
+    /// Cache-efficient packed vector storage (optional, used for large vector sets)
+    pub packed_vectors: Option<PackedVectors>,
     /// All nodes indexed by internal ID
     pub nodes: Vec<VectorNode>,
     /// Element name -> node index mapping for O(1) lookup
@@ -1243,8 +1508,12 @@ impl VectorSetData {
         let m = Self::DEFAULT_M;
         Self {
             dim,
+            original_dim: None,
             reduced_dim: None,
+            projection_matrix: None,
             quant: VectorQuantization::NoQuant,
+            q8_stats: None,
+            packed_vectors: None, // Enable lazily when beneficial
             nodes: Vec::new(),
             element_index: std::collections::HashMap::new(),
             entry_point: None,
@@ -1256,6 +1525,65 @@ impl VectorSetData {
         }
     }
 
+    /// Create a new VectorSetData with dimension reduction using random projection
+    pub fn with_reduction(original_dim: usize, reduced_dim: usize) -> Self {
+        let m = Self::DEFAULT_M;
+
+        // Generate random projection matrix using Gaussian random projection
+        // Each element is sampled from N(0, 1/reduced_dim) for approximate norm preservation
+        let scale = 1.0 / (reduced_dim as f32).sqrt();
+        let matrix_size = original_dim * reduced_dim;
+        let mut projection_matrix = Vec::with_capacity(matrix_size);
+
+        for _ in 0..matrix_size {
+            // Box-Muller transform for Gaussian random numbers
+            let u1 = fastrand::f32();
+            let u2 = fastrand::f32();
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+            projection_matrix.push(z * scale);
+        }
+
+        Self {
+            dim: reduced_dim,
+            original_dim: Some(original_dim),
+            reduced_dim: Some(reduced_dim),
+            projection_matrix: Some(projection_matrix),
+            quant: VectorQuantization::NoQuant,
+            q8_stats: None,
+            packed_vectors: None,
+            nodes: Vec::new(),
+            element_index: std::collections::HashMap::new(),
+            entry_point: None,
+            max_level: 0,
+            m,
+            m0: m * 2,
+            ef_construction: Self::DEFAULT_EF_CONSTRUCTION,
+            level_mult: 1.0 / (m as f64).ln(),
+        }
+    }
+
+    /// Project a vector using the random projection matrix
+    #[inline]
+    pub fn project_vector(&self, vector: &[f32]) -> Option<Vec<f32>> {
+        let matrix = self.projection_matrix.as_ref()?;
+        let original_dim = self.original_dim?;
+        let reduced_dim = self.dim;
+
+        if vector.len() != original_dim {
+            return None;
+        }
+
+        let mut result = vec![0.0f32; reduced_dim];
+        for j in 0..reduced_dim {
+            let mut sum = 0.0f32;
+            for i in 0..original_dim {
+                sum += vector[i] * matrix[i * reduced_dim + j];
+            }
+            result[j] = sum;
+        }
+        Some(result)
+    }
+
     pub fn with_options(
         dim: usize,
         m: usize,
@@ -1265,8 +1593,12 @@ impl VectorSetData {
         let m = m.clamp(2, 128); // Clamp M to reasonable range
         Self {
             dim,
+            original_dim: None,
             reduced_dim: None,
+            projection_matrix: None,
             quant,
+            q8_stats: None,
+            packed_vectors: None,
             nodes: Vec::new(),
             element_index: std::collections::HashMap::new(),
             entry_point: None,
@@ -1351,7 +1683,7 @@ impl VectorSetData {
         false
     }
 
-    /// Get all elements in lexicographical order within range
+    /// Get all elements in lexicographical order within range (simple version)
     pub fn range(&self, start: &[u8], end: &[u8], count: Option<usize>) -> Vec<Bytes> {
         let mut elements: Vec<Bytes> = self
             .element_index
@@ -1359,6 +1691,77 @@ impl VectorSetData {
             .filter(|e| {
                 let e_slice = e.as_ref();
                 (start.is_empty() || e_slice >= start) && (end.is_empty() || e_slice <= end)
+            })
+            .cloned()
+            .collect();
+
+        elements.sort();
+
+        if let Some(n) = count {
+            elements.truncate(n);
+        }
+
+        elements
+    }
+
+    /// Get elements in lexicographical range with Redis-style bounds
+    /// Supports: [value (inclusive), (value (exclusive), - (min), + (max)
+    pub fn lex_range(&self, start: &[u8], end: &[u8], count: Option<usize>) -> Vec<Bytes> {
+        // Parse start bound
+        let (start_val, start_inclusive) = if start == b"-" {
+            (None, true) // Minimum
+        } else if start.starts_with(b"[") {
+            (Some(&start[1..]), true) // Inclusive
+        } else if start.starts_with(b"(") {
+            (Some(&start[1..]), false) // Exclusive
+        } else {
+            // Default: treat as inclusive
+            (Some(start), true)
+        };
+
+        // Parse end bound
+        let (end_val, end_inclusive) = if end == b"+" {
+            (None, true) // Maximum
+        } else if end.starts_with(b"[") {
+            (Some(&end[1..]), true) // Inclusive
+        } else if end.starts_with(b"(") {
+            (Some(&end[1..]), false) // Exclusive
+        } else {
+            // Default: treat as inclusive
+            (Some(end), true)
+        };
+
+        let mut elements: Vec<Bytes> = self
+            .element_index
+            .keys()
+            .filter(|e| {
+                let e_slice = e.as_ref();
+
+                // Check start bound
+                let start_ok = match start_val {
+                    None => true,
+                    Some(s) => {
+                        if start_inclusive {
+                            e_slice >= s
+                        } else {
+                            e_slice > s
+                        }
+                    }
+                };
+
+                // Check end bound
+                let end_ok = match end_val {
+                    None => true,
+                    Some(e) => {
+                        if end_inclusive {
+                            e_slice <= e
+                        } else {
+                            e_slice < e
+                        }
+                    }
+                };
+
+                start_ok && end_ok
             })
             .cloned()
             .collect();

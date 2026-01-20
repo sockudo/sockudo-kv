@@ -503,7 +503,7 @@ impl Dispatcher {
             // Vector commands
             #[cfg(feature = "vector")]
             if !cmd_name.is_empty() && (cmd_name[0] == b'V' || cmd_name[0] == b'v') {
-                match vector::execute(store, cmd_name, args) {
+                match vector::execute(store, cmd_name, args, client) {
                     Ok(resp) => return Ok(resp),
                     Err(Error::UnknownCommand(_)) => {}
                     Err(e) => return Err(e),
@@ -576,6 +576,16 @@ impl Dispatcher {
                         {
                             // Hash commands handle their own propagation in hash.rs
                             // Skip standard propagation to avoid double propagation
+                        } else if cmd.is_command(b"VADD") {
+                            // VADD needs special propagation with _LEVEL for deterministic replication
+                            // The level is stored in the response's internal state - we need to propagate
+                            // with the level that was assigned on the primary
+                            // For now, we propagate verbatim and rely on RDB sync for consistency
+                            // TODO: Implement _LEVEL propagation for real-time replication consistency
+                            let mut parts = Vec::with_capacity(1 + args.len());
+                            parts.push(Bytes::copy_from_slice(cmd.name()));
+                            parts.extend_from_slice(args);
+                            repl.propagate(&parts);
                         } else if cmd.is_command(b"SPOP") {
                             // SPOP handles its own propagation in set.rs
                             // When key is deleted, it propagates DEL or UNLINK instead
@@ -853,7 +863,52 @@ fn cmd_info(store: &Store, args: &[Bytes], server: Option<&Arc<ServerState>>) ->
         if !info.is_empty() && !info.ends_with("\r\n\r\n") {
             info.push_str("\r\n");
         }
-        info.push_str("# Replication\r\nrole:master\r\nconnected_slaves:0\r\n");
+        info.push_str("# Replication\r\n");
+
+        if let Some(srv) = server {
+            let role = *srv.role.read();
+            match role {
+                crate::server_state::Role::Master => {
+                    info.push_str("role:master\r\n");
+                    info.push_str("connected_slaves:0\r\n");
+                    let offset = srv
+                        .master_repl_offset
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    info.push_str(&format!("master_replid:{}\r\n", srv.master_replid.read()));
+                    info.push_str(&format!("master_repl_offset:{}\r\n", offset));
+                }
+                crate::server_state::Role::Slave => {
+                    info.push_str("role:slave\r\n");
+                    let master_host = srv.master_host.read();
+                    let master_port = srv.master_port.load(std::sync::atomic::Ordering::Relaxed);
+                    info.push_str(&format!(
+                        "master_host:{}\r\n",
+                        master_host.as_deref().unwrap_or("none")
+                    ));
+                    info.push_str(&format!("master_port:{}\r\n", master_port));
+                    // Check if replication link is up
+                    let link_status = if srv
+                        .replication_connected
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        "up"
+                    } else {
+                        "down"
+                    };
+                    info.push_str(&format!("master_link_status:{}\r\n", link_status));
+                    info.push_str("master_last_io_seconds_ago:0\r\n");
+                    info.push_str("master_sync_in_progress:0\r\n");
+                    let offset = srv
+                        .slave_repl_offset
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    info.push_str(&format!("slave_repl_offset:{}\r\n", offset));
+                    info.push_str("slave_priority:100\r\n");
+                    info.push_str("slave_read_only:1\r\n");
+                }
+            }
+        } else {
+            info.push_str("role:master\r\nconnected_slaves:0\r\n");
+        }
     }
 
     if section.eq_ignore_ascii_case(b"clients") || is_all || is_default {
@@ -1038,7 +1093,7 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "READONLY",
     "READWRITE",
     "ASKING",
-    "SELECT",
+    // Note: SELECT is NOT in this list - it must be propagated for replication
     "SUBSCRIBE",
     "PSUBSCRIBE",
     "UNSUBSCRIBE",
@@ -1060,6 +1115,85 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "SLOWLOG",
     "SWAPDB",
     "INFO",
+    // Vector read-only commands
+    "VCARD",
+    "VDIM",
+    "VEMB",
+    "VGETATTR",
+    "VINFO",
+    "VISMEMBER",
+    "VLINKS",
+    "VRANDMEMBER",
+    "VRANGE",
+    "VSIM",
+    // JSON read-only commands
+    "JSON.GET",
+    "JSON.MGET",
+    "JSON.TYPE",
+    "JSON.STRLEN",
+    "JSON.ARRLEN",
+    "JSON.ARRINDEX",
+    "JSON.OBJKEYS",
+    "JSON.OBJLEN",
+    "JSON.NUMINCRBY",
+    "JSON.DEBUG",
+    "JSON.RESP",
+    // TimeSeries read-only commands
+    "TS.GET",
+    "TS.MGET",
+    "TS.INFO",
+    "TS.QUERYINDEX",
+    "TS.RANGE",
+    "TS.REVRANGE",
+    "TS.MRANGE",
+    "TS.MREVRANGE",
+    // Search read-only commands
+    "FT.SEARCH",
+    "FT.AGGREGATE",
+    "FT.INFO",
+    "FT.EXPLAIN",
+    "FT.EXPLAINCLI",
+    "FT.PROFILE",
+    "FT.TAGVALS",
+    "FT.SUGGET",
+    "FT.SUGLEN",
+    "FT.SYNDUMP",
+    "FT.SPELLCHECK",
+    "FT.DICTDUMP",
+    "FT._LIST",
+    // Bloom filter read-only commands
+    "BF.EXISTS",
+    "BF.MEXISTS",
+    "BF.INFO",
+    "BF.SCANDUMP",
+    "BF.CARD",
+    // Cuckoo filter read-only commands
+    "CF.EXISTS",
+    "CF.MEXISTS",
+    "CF.COUNT",
+    "CF.INFO",
+    "CF.SCANDUMP",
+    // TDigest read-only commands
+    "TDIGEST.MIN",
+    "TDIGEST.MAX",
+    "TDIGEST.QUANTILE",
+    "TDIGEST.CDF",
+    "TDIGEST.TRIMMED_MEAN",
+    "TDIGEST.RANK",
+    "TDIGEST.REVRANK",
+    "TDIGEST.BYRANK",
+    "TDIGEST.BYREVRANK",
+    "TDIGEST.INFO",
+    // TopK read-only commands
+    "TOPK.QUERY",
+    "TOPK.COUNT",
+    "TOPK.LIST",
+    "TOPK.INFO",
+    // Count-Min Sketch read-only commands
+    "CMS.QUERY",
+    "CMS.INFO",
+    // Script read-only
+    "SCRIPT",
 ];
 
 /// Check if a command is a write command (used for cluster read/write checks and replication)

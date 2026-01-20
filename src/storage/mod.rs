@@ -57,8 +57,8 @@ pub use store::{EncodingConfig, Store};
 // Re-export commonly used types
 pub use types::{
     Aggregation, CompactionRule, Consumer, ConsumerGroup, DataType, DuplicatePolicy, Entry,
-    HyperLogLogData, PendingEntry, SortedSetData, StreamData, StreamId, TimeSeriesInfo, VectorNode,
-    VectorQuantization, VectorSetData,
+    HyperLogLogData, PackedVectors, PendingEntry, Q8GlobalStats, SortedSetData, StreamData,
+    StreamId, TimeSeriesInfo, VectorNode, VectorQuantization, VectorSetData,
 };
 pub use value::{allow_access_expired, now_ms, set_allow_access_expired};
 

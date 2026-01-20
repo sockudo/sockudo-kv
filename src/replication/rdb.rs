@@ -625,11 +625,26 @@ fn write_timeseries(rdb: &mut Vec<u8>, ts: &crate::storage::timeseries::TimeSeri
 
 /// Write VectorSet data structure
 fn write_vectorset(rdb: &mut Vec<u8>, vs: &crate::storage::VectorSetData) {
-    // Version marker
-    rdb.push(1);
+    // Version marker - version 4 adds q8_stats for global quantization
+    // Version 3 removes element_index serialization (Redis-compatible approach)
+    // The element_index is reconstructed from nodes during deserialization for deterministic digests
+    rdb.push(4);
 
     // Write configuration
     write_length(rdb, vs.dim);
+
+    // Write original_dim (for dimension reduction)
+    match vs.original_dim {
+        Some(d) => {
+            rdb.push(1);
+            write_length(rdb, d);
+        }
+        None => {
+            rdb.push(0);
+        }
+    }
+
+    // Write reduced_dim
     match vs.reduced_dim {
         Some(d) => {
             rdb.push(1);
@@ -639,7 +654,38 @@ fn write_vectorset(rdb: &mut Vec<u8>, vs: &crate::storage::VectorSetData) {
             rdb.push(0);
         }
     }
+
+    // Write projection_matrix
+    match &vs.projection_matrix {
+        Some(matrix) => {
+            rdb.push(1);
+            write_length(rdb, matrix.len());
+            for &v in matrix {
+                rdb.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        None => {
+            rdb.push(0);
+        }
+    }
+
     rdb.push(vs.quant as u8);
+
+    // Write Q8 global stats (version 4+)
+    match &vs.q8_stats {
+        Some(stats) => {
+            rdb.push(1);
+            rdb.extend_from_slice(&stats.min.to_le_bytes());
+            rdb.extend_from_slice(&stats.max.to_le_bytes());
+            rdb.extend_from_slice(&stats.scale.to_le_bytes());
+            rdb.extend_from_slice(&stats.inv_scale.to_le_bytes());
+            rdb.extend_from_slice(&stats.sample_count.to_le_bytes());
+        }
+        None => {
+            rdb.push(0);
+        }
+    }
+
     write_length(rdb, vs.m);
     write_length(rdb, vs.m0);
     write_length(rdb, vs.ef_construction);
@@ -694,12 +740,9 @@ fn write_vectorset(rdb: &mut Vec<u8>, vs: &crate::storage::VectorSetData) {
         }
     }
 
-    // Write element_index for quick reconstruction
-    write_length(rdb, vs.element_index.len());
-    for (name, &idx) in &vs.element_index {
-        write_string(rdb, name);
-        rdb.extend_from_slice(&idx.to_le_bytes());
-    }
+    // Note: element_index is NOT serialized in version 3+
+    // It is reconstructed from nodes during deserialization (Redis-compatible approach)
+    // This ensures deterministic serialization for digest matching between primary and replica
 }
 
 // ==================== RDB Loading ====================
@@ -1652,13 +1695,31 @@ fn read_vectorset(data: &[u8]) -> Result<(VectorSetData, usize), String> {
     }
     let version = data[cursor];
     cursor += 1;
-    if version != 1 {
+    if version != 1 && version != 2 && version != 3 && version != 4 {
         return Err(format!("Unknown vectorset version: {}", version));
     }
 
     // Read configuration
     let (dim, dlen) = read_length(&data[cursor..])?;
     cursor += dlen;
+
+    // Read original_dim (version 2+, including version 3)
+    let original_dim = if version >= 2 {
+        if cursor >= data.len() {
+            return Err("Truncated vectorset original_dim marker".to_string());
+        }
+        let has_original_dim = data[cursor];
+        cursor += 1;
+        if has_original_dim == 1 {
+            let (od, odlen) = read_length(&data[cursor..])?;
+            cursor += odlen;
+            Some(od)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Read reduced_dim
     if cursor >= data.len() {
@@ -1674,6 +1735,33 @@ fn read_vectorset(data: &[u8]) -> Result<(VectorSetData, usize), String> {
         None
     };
 
+    // Read projection_matrix (version 2+, including version 3)
+    let projection_matrix = if version >= 2 {
+        if cursor >= data.len() {
+            return Err("Truncated vectorset projection_matrix marker".to_string());
+        }
+        let has_projection = data[cursor];
+        cursor += 1;
+        if has_projection == 1 {
+            let (matrix_len, mlen) = read_length(&data[cursor..])?;
+            cursor += mlen;
+            let mut matrix = Vec::with_capacity(matrix_len);
+            for _ in 0..matrix_len {
+                if cursor + 4 > data.len() {
+                    return Err("Truncated vectorset projection_matrix element".to_string());
+                }
+                let v = f32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+                cursor += 4;
+                matrix.push(v);
+            }
+            Some(matrix)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Read quant
     if cursor >= data.len() {
         return Err("Truncated vectorset quant".to_string());
@@ -1685,6 +1773,42 @@ fn read_vectorset(data: &[u8]) -> Result<(VectorSetData, usize), String> {
         1 => VectorQuantization::Q8,
         2 => VectorQuantization::Binary,
         _ => VectorQuantization::NoQuant,
+    };
+
+    // Read Q8 global stats (version 4+)
+    let q8_stats = if version >= 4 {
+        if cursor >= data.len() {
+            return Err("Truncated vectorset q8_stats marker".to_string());
+        }
+        let has_q8_stats = data[cursor];
+        cursor += 1;
+        if has_q8_stats == 1 {
+            if cursor + 20 > data.len() {
+                return Err("Truncated vectorset q8_stats data".to_string());
+            }
+            let min = f32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            let max = f32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            let scale = f32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            let inv_scale = f32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            let sample_count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            Some(crate::storage::Q8GlobalStats {
+                min,
+                max,
+                scale,
+                inv_scale,
+                sample_count,
+                needs_recalc: false,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
     // Read m, m0, ef_construction
@@ -1729,8 +1853,12 @@ fn read_vectorset(data: &[u8]) -> Result<(VectorSetData, usize), String> {
     // Create VectorSetData
     let mut vs = VectorSetData {
         dim,
+        original_dim,
         reduced_dim,
+        projection_matrix,
         quant,
+        q8_stats,
+        packed_vectors: None, // Rebuilt on demand
         nodes: Vec::new(),
         element_index: std::collections::HashMap::new(),
         entry_point,
@@ -1809,10 +1937,17 @@ fn read_vectorset(data: &[u8]) -> Result<(VectorSetData, usize), String> {
             None
         };
 
+        // Compute norm for the vector (precomputed for SIMD-optimized distance calculations)
+        let sum_sq: f32 = vector.iter().map(|&x| x * x).sum();
+        let norm = sum_sq.sqrt();
+        let inv_norm = if norm > 1e-10 { 1.0 / norm } else { 0.0 };
+
         // Create VectorNode
         let node = VectorNode {
             element: element.clone(),
             vector,
+            norm,
+            inv_norm,
             vector_q8: None,  // Will be regenerated if needed
             vector_bin: None, // Will be regenerated if needed
             attributes,
@@ -1820,25 +1955,34 @@ fn read_vectorset(data: &[u8]) -> Result<(VectorSetData, usize), String> {
             level,
         };
 
+        // Build element_index as we add nodes (Redis-compatible approach for version 3)
+        let node_idx = vs.nodes.len() as u32;
+        vs.element_index.insert(element, node_idx);
         vs.nodes.push(node);
     }
 
-    // Read element_index
-    let (index_count, ilen) = read_length(&data[cursor..])?;
-    cursor += ilen;
+    // Read element_index (only for version 1 and 2 - version 3 reconstructs from nodes above)
+    if version <= 2 {
+        let (index_count, ilen) = read_length(&data[cursor..])?;
+        cursor += ilen;
 
-    for _ in 0..index_count {
-        let (name, nlen) = read_string(&data[cursor..])?;
-        cursor += nlen;
+        // Clear the element_index we built above and use the serialized one for v1/v2
+        vs.element_index.clear();
 
-        if cursor + 4 > data.len() {
-            return Err("Truncated vectorset element_index value".to_string());
+        for _ in 0..index_count {
+            let (name, nlen) = read_string(&data[cursor..])?;
+            cursor += nlen;
+
+            if cursor + 4 > data.len() {
+                return Err("Truncated vectorset element_index value".to_string());
+            }
+            let idx = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+
+            vs.element_index.insert(name, idx);
         }
-        let idx = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
-        cursor += 4;
-
-        vs.element_index.insert(name, idx);
     }
+    // For version 3, element_index was already reconstructed from nodes above
 
     Ok((vs, cursor))
 }

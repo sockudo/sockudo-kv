@@ -20,6 +20,10 @@ pub enum RespValue {
     Array(Vec<RespValue>),
     /// RESP3 Map: %2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n$3\r\nbaz\r\n$4\r\nqux\r\n
     Map(Vec<(RespValue, RespValue)>),
+    /// RESP3 Boolean: #t\r\n or #f\r\n (falls back to integer 1/0 in RESP2)
+    Boolean(bool),
+    /// RESP3 Double: ,3.14159\r\n (falls back to bulk string in RESP2)
+    Double(f64),
 }
 
 impl RespValue {
@@ -72,6 +76,18 @@ impl RespValue {
     #[inline]
     pub fn map(pairs: Vec<(RespValue, RespValue)>) -> Self {
         Self::Map(pairs)
+    }
+
+    /// Create a RESP3 boolean (falls back to integer in RESP2)
+    #[inline]
+    pub fn boolean(b: bool) -> Self {
+        Self::Boolean(b)
+    }
+
+    /// Create a RESP3 double (falls back to bulk string in RESP2)
+    #[inline]
+    pub fn double(d: f64) -> Self {
+        Self::Double(d)
     }
 
     /// Serialize to RESP wire format (RESP2)
@@ -170,6 +186,40 @@ impl RespValue {
                         key.write_to_protocol(buf, protocol);
                         value.write_to_protocol(buf, protocol);
                     }
+                }
+            }
+            RespValue::Boolean(b) => {
+                if protocol >= 3 {
+                    // RESP3 boolean format: #t\r\n or #f\r\n
+                    if *b {
+                        buf.extend_from_slice(b"#t\r\n");
+                    } else {
+                        buf.extend_from_slice(b"#f\r\n");
+                    }
+                } else {
+                    // RESP2 fallback: integer 1 or 0
+                    if *b {
+                        buf.extend_from_slice(b":1\r\n");
+                    } else {
+                        buf.extend_from_slice(b":0\r\n");
+                    }
+                }
+            }
+            RespValue::Double(d) => {
+                if protocol >= 3 {
+                    // RESP3 double format: ,<floating-point-number>\r\n
+                    buf.push(b',');
+                    let s = d.to_string();
+                    buf.extend_from_slice(s.as_bytes());
+                    buf.extend_from_slice(b"\r\n");
+                } else {
+                    // RESP2 fallback: bulk string
+                    let s = d.to_string();
+                    buf.push(b'$');
+                    buf.extend_from_slice(itoa::Buffer::new().format(s.len()).as_bytes());
+                    buf.extend_from_slice(b"\r\n");
+                    buf.extend_from_slice(s.as_bytes());
+                    buf.extend_from_slice(b"\r\n");
                 }
             }
         }
