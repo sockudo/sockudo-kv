@@ -3,10 +3,12 @@
 //! This module provides highly optimized distance functions using:
 //! - AVX-512 (512-bit) on supported x86_64 CPUs
 //! - AVX2 (256-bit) on most modern x86_64 CPUs
+//! - SSE4.1 (128-bit) on older x86_64 CPUs without AVX2
 //! - NEON (128-bit) on ARM64 (Apple Silicon, AWS Graviton, etc.)
 //! - Scalar fallback for any architecture
 //!
 //! The module uses runtime feature detection to select the best implementation.
+//! Hierarchy: AVX-512 > AVX2 > SSE4.1 > Scalar (x86) or NEON > Scalar (ARM)
 
 // Allow unsafe operations inside unsafe functions (Rust 2024 compatibility)
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -24,6 +26,10 @@ pub struct SimdCapabilities {
     pub avx2: bool,
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     pub fma: bool,
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    pub sse4_1: bool,
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    pub sse2: bool,
     #[cfg(target_arch = "aarch64")]
     pub neon: bool,
 }
@@ -37,6 +43,10 @@ impl SimdCapabilities {
             avx2: std::arch::is_x86_feature_detected!("avx2"),
             #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             fma: std::arch::is_x86_feature_detected!("fma"),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+            sse4_1: std::arch::is_x86_feature_detected!("sse4.1"),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+            sse2: std::arch::is_x86_feature_detected!("sse2"),
             #[cfg(target_arch = "aarch64")]
             neon: std::arch::is_aarch64_feature_detected!("neon"),
         }
@@ -99,6 +109,9 @@ pub fn dot_product_auto(a: &[f32], b: &[f32]) -> f32 {
         if caps.avx2 && a.len() >= 8 {
             return unsafe { dot_product_avx2(a, b) };
         }
+        if caps.sse4_1 && a.len() >= 4 {
+            return unsafe { dot_product_sse(a, b) };
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -125,6 +138,9 @@ pub fn l2_distance_sq_auto(a: &[f32], b: &[f32]) -> f32 {
         }
         if caps.avx2 && a.len() >= 8 {
             return unsafe { l2_distance_sq_avx2(a, b) };
+        }
+        if caps.sse4_1 && a.len() >= 4 {
+            return unsafe { l2_distance_sq_sse(a, b) };
         }
     }
 
@@ -428,6 +444,178 @@ unsafe fn l2_distance_sq_avx2(a: &[f32], b: &[f32]) -> f32 {
     total
 }
 
+// ==================== SSE Implementations (x86/x86_64) ====================
+// SSE processes 128-bit (4 floats) at a time - fallback when AVX2 unavailable
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn dot_product_sse(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let chunks = n / 4;
+
+    // Use 4 accumulators to hide latency
+    let mut sum0 = _mm_setzero_ps();
+    let mut sum1 = _mm_setzero_ps();
+    let mut sum2 = _mm_setzero_ps();
+    let mut sum3 = _mm_setzero_ps();
+
+    let unroll_chunks = chunks / 4;
+
+    for i in 0..unroll_chunks {
+        let base = i * 16;
+
+        let va0 = _mm_loadu_ps(a.as_ptr().add(base));
+        let vb0 = _mm_loadu_ps(b.as_ptr().add(base));
+        sum0 = _mm_add_ps(sum0, _mm_mul_ps(va0, vb0));
+
+        let va1 = _mm_loadu_ps(a.as_ptr().add(base + 4));
+        let vb1 = _mm_loadu_ps(b.as_ptr().add(base + 4));
+        sum1 = _mm_add_ps(sum1, _mm_mul_ps(va1, vb1));
+
+        let va2 = _mm_loadu_ps(a.as_ptr().add(base + 8));
+        let vb2 = _mm_loadu_ps(b.as_ptr().add(base + 8));
+        sum2 = _mm_add_ps(sum2, _mm_mul_ps(va2, vb2));
+
+        let va3 = _mm_loadu_ps(a.as_ptr().add(base + 12));
+        let vb3 = _mm_loadu_ps(b.as_ptr().add(base + 12));
+        sum3 = _mm_add_ps(sum3, _mm_mul_ps(va3, vb3));
+    }
+
+    // Handle remaining full 4-element chunks
+    for i in (unroll_chunks * 4)..chunks {
+        let base = i * 4;
+        let va = _mm_loadu_ps(a.as_ptr().add(base));
+        let vb = _mm_loadu_ps(b.as_ptr().add(base));
+        sum0 = _mm_add_ps(sum0, _mm_mul_ps(va, vb));
+    }
+
+    // Combine accumulators
+    let sum01 = _mm_add_ps(sum0, sum1);
+    let sum23 = _mm_add_ps(sum2, sum3);
+    let sum = _mm_add_ps(sum01, sum23);
+
+    // Horizontal sum using SSE3 hadd or manual shuffle
+    // sum = [a, b, c, d]
+    let sum64 = _mm_add_ps(sum, _mm_movehl_ps(sum, sum)); // [a+c, b+d, ?, ?]
+    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1)); // [a+c+b+d, ?, ?, ?]
+    let mut total = _mm_cvtss_f32(sum32);
+
+    // Handle remaining elements
+    for i in (chunks * 4)..n {
+        total += a[i] * b[i];
+    }
+
+    total
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn l2_distance_sq_sse(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let chunks = n / 4;
+
+    let mut sum0 = _mm_setzero_ps();
+    let mut sum1 = _mm_setzero_ps();
+    let mut sum2 = _mm_setzero_ps();
+    let mut sum3 = _mm_setzero_ps();
+
+    let unroll_chunks = chunks / 4;
+
+    for i in 0..unroll_chunks {
+        let base = i * 16;
+
+        let va0 = _mm_loadu_ps(a.as_ptr().add(base));
+        let vb0 = _mm_loadu_ps(b.as_ptr().add(base));
+        let diff0 = _mm_sub_ps(va0, vb0);
+        sum0 = _mm_add_ps(sum0, _mm_mul_ps(diff0, diff0));
+
+        let va1 = _mm_loadu_ps(a.as_ptr().add(base + 4));
+        let vb1 = _mm_loadu_ps(b.as_ptr().add(base + 4));
+        let diff1 = _mm_sub_ps(va1, vb1);
+        sum1 = _mm_add_ps(sum1, _mm_mul_ps(diff1, diff1));
+
+        let va2 = _mm_loadu_ps(a.as_ptr().add(base + 8));
+        let vb2 = _mm_loadu_ps(b.as_ptr().add(base + 8));
+        let diff2 = _mm_sub_ps(va2, vb2);
+        sum2 = _mm_add_ps(sum2, _mm_mul_ps(diff2, diff2));
+
+        let va3 = _mm_loadu_ps(a.as_ptr().add(base + 12));
+        let vb3 = _mm_loadu_ps(b.as_ptr().add(base + 12));
+        let diff3 = _mm_sub_ps(va3, vb3);
+        sum3 = _mm_add_ps(sum3, _mm_mul_ps(diff3, diff3));
+    }
+
+    for i in (unroll_chunks * 4)..chunks {
+        let base = i * 4;
+        let va = _mm_loadu_ps(a.as_ptr().add(base));
+        let vb = _mm_loadu_ps(b.as_ptr().add(base));
+        let diff = _mm_sub_ps(va, vb);
+        sum0 = _mm_add_ps(sum0, _mm_mul_ps(diff, diff));
+    }
+
+    let sum01 = _mm_add_ps(sum0, sum1);
+    let sum23 = _mm_add_ps(sum2, sum3);
+    let sum = _mm_add_ps(sum01, sum23);
+
+    let sum64 = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
+    let mut total = _mm_cvtss_f32(sum32);
+
+    for i in (chunks * 4)..n {
+        let d = a[i] - b[i];
+        total += d * d;
+    }
+
+    total
+}
+
+// SSE2 Q8 dot product - processes 16 i8 values at a time
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn dot_product_q8_sse(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let chunks = n / 16;
+
+    let mut sum = _mm_setzero_si128();
+
+    for i in 0..chunks {
+        let base = i * 16;
+        let va = _mm_loadu_si128(a.as_ptr().add(base) as *const __m128i);
+        let vb = _mm_loadu_si128(b.as_ptr().add(base) as *const __m128i);
+
+        // Unpack to 16-bit for proper signed multiplication
+        let va_lo = _mm_cvtepi8_epi16(va);
+        let va_hi = _mm_cvtepi8_epi16(_mm_srli_si128(va, 8));
+        let vb_lo = _mm_cvtepi8_epi16(vb);
+        let vb_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vb, 8));
+
+        // Multiply and accumulate
+        let prod_lo = _mm_madd_epi16(va_lo, vb_lo);
+        let prod_hi = _mm_madd_epi16(va_hi, vb_hi);
+
+        sum = _mm_add_epi32(sum, prod_lo);
+        sum = _mm_add_epi32(sum, prod_hi);
+    }
+
+    // Horizontal sum
+    let sum64 = _mm_add_epi32(sum, _mm_srli_si128(sum, 8));
+    let sum32 = _mm_add_epi32(sum64, _mm_srli_si128(sum64, 4));
+    let mut total = _mm_cvtsi128_si32(sum32);
+
+    // Handle remaining
+    for i in (chunks * 16)..n {
+        total += (a[i] as i32) * (b[i] as i32);
+    }
+
+    total
+}
+
 // ==================== NEON Implementations (ARM64) ====================
 
 #[cfg(target_arch = "aarch64")]
@@ -627,7 +815,7 @@ unsafe fn hamming_distance_neon(a: &[u64], b: &[u64]) -> u32 {
 // ==================== Q8 Quantized Distance ====================
 
 /// Compute dot product of Q8 quantized vectors
-/// Uses SIMD for processing 32 i8 values at a time
+/// Uses SIMD for processing 32 i8 values at a time (AVX2) or 16 at a time (SSE)
 #[inline]
 pub fn dot_product_q8_auto(a: &[i8], b: &[i8]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
@@ -637,6 +825,9 @@ pub fn dot_product_q8_auto(a: &[i8], b: &[i8]) -> i32 {
         let caps = simd_caps();
         if caps.avx2 && a.len() >= 32 {
             return unsafe { dot_product_q8_avx2(a, b) };
+        }
+        if caps.sse4_1 && a.len() >= 16 {
+            return unsafe { dot_product_q8_sse(a, b) };
         }
     }
 
@@ -883,5 +1074,101 @@ mod tests {
         assert!((meta.norm - 5.0).abs() < 1e-6);
         assert!((meta.inv_norm - 0.2).abs() < 1e-6);
         assert!((meta.sum_sq - 25.0).abs() < 1e-6);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    #[test]
+    fn test_sse_dot_product() {
+        if !simd_caps().sse4_1 {
+            return; // Skip if SSE4.1 not available
+        }
+
+        // Test with various sizes
+        for size in [4, 8, 16, 32, 64, 128, 256] {
+            let a: Vec<f32> = (0..size).map(|i| i as f32 * 0.1).collect();
+            let b: Vec<f32> = (0..size).map(|i| (size - i) as f32 * 0.1).collect();
+
+            let scalar = dot_product_scalar(&a, &b);
+            let sse = unsafe { dot_product_sse(&a, &b) };
+
+            // Use relative tolerance for floating point comparison
+            let rel_diff = if scalar.abs() > 1e-6 {
+                (scalar - sse).abs() / scalar.abs()
+            } else {
+                (scalar - sse).abs()
+            };
+            assert!(
+                rel_diff < 1e-5,
+                "SSE dot product mismatch at size {}: scalar={} sse={} rel_diff={}",
+                size,
+                scalar,
+                sse,
+                rel_diff
+            );
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    #[test]
+    fn test_sse_l2_distance() {
+        if !simd_caps().sse4_1 {
+            return;
+        }
+
+        for size in [4, 8, 16, 32, 64, 128] {
+            let a: Vec<f32> = (0..size).map(|i| i as f32).collect();
+            let b: Vec<f32> = (0..size).map(|i| (i * 2) as f32).collect();
+
+            let scalar = l2_distance_sq_scalar(&a, &b);
+            let sse = unsafe { l2_distance_sq_sse(&a, &b) };
+
+            assert!(
+                (scalar - sse).abs() < 1e-3,
+                "SSE L2 distance mismatch at size {}: scalar={} sse={}",
+                size,
+                scalar,
+                sse
+            );
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    #[test]
+    fn test_sse_q8_dot_product() {
+        if !simd_caps().sse4_1 {
+            return;
+        }
+
+        for size in [16, 32, 64, 128] {
+            let a: Vec<i8> = (0..size).map(|i| (i % 128) as i8).collect();
+            let b: Vec<i8> = (0..size).map(|i| ((size - i) % 128) as i8).collect();
+
+            let scalar = dot_product_q8_scalar(&a, &b);
+            let sse = unsafe { dot_product_q8_sse(&a, &b) };
+
+            assert_eq!(
+                scalar, sse,
+                "SSE Q8 dot product mismatch at size {}: scalar={} sse={}",
+                size, scalar, sse
+            );
+        }
+    }
+
+    #[test]
+    fn test_simd_capabilities_detection() {
+        let caps = simd_caps();
+        // Just verify detection runs without panic
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        {
+            println!("AVX-512: {}", caps.avx512f);
+            println!("AVX2: {}", caps.avx2);
+            println!("FMA: {}", caps.fma);
+            println!("SSE4.1: {}", caps.sse4_1);
+            println!("SSE2: {}", caps.sse2);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            println!("NEON: {}", caps.neon);
+        }
     }
 }
