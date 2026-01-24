@@ -475,6 +475,14 @@ impl Store {
             return self.lmove_same_key(source, wherefrom, whereto);
         }
 
+        // Check destination type BEFORE popping from source to ensure atomicity
+        // If destination exists and is not a list, return WRONGTYPE error without modifying source
+        if let Some(dest_type) = self.key_type(destination) {
+            if dest_type != "list" {
+                return Err(Error::WrongType);
+            }
+        }
+
         // Pop from source
         let value = if wherefrom {
             // LEFT = pop from head
@@ -490,7 +498,7 @@ impl Store {
             }
         };
 
-        // Push to destination
+        // Push to destination - this should not fail now since we pre-checked the type
         if whereto {
             // LEFT = push to head
             self.lpush(Bytes::copy_from_slice(destination), vec![value.clone()])?;

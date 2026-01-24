@@ -390,6 +390,9 @@ pub fn try_mpop(
 }
 
 /// Try to execute BLMOVE/BRPOPLPUSH immediately
+/// Returns Ok(Some(value)) if data was moved
+/// Returns Ok(None) if source is empty (caller should block)
+/// Returns Err(WrongType) if source is wrong type OR if source has data but destination is wrong type
 pub fn try_move(
     store: &Store,
     source: &Bytes,
@@ -397,14 +400,26 @@ pub fn try_move(
     wherefrom: PopDirection,
     whereto: PopDirection,
 ) -> Result<Option<Bytes>> {
-    // Check source type
+    // Check source type first
     if let Some(key_type) = store.key_type(source) {
         if key_type != "list" {
             return Err(Error::WrongType);
         }
     }
 
-    // Check destination type (if exists)
+    // Check if source has data before checking destination type
+    // This allows blocking to happen even if destination is wrong type
+    // (the error will be returned when data arrives)
+    let source_has_data = store.llen(source).map(|len| len > 0).unwrap_or(false);
+
+    if !source_has_data {
+        // Source is empty - return None to indicate blocking needed
+        // Don't check destination type yet - we'll check when data arrives
+        return Ok(None);
+    }
+
+    // Source has data - now check destination type
+    // If it's wrong type, we return an error (preventing the pop)
     if let Some(key_type) = store.key_type(destination) {
         if key_type != "list" {
             return Err(Error::WrongType);

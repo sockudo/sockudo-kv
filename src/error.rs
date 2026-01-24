@@ -23,6 +23,9 @@ pub enum Error {
     #[error("ERR increment or decrement would overflow")]
     Overflow,
 
+    #[error("ERR increment would produce NaN or Infinity")]
+    FloatInfinity,
+
     #[error("ERR no such key")]
     NoSuchKey,
 

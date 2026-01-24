@@ -19,13 +19,16 @@ fn parse_int(b: &[u8]) -> Result<i64> {
         .map_err(|_| Error::NotInteger)
 }
 
-/// Parse float from bytes
+/// Parse float from bytes, rejecting infinity and NaN
 #[inline]
 fn parse_float(b: &[u8]) -> Result<f64> {
-    std::str::from_utf8(b)
-        .map_err(|_| Error::NotFloat)?
-        .parse()
-        .map_err(|_| Error::NotFloat)
+    let s = std::str::from_utf8(b).map_err(|_| Error::NotFloat)?;
+    let val: f64 = s.parse().map_err(|_| Error::NotFloat)?;
+    // Redis rejects infinity in the increment
+    if val.is_infinite() || val.is_nan() {
+        return Err(Error::FloatInfinity);
+    }
+    Ok(val)
 }
 
 /// Validate that a string is exactly 16 hexadecimal characters
@@ -928,7 +931,13 @@ fn compute_lcs(
 }
 
 /// Format float like Redis
+/// - Handles negative zero: -0.0 becomes "0"
+/// - Integers are displayed without decimal point
+/// - Non-integer floats are trimmed of trailing zeros
 fn format_float(f: f64) -> String {
+    // Handle negative zero
+    let f = if f == 0.0 { 0.0 } else { f };
+
     if f.fract() == 0.0 && f.abs() < 1e15 {
         format!("{:.0}", f)
     } else {

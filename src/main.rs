@@ -1870,18 +1870,20 @@ async fn blocking_wait(
 
                 let result = match &operation {
                     BlockingOperation::Pop { keys, direction } => {
-                        match try_pop(&store, keys, *direction)? {
-                            Some((key, value)) => Some(format_pop_response(key, value)),
-                            None => None, // Data was taken by another client, retry
+                        match try_pop(&store, keys, *direction) {
+                            Ok(Some((key, value))) => Ok(Some(format_pop_response(key, value))),
+                            Ok(None) => Ok(None), // Data was taken by another client, retry
+                            Err(e) => Err(e),
                         }
                     }
                     BlockingOperation::MPop {
                         keys,
                         direction,
                         count,
-                    } => match try_mpop(&store, keys, *direction, *count)? {
-                        Some((key, values)) => Some(format_mpop_response(key, values)),
-                        None => None, // Data was taken by another client, retry
+                    } => match try_mpop(&store, keys, *direction, *count) {
+                        Ok(Some((key, values))) => Ok(Some(format_mpop_response(key, values))),
+                        Ok(None) => Ok(None), // Data was taken by another client, retry
+                        Err(e) => Err(e),
                     },
                     BlockingOperation::Move {
                         source,
@@ -1889,13 +1891,14 @@ async fn blocking_wait(
                         wherefrom,
                         whereto,
                     } => {
-                        match try_move(&store, source, destination, *wherefrom, *whereto)? {
-                            Some(value) => {
+                        match try_move(&store, source, destination, *wherefrom, *whereto) {
+                            Ok(Some(value)) => {
                                 // Signal destination key - another blocked client might be waiting
                                 server_state.blocking.signal_key(db_index, destination);
-                                Some(RespValue::bulk(value))
+                                Ok(Some(RespValue::bulk(value)))
                             }
-                            None => None, // Data was taken by another client, retry
+                            Ok(None) => Ok(None), // Data was taken by another client, retry
+                            Err(e) => Err(e),
                         }
                     }
                     BlockingOperation::RPopLPush {
@@ -1908,24 +1911,51 @@ async fn blocking_wait(
                             destination,
                             PopDirection::Right,
                             PopDirection::Left,
-                        )? {
-                            Some(value) => {
+                        ) {
+                            Ok(Some(value)) => {
                                 // Signal destination key - another blocked client might be waiting
                                 server_state.blocking.signal_key(db_index, destination);
-                                Some(RespValue::bulk(value))
+                                Ok(Some(RespValue::bulk(value)))
                             }
-                            None => None, // Data was taken by another client, retry
+                            Ok(None) => Ok(None), // Data was taken by another client, retry
+                            Err(e) => Err(e),
                         }
                     }
                 };
 
-                if let Some(resp) = result {
-                    // Success - clear blocked state and return
-                    client.set_blocked(None);
-                    return Ok(resp);
+                // Handle the result
+                match result {
+                    Ok(Some(resp)) => {
+                        // Success - clear blocked state and return
+                        client.set_blocked(None);
+                        return Ok(resp);
+                    }
+                    Ok(None) => {
+                        // Data was consumed by another client - continue retry loop
+                        // The loop will re-register and wait again
+                    }
+                    Err(e) => {
+                        // Error occurred (e.g., WRONGTYPE) - clean up and return error
+                        // But first, signal the key again so the next blocked client can try
+                        // This is important for fairness: if client 1 fails due to wrong dest type,
+                        // client 2 waiting on the same source should get a chance
+                        match &operation {
+                            BlockingOperation::Move { source, .. }
+                            | BlockingOperation::RPopLPush { source, .. } => {
+                                server_state.blocking.signal_key(db_index, source);
+                            }
+                            BlockingOperation::Pop { keys, .. }
+                            | BlockingOperation::MPop { keys, .. } => {
+                                for key in keys {
+                                    server_state.blocking.signal_key(db_index, key);
+                                }
+                            }
+                        }
+                        client.set_blocked(None);
+                        server_state.blocking.cleanup_client(client.id);
+                        return Err(e);
+                    }
                 }
-                // Data was consumed by another client - continue retry loop
-                // The loop will re-register and wait again
             }
             Ok(Ok(BlockResult::Timeout)) | Err(_) => {
                 // Timeout

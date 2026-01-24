@@ -231,13 +231,14 @@ impl Store {
                 }
 
                 match &mut entry.data {
-                    DataType::String(s) => {
+                    DataType::String(s) | DataType::RawString(s) => {
                         let val: i64 = std::str::from_utf8(s)
                             .map_err(|_| Error::NotInteger)?
                             .parse()
                             .map_err(|_| Error::NotInteger)?;
                         let new_val = val.checked_add(delta).ok_or(Error::Overflow)?;
-                        *s = Bytes::from(new_val.to_string());
+                        // Convert back to String (int encoding)
+                        entry.data = DataType::String(Bytes::from(new_val.to_string()));
                         entry.bump_version();
                         Ok(new_val)
                     }
@@ -271,13 +272,14 @@ impl Store {
                 }
 
                 match &mut entry.data {
-                    DataType::String(s) => {
+                    DataType::String(s) | DataType::RawString(s) => {
                         let val: i64 = std::str::from_utf8(s)
                             .map_err(|_| Error::NotInteger)?
                             .parse()
                             .map_err(|_| Error::NotInteger)?;
                         let new_val = val.checked_sub(delta).ok_or(Error::Overflow)?;
-                        *s = Bytes::from(new_val.to_string());
+                        // Convert back to String (int encoding)
+                        entry.data = DataType::String(Bytes::from(new_val.to_string()));
                         entry.bump_version();
                         Ok(new_val)
                     }
@@ -312,17 +314,17 @@ impl Store {
                 }
 
                 match &mut entry.data {
-                    DataType::String(s) => {
+                    DataType::String(s) | DataType::RawString(s) => {
                         let val: f64 = std::str::from_utf8(s)
                             .map_err(|_| Error::NotFloat)?
                             .parse()
                             .map_err(|_| Error::NotFloat)?;
                         let new_val = val + delta;
                         if new_val.is_infinite() || new_val.is_nan() {
-                            return Err(Error::Overflow);
+                            return Err(Error::FloatInfinity);
                         }
                         let result = format_float(new_val);
-                        *s = Bytes::from(result);
+                        entry.data = DataType::String(Bytes::from(result));
                         entry.bump_version();
                         Ok(new_val)
                     }
@@ -634,10 +636,18 @@ impl Store {
 }
 
 /// Format float like Redis does
+/// - Handles negative zero: -0.0 becomes "0"
+/// - Integers are displayed without decimal point
+/// - Non-integer floats are trimmed of trailing zeros
 fn format_float(f: f64) -> String {
+    // Handle negative zero
+    let f = if f == 0.0 { 0.0 } else { f };
+
     if f.fract() == 0.0 && f.abs() < 1e17 {
-        format!("{:.1}", f)
+        format!("{:.0}", f)
     } else {
-        f.to_string()
+        // Format with high precision, then trim trailing zeros
+        let s = format!("{:.17}", f);
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
