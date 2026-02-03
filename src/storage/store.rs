@@ -130,6 +130,13 @@ impl Store {
     /// Check if key exists (and not expired)
     #[inline]
     pub fn exists(&self, key: &[u8]) -> bool {
+        self.exists_with_lazy_expire(key).0
+    }
+
+    /// Check if key exists (and not expired), returning (exists, was_lazily_expired)
+    /// This is used to propagate DEL to replicas when lazy expiration occurs.
+    #[inline]
+    pub fn exists_with_lazy_expire(&self, key: &[u8]) -> (bool, bool) {
         let h = calculate_hash(key);
         match self
             .data
@@ -138,12 +145,12 @@ impl Store {
             crate::storage::dashtable::Entry::Occupied(e) => {
                 if e.get().1.is_expired() {
                     e.remove();
-                    false
+                    (false, true) // Key was lazily expired
                 } else {
-                    true
+                    (true, false)
                 }
             }
-            crate::storage::dashtable::Entry::Vacant(_) => false,
+            crate::storage::dashtable::Entry::Vacant(_) => (false, false),
         }
     }
 

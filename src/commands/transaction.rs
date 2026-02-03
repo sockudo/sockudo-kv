@@ -9,7 +9,9 @@ use crate::client::ClientState;
 use crate::commands::Dispatcher;
 use crate::error::{Error, Result};
 use crate::protocol::{Command, RespValue};
-use crate::storage::Store;
+use crate::replication::ReplicationManager;
+use crate::server_state::ServerState;
+use crate::storage::{self, MultiStore, Store};
 
 /// Result of transaction command execution
 pub enum TransactionResult {
@@ -44,13 +46,16 @@ pub fn is_forbidden_in_multi(cmd: &[u8]) -> bool {
 /// Execute a transaction command
 pub fn execute(
     client: &Arc<ClientState>,
+    multi_store: &Arc<MultiStore>,
     store: &Arc<Store>,
+    server_state: &Arc<ServerState>,
+    replication: Option<&Arc<ReplicationManager>>,
     cmd: &[u8],
     args: &[Bytes],
 ) -> Result<TransactionResult> {
     match cmd.to_ascii_uppercase().as_slice() {
         b"MULTI" => cmd_multi(client),
-        b"EXEC" => cmd_exec(client, store),
+        b"EXEC" => cmd_exec(client, multi_store, store, server_state, replication),
         b"DISCARD" => cmd_discard(client),
         b"WATCH" => cmd_watch(client, store, args),
         b"UNWATCH" => cmd_unwatch(client),
@@ -73,6 +78,97 @@ fn cmd_multi(client: &Arc<ClientState>) -> Result<TransactionResult> {
 
 /// Check if command is a list push command that could wake blocked clients
 #[inline]
+/// Convert time-relative commands (EXPIRE, PEXPIRE, SETEX, PSETEX) to absolute time
+/// for replication consistency (EXPIREAT, PEXPIREAT, SET with PXAT)
+fn convert_command_for_replication(cmd_name: &Bytes, cmd_args: &[Bytes]) -> Vec<Bytes> {
+    let cmd_upper = cmd_name.to_ascii_uppercase();
+    let now_ms = storage::now_ms();
+
+    match cmd_upper.as_slice() {
+        b"EXPIRE" if cmd_args.len() >= 2 => {
+            // EXPIRE key seconds -> PEXPIREAT key timestamp_ms
+            if let Ok(seconds) = std::str::from_utf8(&cmd_args[1])
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or(())
+            {
+                let expire_at_ms = now_ms + seconds * 1000;
+                let mut parts = vec![
+                    Bytes::from_static(b"PEXPIREAT"),
+                    cmd_args[0].clone(),
+                    Bytes::from(expire_at_ms.to_string()),
+                ];
+                // Preserve additional flags (NX, XX, GT, LT) if present
+                if cmd_args.len() > 2 {
+                    parts.extend(cmd_args[2..].iter().cloned());
+                }
+                return parts;
+            }
+        }
+        b"PEXPIRE" if cmd_args.len() >= 2 => {
+            // PEXPIRE key milliseconds -> PEXPIREAT key timestamp_ms
+            if let Ok(ms) = std::str::from_utf8(&cmd_args[1])
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or(())
+            {
+                let expire_at_ms = now_ms + ms;
+                let mut parts = vec![
+                    Bytes::from_static(b"PEXPIREAT"),
+                    cmd_args[0].clone(),
+                    Bytes::from(expire_at_ms.to_string()),
+                ];
+                // Preserve additional flags (NX, XX, GT, LT) if present
+                if cmd_args.len() > 2 {
+                    parts.extend(cmd_args[2..].iter().cloned());
+                }
+                return parts;
+            }
+        }
+        b"SETEX" if cmd_args.len() >= 3 => {
+            // SETEX key seconds value -> SET key value PXAT timestamp_ms
+            if let Ok(seconds) = std::str::from_utf8(&cmd_args[1])
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or(())
+            {
+                let expire_at_ms = now_ms + seconds * 1000;
+                return vec![
+                    Bytes::from_static(b"SET"),
+                    cmd_args[0].clone(),
+                    cmd_args[2].clone(),
+                    Bytes::from_static(b"PXAT"),
+                    Bytes::from(expire_at_ms.to_string()),
+                ];
+            }
+        }
+        b"PSETEX" if cmd_args.len() >= 3 => {
+            // PSETEX key milliseconds value -> SET key value PXAT timestamp_ms
+            if let Ok(ms) = std::str::from_utf8(&cmd_args[1])
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or(())
+            {
+                let expire_at_ms = now_ms + ms;
+                return vec![
+                    Bytes::from_static(b"SET"),
+                    cmd_args[0].clone(),
+                    cmd_args[2].clone(),
+                    Bytes::from_static(b"PXAT"),
+                    Bytes::from(expire_at_ms.to_string()),
+                ];
+            }
+        }
+        _ => {}
+    }
+
+    // Default: return the command unchanged
+    let mut parts = Vec::with_capacity(1 + cmd_args.len());
+    parts.push(cmd_name.clone());
+    parts.extend(cmd_args.iter().cloned());
+    parts
+}
+
 fn is_list_push_command(cmd: &[u8]) -> bool {
     cmd.eq_ignore_ascii_case(b"LPUSH")
         || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -83,7 +179,13 @@ fn is_list_push_command(cmd: &[u8]) -> bool {
 }
 
 /// EXEC - Execute all queued commands
-fn cmd_exec(client: &Arc<ClientState>, store: &Arc<Store>) -> Result<TransactionResult> {
+fn cmd_exec(
+    client: &Arc<ClientState>,
+    multi_store: &Arc<MultiStore>,
+    store: &Arc<Store>,
+    server_state: &Arc<ServerState>,
+    replication: Option<&Arc<ReplicationManager>>,
+) -> Result<TransactionResult> {
     // Take the multi state
     let multi_state = match client.take_multi() {
         Some(state) => state,
@@ -120,6 +222,9 @@ fn cmd_exec(client: &Arc<ClientState>, store: &Arc<Store>) -> Result<Transaction
     let mut results = Vec::with_capacity(multi_state.commands.len());
     let mut keys_to_signal: Vec<Bytes> = Vec::new();
 
+    // Collect commands for replication (we'll propagate after successful execution)
+    let mut commands_for_replication: Vec<(Bytes, Vec<Bytes>)> = Vec::new();
+
     for queued in multi_state.commands {
         // Track list push commands to signal blocked clients after EXEC
         let push_key = if is_list_push_command(&queued.name) && !queued.args.is_empty() {
@@ -138,12 +243,17 @@ fn cmd_exec(client: &Arc<ClientState>, store: &Arc<Store>) -> Result<Transaction
 
         // Create a Command from the queued command
         let cmd = Command {
-            name: queued.name,
-            args: queued.args,
+            name: queued.name.clone(),
+            args: queued.args.clone(),
         };
 
-        // Execute the command
-        let result = Dispatcher::execute_basic(store, cmd);
+        // Store command for replication
+        commands_for_replication.push((queued.name, queued.args));
+
+        // Execute the command with full server context
+        // Note: We pass None for replication to avoid double-propagation.
+        // Commands inside MULTI are propagated as a batch (MULTI + commands + EXEC) below.
+        let result = Dispatcher::execute(multi_store, store, server_state, None, None, cmd);
 
         // Check if list push was successful (returns integer > 0)
         if let Some(key) = push_key {
@@ -172,6 +282,21 @@ fn cmd_exec(client: &Arc<ClientState>, store: &Arc<Store>) -> Result<Transaction
         }
         false
     });
+
+    // Propagate transaction to replicas (MULTI + commands + EXEC)
+    if let Some(repl) = replication {
+        // Propagate MULTI
+        repl.propagate(&[Bytes::from_static(b"MULTI")]);
+
+        // Propagate each command, converting time-relative commands to absolute time
+        for (cmd_name, cmd_args) in commands_for_replication {
+            let parts = convert_command_for_replication(&cmd_name, &cmd_args);
+            repl.propagate(&parts);
+        }
+
+        // Propagate EXEC
+        repl.propagate(&[Bytes::from_static(b"EXEC")]);
+    }
 
     // Return keys to signal so main.rs can wake blocked clients
     if keys_to_signal.is_empty() {
@@ -270,19 +395,37 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    fn make_test_setup() -> (Arc<ClientState>, Arc<Store>) {
+    fn make_test_setup() -> (
+        Arc<ClientState>,
+        Arc<MultiStore>,
+        Arc<Store>,
+        Arc<ServerState>,
+        Arc<ReplicationManager>,
+    ) {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
         let client = Arc::new(ClientState::new(1, addr, 1, false));
-        let store = Arc::new(Store::with_capacity(100));
-        (client, store)
+        let multi_store = Arc::new(MultiStore::new());
+        let store = multi_store.db(0);
+        let server_state = Arc::new(ServerState::new());
+        let replication = Arc::new(ReplicationManager::new());
+        (client, multi_store, store, server_state, replication)
     }
 
     #[test]
     fn test_multi_exec() {
-        let (client, store) = make_test_setup();
+        let (client, multi_store, store, server_state, replication) = make_test_setup();
 
         // Start MULTI
-        let result = execute(&client, &store, b"MULTI", &[]).unwrap();
+        let result = execute(
+            &client,
+            &multi_store,
+            &store,
+            &server_state,
+            Some(&replication),
+            b"MULTI",
+            &[],
+        )
+        .unwrap();
         assert!(matches!(result, TransactionResult::Response(_)));
         assert!(client.in_multi());
 
@@ -293,7 +436,16 @@ mod tests {
         );
 
         // EXEC
-        let result = execute(&client, &store, b"EXEC", &[]).unwrap();
+        let result = execute(
+            &client,
+            &multi_store,
+            &store,
+            &server_state,
+            Some(&replication),
+            b"EXEC",
+            &[],
+        )
+        .unwrap();
         assert!(matches!(
             result,
             TransactionResult::Response(RespValue::Array(_))
@@ -303,35 +455,79 @@ mod tests {
 
     #[test]
     fn test_discard() {
-        let (client, store) = make_test_setup();
+        let (client, multi_store, store, server_state, replication) = make_test_setup();
 
-        execute(&client, &store, b"MULTI", &[]).unwrap();
+        execute(
+            &client,
+            &multi_store,
+            &store,
+            &server_state,
+            Some(&replication),
+            b"MULTI",
+            &[],
+        )
+        .unwrap();
         assert!(client.in_multi());
 
-        execute(&client, &store, b"DISCARD", &[]).unwrap();
+        execute(
+            &client,
+            &multi_store,
+            &store,
+            &server_state,
+            Some(&replication),
+            b"DISCARD",
+            &[],
+        )
+        .unwrap();
         assert!(!client.in_multi());
     }
 
     #[test]
     fn test_exec_without_multi() {
-        let (client, store) = make_test_setup();
-        let result = execute(&client, &store, b"EXEC", &[]);
+        let (client, multi_store, store, server_state, replication) = make_test_setup();
+        let result = execute(
+            &client,
+            &multi_store,
+            &store,
+            &server_state,
+            Some(&replication),
+            b"EXEC",
+            &[],
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_watch_unwatch() {
-        let (client, store) = make_test_setup();
+        let (client, multi_store, store, server_state, replication) = make_test_setup();
 
         // Set a key
         store.set(Bytes::from_static(b"key1"), Bytes::from_static(b"value1"));
 
         // Watch it
-        execute(&client, &store, b"WATCH", &[Bytes::from_static(b"key1")]).unwrap();
+        execute(
+            &client,
+            &multi_store,
+            &store,
+            &server_state,
+            Some(&replication),
+            b"WATCH",
+            &[Bytes::from_static(b"key1")],
+        )
+        .unwrap();
         assert_eq!(client.get_watched_keys().len(), 1);
 
         // Unwatch
-        execute(&client, &store, b"UNWATCH", &[]).unwrap();
+        execute(
+            &client,
+            &multi_store,
+            &store,
+            &server_state,
+            Some(&replication),
+            b"UNWATCH",
+            &[],
+        )
+        .unwrap();
         assert_eq!(client.get_watched_keys().len(), 0);
     }
 }

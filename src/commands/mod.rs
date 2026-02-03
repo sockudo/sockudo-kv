@@ -303,7 +303,7 @@ impl Dispatcher {
             return result;
         }
         if cmd.is_command(b"EXISTS") {
-            return cmd_exists(store, args);
+            return cmd_exists(store, args, replication);
         }
         if cmd.is_command(b"EXPIRE") {
             let result = cmd_expire(store, args);
@@ -667,14 +667,35 @@ fn cmd_del(store: &Store, args: &[Bytes], use_lazy: bool) -> Result<RespValue> {
     Ok(RespValue::integer(count))
 }
 
-fn cmd_exists(store: &Store, args: &[Bytes]) -> Result<RespValue> {
+fn cmd_exists(
+    store: &Store,
+    args: &[Bytes],
+    replication: Option<&Arc<ReplicationManager>>,
+) -> Result<RespValue> {
     if args.is_empty() {
         return Err(Error::WrongArity("EXISTS"));
     }
-    let count: i64 = args
-        .iter()
-        .map(|k| if store.exists(k) { 1 } else { 0 })
-        .sum();
+    let mut count: i64 = 0;
+    let mut expired_keys: Vec<Bytes> = Vec::new();
+
+    for k in args {
+        let (exists, was_lazily_expired) = store.exists_with_lazy_expire(k);
+        if exists {
+            count += 1;
+        }
+        if was_lazily_expired {
+            expired_keys.push(k.clone());
+        }
+    }
+
+    // Propagate DEL for lazily expired keys
+    if let Some(repl) = replication {
+        for key in expired_keys {
+            let parts = vec![Bytes::from_static(b"DEL"), key];
+            repl.propagate(&parts);
+        }
+    }
+
     Ok(RespValue::integer(count))
 }
 

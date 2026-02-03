@@ -10,7 +10,8 @@
       "Bash(git -C /home/radud/Desktop/Code/Rust/sockudo-kv status:*)",
       "mcp__acp__Write",
       "mcp__acp__Edit",
-      "mcp__acp__Bash"
+      "mcp__acp__Bash",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

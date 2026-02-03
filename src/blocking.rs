@@ -2,6 +2,10 @@
 //!
 //! This module implements Redis-compatible blocking list operations using an
 //! event-driven architecture with tokio channels for efficient wakeup.
+//!
+//! FIFO ordering is maintained through a per-key mutex system. When data arrives
+//! on a key, clients waiting on that key must acquire the key's mutex before
+//! attempting to consume data, ensuring strict first-come-first-served ordering.
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -84,8 +88,8 @@ pub struct BlockedClient {
 /// Result sent to a blocked client when unblocked
 #[derive(Debug)]
 pub enum BlockResult {
-    /// Data is available - client should try the operation
-    Ready,
+    /// Data is available on this key - client should try to pop
+    Ready(Bytes),
     /// Operation timed out
     Timeout,
     /// Client was explicitly unblocked (CLIENT UNBLOCK)
@@ -96,6 +100,28 @@ pub enum BlockResult {
 struct ClientRegistration {
     keys: Vec<(usize, Bytes)>,
     waker: Option<oneshot::Sender<BlockResult>>,
+    /// Global sequence number for FIFO ordering across all keys
+    sequence: u64,
+}
+
+/// FIFO lock for serializing access to a key's data
+/// This ensures that when multiple clients are woken for the same key,
+/// they attempt to pop in FIFO order
+pub struct KeyLock {
+    mutex: tokio::sync::Mutex<()>,
+}
+
+impl KeyLock {
+    fn new() -> Self {
+        Self {
+            mutex: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Acquire the lock, returning a guard that releases when dropped
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutex.lock().await
+    }
 }
 
 /// Manager for blocked clients
@@ -103,6 +129,10 @@ struct ClientRegistration {
 /// This is the central coordinator for all blocking operations. It maintains
 /// a mapping from keys to blocked clients and handles signaling when data
 /// becomes available.
+///
+/// FIFO ordering is maintained globally: when data arrives on any key, the
+/// globally-first client that is waiting on that key will be woken. This ensures
+/// that clients blocked on multiple keys are served in the order they blocked.
 pub struct BlockingManager {
     /// Map from (db_index, key) -> queue of blocked client IDs
     /// Clients are served in FIFO order (first blocked = first served)
@@ -111,6 +141,13 @@ pub struct BlockingManager {
     /// Map from client_id -> registration info including waker
     /// The waker is stored here and taken when the client is woken
     client_registrations: DashMap<u64, Arc<Mutex<ClientRegistration>>>,
+
+    /// Per-key locks for FIFO serialization
+    /// When a client is woken up, it must acquire this lock before trying to pop
+    key_locks: DashMap<(usize, Bytes), Arc<KeyLock>>,
+
+    /// Global sequence counter for FIFO ordering
+    next_sequence: std::sync::atomic::AtomicU64,
 }
 
 impl BlockingManager {
@@ -118,7 +155,19 @@ impl BlockingManager {
         Self {
             blocked_clients: DashMap::new(),
             client_registrations: DashMap::new(),
+            key_locks: DashMap::new(),
+            next_sequence: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Get or create a lock for a specific key
+    /// This lock must be held when attempting to pop data from the key
+    pub fn get_key_lock(&self, db_index: usize, key: &Bytes) -> Arc<KeyLock> {
+        let db_key = (db_index, key.clone());
+        self.key_locks
+            .entry(db_key)
+            .or_insert_with(|| Arc::new(KeyLock::new()))
+            .clone()
     }
 
     /// Register a client as blocked on the given keys
@@ -141,12 +190,18 @@ impl BlockingManager {
             .map(|k| (db_index, k))
             .collect();
 
+        // Assign a global sequence number for FIFO ordering
+        let sequence = self
+            .next_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         // Store client registration with waker
         self.client_registrations.insert(
             client_id,
             Arc::new(Mutex::new(ClientRegistration {
                 keys: key_pairs.clone(),
                 waker: Some(tx),
+                sequence,
             })),
         );
 
@@ -165,47 +220,65 @@ impl BlockingManager {
     }
 
     /// Signal that a key has received data
-    /// Wakes up the first blocked client waiting on this key
+    /// Wakes up the client with the lowest sequence number waiting on this key
     /// Returns true if a client was woken up
+    ///
+    /// This maintains global FIFO ordering: when multiple keys receive data
+    /// (e.g., from a transaction), the globally-first blocked client will be
+    /// woken, regardless of which key is signaled first.
+    ///
+    /// Note: This does NOT cleanup the client - the client is responsible for
+    /// cleaning up after themselves when they successfully complete, timeout,
+    /// or re-register.
     pub fn signal_key(&self, db_index: usize, key: &Bytes) -> bool {
         let db_key = (db_index, key.clone());
 
-        // First, find a client to wake and collect info needed for cleanup
-        // We need to release the blocked_clients lock before calling cleanup_client
-        // to avoid deadlock
-        let client_to_cleanup: Option<u64> = {
-            if let Some(entry) = self.blocked_clients.get(&db_key) {
-                let mut queue = entry.lock();
+        if let Some(entry) = self.blocked_clients.get(&db_key) {
+            let mut queue = entry.lock();
 
-                // Find first client that hasn't been woken yet
-                loop {
-                    match queue.pop_front() {
-                        Some(client_id) => {
-                            // Try to get and wake the client
-                            if let Some(reg) = self.client_registrations.get(&client_id) {
-                                let mut registration = reg.lock();
-                                // Take the waker - this ensures we only wake once
-                                if let Some(waker) = registration.waker.take() {
-                                    if waker.send(BlockResult::Ready).is_ok() {
-                                        // Successfully woke a client
-                                        break Some(client_id);
-                                    }
-                                }
-                            }
-                            // If send failed or no waker, client already gone - try next
+            // Find the client with the lowest sequence number that hasn't been woken yet
+            // This ensures global FIFO ordering across all keys
+            let mut best_idx: Option<usize> = None;
+            let mut best_seq: u64 = u64::MAX;
+            let mut indices_to_remove = Vec::new();
+
+            for (idx, &client_id) in queue.iter().enumerate() {
+                if let Some(reg) = self.client_registrations.get(&client_id) {
+                    let registration = reg.lock();
+                    if registration.waker.is_some() {
+                        // This client hasn't been woken yet
+                        if registration.sequence < best_seq {
+                            best_seq = registration.sequence;
+                            best_idx = Some(idx);
                         }
-                        None => break None,
+                    } else {
+                        // Waker already taken - mark for removal
+                        indices_to_remove.push(idx);
+                    }
+                } else {
+                    // Registration gone - mark for removal
+                    indices_to_remove.push(idx);
+                }
+            }
+
+            // Remove stale entries (in reverse order to maintain indices)
+            for idx in indices_to_remove.into_iter().rev() {
+                queue.remove(idx);
+            }
+
+            // Wake the best candidate
+            if let Some(idx) = best_idx {
+                let client_id = queue[idx];
+                if let Some(reg) = self.client_registrations.get(&client_id) {
+                    let mut registration = reg.lock();
+                    if let Some(waker) = registration.waker.take() {
+                        if waker.send(BlockResult::Ready(key.clone())).is_ok() {
+                            queue.remove(idx);
+                            return true;
+                        }
                     }
                 }
-            } else {
-                None
             }
-        };
-
-        // Now cleanup outside of the blocked_clients lock
-        if let Some(client_id) = client_to_cleanup {
-            self.cleanup_client(client_id);
-            return true;
         }
 
         false
@@ -266,6 +339,90 @@ impl BlockingManager {
         self.client_registrations
             .get(&client_id)
             .map(|reg| reg.lock().keys.clone())
+    }
+
+    /// Handle SWAPDB - swap database indices for blocked clients and signal them
+    ///
+    /// When databases are swapped, blocked clients waiting on keys in either database
+    /// need to be notified because the data has changed. We:
+    /// 1. Swap the db_index in blocked_clients map entries
+    /// 2. Update client registrations to reflect new db indices
+    /// 3. Signal all affected clients so they re-check for data
+    pub fn handle_swapdb(&self, db1: usize, db2: usize) {
+        if db1 == db2 {
+            return;
+        }
+
+        // Collect all keys from both databases that have blocked clients
+        let mut db1_keys: Vec<Bytes> = Vec::new();
+        let mut db2_keys: Vec<Bytes> = Vec::new();
+
+        // We need to swap entries in blocked_clients map
+        // First, collect all entries for both databases
+        let mut entries_to_swap: Vec<((usize, Bytes), Mutex<VecDeque<u64>>)> = Vec::new();
+
+        self.blocked_clients.retain(|(db_idx, key), queue| {
+            if *db_idx == db1 {
+                db1_keys.push(key.clone());
+                entries_to_swap.push((
+                    (db2, key.clone()),
+                    std::mem::replace(queue, Mutex::new(VecDeque::new())),
+                ));
+                false // Remove this entry
+            } else if *db_idx == db2 {
+                db2_keys.push(key.clone());
+                entries_to_swap.push((
+                    (db1, key.clone()),
+                    std::mem::replace(queue, Mutex::new(VecDeque::new())),
+                ));
+                false // Remove this entry
+            } else {
+                true // Keep entries from other databases
+            }
+        });
+
+        // Re-insert with swapped db indices
+        for (key, queue) in entries_to_swap {
+            self.blocked_clients.insert(key, queue);
+        }
+
+        // Update client registrations to reflect new db indices
+        for reg in self.client_registrations.iter() {
+            let mut registration = reg.value().lock();
+            for (db_idx, _key) in &mut registration.keys {
+                if *db_idx == db1 {
+                    *db_idx = db2;
+                } else if *db_idx == db2 {
+                    *db_idx = db1;
+                }
+            }
+        }
+
+        // Also swap key_locks entries
+        let mut lock_entries_to_swap: Vec<((usize, Bytes), Arc<KeyLock>)> = Vec::new();
+        self.key_locks.retain(|(db_idx, key), lock| {
+            if *db_idx == db1 {
+                lock_entries_to_swap.push(((db2, key.clone()), lock.clone()));
+                false
+            } else if *db_idx == db2 {
+                lock_entries_to_swap.push(((db1, key.clone()), lock.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        for (key, lock) in lock_entries_to_swap {
+            self.key_locks.insert(key, lock);
+        }
+
+        // Signal all affected keys in their NEW database locations
+        // db1_keys are now in db2, db2_keys are now in db1
+        for key in db1_keys {
+            self.signal_key(db2, &key);
+        }
+        for key in db2_keys {
+            self.signal_key(db1, &key);
+        }
     }
 }
 
@@ -333,12 +490,42 @@ pub fn is_blocking_list_command(cmd: &[u8]) -> bool {
 // ============================================================================
 
 /// Try to execute BLPOP/BRPOP immediately, returns Some if data was available
+/// If `priority_key` is provided, try that key first before others
 pub fn try_pop(
     store: &Store,
     keys: &[Bytes],
     direction: PopDirection,
+    priority_key: Option<&Bytes>,
 ) -> Result<Option<(Bytes, Bytes)>> {
+    // If we have a priority key, try it first
+    if let Some(pkey) = priority_key {
+        if keys.contains(pkey) {
+            if let Some(key_type) = store.key_type(pkey) {
+                if key_type != "list" {
+                    return Err(Error::WrongType);
+                }
+            }
+
+            let result = match direction {
+                PopDirection::Left => store.lpop(pkey, 1),
+                PopDirection::Right => store.rpop(pkey, 1),
+            };
+
+            if let Ok(Some(values)) = result {
+                if let Some(value) = values.into_iter().next() {
+                    return Ok(Some((pkey.clone(), value)));
+                }
+            }
+        }
+    }
+
+    // Fall back to trying all keys in order
     for key in keys {
+        // Skip priority key since we already tried it
+        if priority_key.map_or(false, |pk| pk == key) {
+            continue;
+        }
+
         // Check type first
         if let Some(key_type) = store.key_type(key) {
             if key_type != "list" {
@@ -361,13 +548,43 @@ pub fn try_pop(
 }
 
 /// Try to execute BLMPOP immediately
+/// If `priority_key` is provided, try that key first before others
 pub fn try_mpop(
     store: &Store,
     keys: &[Bytes],
     direction: PopDirection,
     count: usize,
+    priority_key: Option<&Bytes>,
 ) -> Result<Option<(Bytes, Vec<Bytes>)>> {
+    // If we have a priority key, try it first
+    if let Some(pkey) = priority_key {
+        if keys.contains(pkey) {
+            if let Some(key_type) = store.key_type(pkey) {
+                if key_type != "list" {
+                    return Err(Error::WrongType);
+                }
+            }
+
+            let result = match direction {
+                PopDirection::Left => store.lpop(pkey, count),
+                PopDirection::Right => store.rpop(pkey, count),
+            };
+
+            if let Ok(Some(values)) = result {
+                if !values.is_empty() {
+                    return Ok(Some((pkey.clone(), values)));
+                }
+            }
+        }
+    }
+
+    // Fall back to trying all keys in order
     for key in keys {
+        // Skip priority key since we already tried it
+        if priority_key.map_or(false, |pk| pk == key) {
+            continue;
+        }
+
         // Check type first
         if let Some(key_type) = store.key_type(key) {
             if key_type != "list" {

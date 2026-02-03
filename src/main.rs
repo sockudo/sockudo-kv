@@ -986,8 +986,9 @@ where
                     match Parser::parse(&mut buf) {
                         Ok(Some(value)) => match Command::from_resp(value) {
                             Ok(mut cmd) => {
-                                // Update last command timestamp
+                                // Update last command timestamp and track command name
                                 client.touch();
+                                client.set_last_cmd(cmd.name.clone());
 
                                 // Apply command renaming from config
                                 if !config.rename_command.is_empty() {
@@ -1149,7 +1150,7 @@ where
                                     }
                                 } else if is_transaction_command(cmd_name) {
                                     let store = multi_store.db(client.current_db());
-                                    match transaction::execute(client, &store, cmd_name, &cmd.args) {
+                                    match transaction::execute(client, multi_store, &store, server_state, Some(replication), cmd_name, &cmd.args) {
                                         Ok(TransactionResult::Response(response)) => {
                                             if client.should_reply() {
                                                 write_response(&mut write_buf, &response, client);
@@ -1157,6 +1158,8 @@ where
                                         }
                                         Ok(TransactionResult::ResponseWithSignal(response, keys_to_signal)) => {
                                             // Signal blocked clients for list push commands executed in EXEC
+                                            // Signal each key once - the cascade from successful operations
+                                            // will handle waking additional clients
                                             let db_index = client.current_db();
                                             for key in keys_to_signal {
                                                 server_state.blocking.signal_key(db_index, &key);
@@ -1200,8 +1203,42 @@ where
                                             &cmd.args,
                                         ).await;
                                     } else if cmd.is_command(b"SWAPDB") {
-                                        // SWAPDB needs access to MultiStore
-                                        let response = handle_swapdb(multi_store, &cmd.args);
+                                        // SWAPDB needs access to MultiStore and ServerState for blocking clients
+                                        let response = handle_swapdb(multi_store, server_state, &cmd.args);
+                                        // Propagate SWAPDB to replicas
+                                        if !matches!(response, RespValue::Error(_)) {
+                                            let mut parts = vec![bytes::Bytes::from_static(b"SWAPDB")];
+                                            parts.extend(cmd.args.iter().cloned());
+                                            replication.propagate(&parts);
+                                        }
+                                        if client.should_reply() {
+                                            write_response(&mut write_buf, &response, client);
+                                        }
+                                    } else if cmd.is_command(b"RENAME") {
+                                        // RENAME needs to signal blocked clients waiting on the destination key
+                                        let db_index = client.current_db();
+                                        let current_store = multi_store.db(db_index);
+                                        let response = handle_rename(&current_store, server_state, db_index, &cmd.args);
+                                        // Propagate RENAME to replicas
+                                        if !matches!(response, RespValue::Error(_)) {
+                                            let mut parts = vec![bytes::Bytes::from_static(b"RENAME")];
+                                            parts.extend(cmd.args.iter().cloned());
+                                            replication.propagate(&parts);
+                                        }
+                                        if client.should_reply() {
+                                            write_response(&mut write_buf, &response, client);
+                                        }
+                                    } else if cmd.is_command(b"RENAMENX") {
+                                        // RENAMENX needs to signal blocked clients waiting on the destination key
+                                        let db_index = client.current_db();
+                                        let current_store = multi_store.db(db_index);
+                                        let response = handle_renamenx(&current_store, server_state, db_index, &cmd.args);
+                                        // Propagate RENAMENX to replicas only on success (result == 1)
+                                        if matches!(response, RespValue::Integer(1)) {
+                                            let mut parts = vec![bytes::Bytes::from_static(b"RENAMENX")];
+                                            parts.extend(cmd.args.iter().cloned());
+                                            replication.propagate(&parts);
+                                        }
                                         if client.should_reply() {
                                             write_response(&mut write_buf, &response, client);
                                         }
@@ -1558,6 +1595,7 @@ fn parse_db_index(arg: &bytes::Bytes) -> Result<usize, RespValue> {
 /// Handle SWAPDB command - O(1) database swap
 fn handle_swapdb(
     multi_store: &Arc<sockudo_kv::storage::MultiStore>,
+    server_state: &Arc<ServerState>,
     args: &[bytes::Bytes],
 ) -> RespValue {
     if args.len() != 2 {
@@ -1574,9 +1612,61 @@ fn handle_swapdb(
     };
 
     if multi_store.swap_db(db1, db2) {
+        // Signal blocked clients after the swap - they may now have data available
+        server_state.blocking.handle_swapdb(db1, db2);
         RespValue::ok()
     } else {
         RespValue::error("ERR invalid DB index")
+    }
+}
+
+/// Handle RENAME command - rename key and signal blocked clients
+fn handle_rename(
+    store: &sockudo_kv::storage::Store,
+    server_state: &Arc<ServerState>,
+    db_index: usize,
+    args: &[bytes::Bytes],
+) -> RespValue {
+    if args.len() != 2 {
+        return RespValue::error("ERR wrong number of arguments for 'rename' command");
+    }
+
+    let source = &args[0];
+    let dest = &args[1];
+
+    if store.rename(source, dest) {
+        // Signal blocked clients waiting on the destination key
+        // The destination key now has data (from the source)
+        server_state.blocking.signal_key(db_index, dest);
+        RespValue::ok()
+    } else {
+        RespValue::error("ERR no such key")
+    }
+}
+
+/// Handle RENAMENX command - rename key if dest doesn't exist and signal blocked clients
+fn handle_renamenx(
+    store: &sockudo_kv::storage::Store,
+    server_state: &Arc<ServerState>,
+    db_index: usize,
+    args: &[bytes::Bytes],
+) -> RespValue {
+    if args.len() != 2 {
+        return RespValue::error("ERR wrong number of arguments for 'renamenx' command");
+    }
+
+    let source = &args[0];
+    let dest = &args[1];
+
+    let result = store.rename_nx(source, dest);
+    if result == -1 {
+        RespValue::error("ERR no such key")
+    } else {
+        if result == 1 {
+            // Successfully renamed - signal blocked clients waiting on the destination key
+            server_state.blocking.signal_key(db_index, dest);
+        }
+        RespValue::integer(result)
     }
 }
 
@@ -1635,8 +1725,8 @@ async fn handle_blocking_list_command(
             PopDirection::Right
         };
 
-        // Try immediate pop
-        match try_pop(&store, &keys, direction)? {
+        // Try immediate pop (no priority key since we haven't blocked yet)
+        match try_pop(&store, &keys, direction, None)? {
             Some((key, value)) => return Ok(format_pop_response(key, value)),
             None => {}
         }
@@ -1773,8 +1863,8 @@ async fn handle_blocking_list_command(
             i += 1;
         }
 
-        // Try immediate pop
-        match try_mpop(&store, &keys, direction, count)? {
+        // Try immediate pop (no priority key since we haven't blocked yet)
+        match try_mpop(&store, &keys, direction, count, None)? {
             Some((key, values)) => return Ok(format_mpop_response(key, values)),
             None => {}
         }
@@ -1809,8 +1899,9 @@ async fn handle_blocking_list_command(
 /// - Timeout to expire
 /// - Client to be unblocked (CLIENT UNBLOCK)
 ///
-/// Uses a retry loop like Redis/Dragonfly to handle race conditions where
-/// another client may have consumed the data between signal and wakeup.
+/// FIFO ordering is enforced using per-key locks. When multiple clients are
+/// woken up for the same key, they must acquire the key's lock before attempting
+/// to pop, ensuring strict first-come-first-served ordering.
 async fn blocking_wait(
     multi_store: &Arc<sockudo_kv::storage::MultiStore>,
     server_state: &Arc<ServerState>,
@@ -1864,14 +1955,25 @@ async fn blocking_wait(
         };
 
         match wait_result {
-            Ok(Ok(BlockResult::Ready)) => {
-                // Data might be available - try the operation
+            Ok(Ok(BlockResult::Ready(signaled_key))) => {
+                // Data might be available on signaled_key
+                // Acquire the key lock to ensure FIFO ordering among concurrent clients
+                let key_lock = server_state.blocking.get_key_lock(db_index, &signaled_key);
+                let _guard = key_lock.lock().await;
+
                 let store = multi_store.db(db_index);
 
                 let result = match &operation {
                     BlockingOperation::Pop { keys, direction } => {
-                        match try_pop(&store, keys, *direction) {
-                            Ok(Some((key, value))) => Ok(Some(format_pop_response(key, value))),
+                        // Try the signaled key first (it's the one that has data)
+                        match try_pop(&store, keys, *direction, Some(&signaled_key)) {
+                            Ok(Some((key, value))) => {
+                                // Signal the key again if there's still data - another client might be waiting
+                                if store.llen(&key).unwrap_or(0) > 0 {
+                                    server_state.blocking.signal_key(db_index, &key);
+                                }
+                                Ok(Some(format_pop_response(key, value)))
+                            }
                             Ok(None) => Ok(None), // Data was taken by another client, retry
                             Err(e) => Err(e),
                         }
@@ -1880,11 +1982,20 @@ async fn blocking_wait(
                         keys,
                         direction,
                         count,
-                    } => match try_mpop(&store, keys, *direction, *count) {
-                        Ok(Some((key, values))) => Ok(Some(format_mpop_response(key, values))),
-                        Ok(None) => Ok(None), // Data was taken by another client, retry
-                        Err(e) => Err(e),
-                    },
+                    } => {
+                        // Try the signaled key first
+                        match try_mpop(&store, keys, *direction, *count, Some(&signaled_key)) {
+                            Ok(Some((key, values))) => {
+                                // Signal the key again if there's still data - another client might be waiting
+                                if store.llen(&key).unwrap_or(0) > 0 {
+                                    server_state.blocking.signal_key(db_index, &key);
+                                }
+                                Ok(Some(format_mpop_response(key, values)))
+                            }
+                            Ok(None) => Ok(None), // Data was taken by another client, retry
+                            Err(e) => Err(e),
+                        }
+                    }
                     BlockingOperation::Move {
                         source,
                         destination,
@@ -1895,6 +2006,10 @@ async fn blocking_wait(
                             Ok(Some(value)) => {
                                 // Signal destination key - another blocked client might be waiting
                                 server_state.blocking.signal_key(db_index, destination);
+                                // Also signal source if there's still data
+                                if store.llen(source).unwrap_or(0) > 0 {
+                                    server_state.blocking.signal_key(db_index, source);
+                                }
                                 Ok(Some(RespValue::bulk(value)))
                             }
                             Ok(None) => Ok(None), // Data was taken by another client, retry
@@ -1915,6 +2030,10 @@ async fn blocking_wait(
                             Ok(Some(value)) => {
                                 // Signal destination key - another blocked client might be waiting
                                 server_state.blocking.signal_key(db_index, destination);
+                                // Also signal source if there's still data
+                                if store.llen(source).unwrap_or(0) > 0 {
+                                    server_state.blocking.signal_key(db_index, source);
+                                }
                                 Ok(Some(RespValue::bulk(value)))
                             }
                             Ok(None) => Ok(None), // Data was taken by another client, retry
@@ -1923,16 +2042,18 @@ async fn blocking_wait(
                     }
                 };
 
-                // Handle the result
+                // Handle the result (lock is still held, will be released when _guard drops)
                 match result {
                     Ok(Some(resp)) => {
-                        // Success - clear blocked state and return
+                        // Success - clear blocked state, cleanup, and return
                         client.set_blocked(None);
+                        server_state.blocking.cleanup_client(client.id);
                         return Ok(resp);
                     }
                     Ok(None) => {
-                        // Data was consumed by another client - continue retry loop
+                        // Data was consumed by another client - cleanup and re-register
                         // The loop will re-register and wait again
+                        server_state.blocking.cleanup_client(client.id);
                     }
                     Err(e) => {
                         // Error occurred (e.g., WRONGTYPE) - clean up and return error
@@ -1958,8 +2079,9 @@ async fn blocking_wait(
                 }
             }
             Ok(Ok(BlockResult::Timeout)) | Err(_) => {
-                // Timeout
+                // Timeout - cleanup and return null
                 client.set_blocked(None);
+                server_state.blocking.cleanup_client(client.id);
                 return Ok(match &operation {
                     BlockingOperation::Pop { .. } | BlockingOperation::MPop { .. } => {
                         RespValue::null_array()
@@ -1968,8 +2090,9 @@ async fn blocking_wait(
                 });
             }
             Ok(Ok(BlockResult::Unblocked)) => {
-                // CLIENT UNBLOCK was called - return null
+                // CLIENT UNBLOCK was called - cleanup and return null
                 client.set_blocked(None);
+                server_state.blocking.cleanup_client(client.id);
                 return Ok(match &operation {
                     BlockingOperation::Pop { .. } | BlockingOperation::MPop { .. } => {
                         RespValue::null_array()
@@ -1978,8 +2101,9 @@ async fn blocking_wait(
                 });
             }
             Ok(Err(_)) => {
-                // Channel closed (shouldn't happen normally)
+                // Channel closed (shouldn't happen normally) - cleanup and return null
                 client.set_blocked(None);
+                server_state.blocking.cleanup_client(client.id);
                 return Ok(match &operation {
                     BlockingOperation::Pop { .. } | BlockingOperation::MPop { .. } => {
                         RespValue::null_array()

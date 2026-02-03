@@ -11,7 +11,10 @@
     </cargoProject>
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a4029692-3d05-48de-89c1-5ee996fe5252" name="Changes" comment="" />
+    <list default="true" id="a4029692-3d05-48de-89c1-5ee996fe5252" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/dump.rdb" beforeDir="false" afterPath="$PROJECT_DIR$/dump.rdb" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -24,9 +27,9 @@
   <component name="MacroExpansionManager">
     <option name="directoryName" value="Z7ID2q4A" />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 3
-}]]></component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 3
+}</component>
   <component name="ProjectId" id="38NhMXaOiTm7z5L5SGmAmJ7h9Gs" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
@@ -41,7 +44,7 @@
     "RunOnceActivity.rust.reset.selective.auto.import": "true",
     "RunOnceActivity.typescript.service.memoryLimit.init": "true",
     "git-widget-placeholder": "main",
-    "last_opened_file_path": "/home/radudiaconu/Desktop/Code/Rust/sockudo-kv",
+    "last_opened_file_path": "/home/radudiaconu/Desktop/Code/Rust/sockudo-ws",
     "org.rust.cargo.project.model.PROJECT_DISCOVERY": "true",
     "org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon": "",
     "org.rust.first.attach.projects": "true",
@@ -96,6 +99,13 @@
       <option name="presentableId" value="Default" />
       <updated>1768645891618</updated>
       <workItem from="1768645892946" duration="45000" />
+      <workItem from="1768902886957" duration="9000" />
+      <workItem from="1768902915109" duration="1000" />
+      <workItem from="1768902931398" duration="2000" />
+      <workItem from="1768903250313" duration="1000" />
+      <workItem from="1768905260016" duration="1000" />
+      <workItem from="1769005799438" duration="9000" />
+      <workItem from="1769275581945" duration="205000" />
     </task>
     <servers />
   </component>

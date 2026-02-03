@@ -188,6 +188,8 @@ pub struct ClientState {
     pub protocol_version: AtomicU8,
     /// Blocked state - command name client is blocked on (empty if not blocked)
     pub blocked_cmd: parking_lot::RwLock<Option<Bytes>>,
+    /// Last command executed (for CLIENT LIST cmd= field)
+    pub last_cmd: parking_lot::RwLock<Option<Bytes>>,
 }
 
 impl ClientState {
@@ -222,6 +224,7 @@ impl ClientState {
             readonly: AtomicBool::new(false),
             protocol_version: AtomicU8::new(2),
             blocked_cmd: parking_lot::RwLock::new(None),
+            last_cmd: parking_lot::RwLock::new(None),
         }
     }
 
@@ -241,6 +244,23 @@ impl ClientState {
     #[inline]
     pub fn blocked_command(&self) -> Option<Bytes> {
         self.blocked_cmd.read().clone()
+    }
+
+    /// Set last command executed
+    #[inline]
+    pub fn set_last_cmd(&self, cmd: Bytes) {
+        *self.last_cmd.write() = Some(cmd);
+    }
+
+    /// Get last command name (returns blocked command if blocked, else last executed)
+    #[inline]
+    pub fn current_command(&self) -> Option<Bytes> {
+        // If blocked, return the blocked command
+        if let Some(cmd) = self.blocked_cmd.read().as_ref() {
+            return Some(cmd.clone());
+        }
+        // Otherwise return last executed command
+        self.last_cmd.read().clone()
     }
 
     /// Check if in MULTI mode
@@ -432,9 +452,9 @@ impl ClientState {
             flags.push('N');
         }
 
-        // Get blocked command name if any
+        // Get current/last command name
         let cmd_str = self
-            .blocked_command()
+            .current_command()
             .map(|b| String::from_utf8_lossy(&b).to_ascii_lowercase())
             .unwrap_or_else(|| "NULL".to_string());
 
